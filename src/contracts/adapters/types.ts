@@ -1,6 +1,7 @@
 import type { CalibrationResult } from '../generated/calibration-result.js';
 import type { ModelSnapshotEntry } from '../generated/model-snapshot.js';
 import type { TranscriptRaw } from '../generated/transcript-raw.js';
+import type { AsrHintsInput } from './asr.js';
 
 export interface AdapterAudioInput {
   sourcePath: string;
@@ -21,6 +22,7 @@ export interface AsrAdapterInput {
   modelSnapshotRef: string;
   model: ModelSnapshotEntry & { role: 'asr'; adapter: 'volcengine_asr' };
   audio: AdapterAudioInput;
+  asrHints?: AsrHintsInput;
   beforeProviderDispatch?: (
     operation: 'volcengine_asr_recognize' | 'volcengine_subtitle_submit' | 'volcengine_subtitle_query',
   ) => Promise<void>;

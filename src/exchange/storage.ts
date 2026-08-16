@@ -49,9 +49,20 @@ export async function readStableJson(filePath: string, errorCode = 'CONTRACT_INV
   try {
     const entry = await lstat(filePath);
     if (!entry.isFile() || entry.isSymbolicLink()) throw new Error('not regular');
+    if (entry.size > 8 * 1024 * 1024) throw new Error('stable json too large');
     const source = await readFile(filePath, 'utf8');
     if (!source.endsWith('\n')) throw new Error('missing newline');
-    return JSON.parse(source);
+    const parsed = JSON.parse(source) as unknown;
+    const queue: Array<{ value: unknown; depth: number }> = [{ value: parsed, depth: 0 }];
+    let nodes = 0;
+    while (queue.length > 0) {
+      const current = queue.pop()!;
+      nodes += 1;
+      if (nodes > 20_000 || current.depth > 20) throw new Error('stable json resource limit exceeded');
+      if (Array.isArray(current.value)) current.value.forEach((value) => queue.push({ value, depth: current.depth + 1 }));
+      else if (typeof current.value === 'object' && current.value !== null) Object.values(current.value).forEach((value) => queue.push({ value, depth: current.depth + 1 }));
+    }
+    return parsed;
   } catch (error) {
     if (error instanceof MercuryError) throw error;
     throw new MercuryError(errorCode, `稳定 JSON 无法安全读取：${path.basename(filePath)}`);

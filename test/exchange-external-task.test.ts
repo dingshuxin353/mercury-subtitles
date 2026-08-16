@@ -6,10 +6,13 @@ import { describe, expect, it, vi } from 'vitest';
 import { ensureWorkspace } from '../src/workspace.js';
 import { loadModelRegistryV2 } from '../src/models-v2.js';
 import { runWorker } from '../src/background/worker.js';
-import { appendV5Event, readV5Events, readV5Task, submitExchangeRequest } from '../src/exchange/runtime.js';
+import { appendV5Event, persistV5Task, readV5Events, readV5Task, submitExchangeRequest } from '../src/exchange/runtime.js';
 import { findTaskReadOnly, stableTaskResult, stableTaskView } from '../src/stable-cli/tasks.js';
 import { createDictionary, makeDictionaryEntry, mutateDictionary } from '../src/dictionary.js';
 import { runCli } from '../src/cli.js';
+import type { AsrAdapter, AsrHintsCapableAdapter } from '../src/contracts/index.js';
+import { VolcengineAsrAdapter } from '../src/adapters/volcengine-asr.js';
+import { VolcengineSubtitleAsrAdapter } from '../src/adapters/volcengine-subtitle-asr.js';
 
 function sha(value: Buffer | string) { return createHash('sha256').update(value).digest('hex'); }
 
@@ -44,7 +47,147 @@ function fixtureFetch(calls: string[], captured: Array<Record<string, any>> = []
   });
 }
 
+function fixtureAsr(calls: string[]): AsrAdapter {
+  return {
+    adapterId: 'volcengine_asr',
+    async run(input) {
+      await input.beforeProviderDispatch?.('volcengine_asr_recognize');
+      calls.push('asr');
+      const at = new Date().toISOString();
+      return {
+        kind: 'artifact',
+        artifact: {
+          schema_version: '1.0.0', task_id: input.taskId, created_at: at,
+          audio: { path_ref: input.audio.pathRef, sha256: input.audio.sha256, duration_ms: input.audio.durationMs, language: 'zh-CN', mime_type: 'audio/mpeg' },
+          full_text: '您好 Mercury 字幕测试',
+          segments: [{ segment_id: 'seg-provider-1', index: 0, start_ms: 0, end_ms: input.audio.durationMs, text: '您好 Mercury 字幕测试', confidence: 0.99, words: [] }],
+          model_snapshot_ref: input.modelSnapshotRef,
+          call: { call_id: 'fixture-asr', model_snapshot_entry_ref: input.model.snapshot_entry_id, started_at: at, ended_at: at, outcome: 'completed', error_ref: null },
+          raw_response_ref: null, warnings: [], errors: [],
+        },
+      };
+    },
+  };
+}
+
+function fixtureHintsAsr(calls: string[], captured: Array<NonNullable<Parameters<AsrAdapter['run']>[0]['asrHints']>>): AsrHintsCapableAdapter {
+  const base = fixtureAsr(calls);
+  return {
+    ...base,
+    adapterId: 'fixture_contract_asr',
+    asrHintsCapability: { status: 'supported', maxEntries: 10, acceptedFields: ['canonical', 'variants'] },
+    async run(input) {
+      captured.push(structuredClone(input.asrHints));
+      return base.run(input);
+    },
+  };
+}
+
 describe('Exchange v1 external transcript task', () => {
+  it('runs provider plus reference through the same v5 request, dictionary, result, and review semantics', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'provider.mp3');
+    const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
+    const reference = path.join(input.home, 'reference.srt');
+    const referenceText = '1\n00:00:00,000 --> 00:00:00,040\n您好 Mercury 字幕测试\n';
+    await writeFile(reference, referenceText);
+    const dictionary = await createDictionary(input.workspace, { name: 'Provider Terms', scope: 'global' });
+    await mutateDictionary(input.workspace, dictionary.dictionary_id, dictionary.revision, (current) => current.entries.push(makeDictionaryEntry({ entry_id: 'entry-provider-mercury', canonical: 'Mercury', variants: ['水星'], kind: 'product' })));
+    const registry = await loadModelRegistryV2(input.workspace);
+    const request = {
+      ...input.request,
+      request_id: 'request-provider-reference-v5',
+      inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: { path: reference, sha256: sha(referenceText), format: 'srt', role: 'reference' } },
+      transcription_mode: 'provider', models: { asr: registry.defaults.asr, chat: registry.defaults.chat }, dictionaries: { project_key: null, selected: [dictionary.dictionary_id], task_overrides: [] },
+    };
+    const submitted = await submitExchangeRequest(input.workspace, request);
+    expect(submitted.task.schema_version).toBe('5.0.0');
+    expect(submitted.task.inputs.reference?.role).toBe('reference');
+    expect(submitted.task.artifacts.transcript).toBeNull();
+    const changed = structuredClone(request); changed.dictionaries.selected = [];
+    await expect(submitExchangeRequest(input.workspace, changed)).rejects.toMatchObject({ code: 'REQUEST_ID_CONFLICT' });
+    const calls: string[] = []; const capturedHints: Array<NonNullable<Parameters<AsrAdapter['run']>[0]['asrHints']>> = [];
+    await runWorker(input.workspace, { asrAdapter: fixtureHintsAsr(calls, capturedHints), fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const task = await readV5Task(directory);
+    expect(task.status, JSON.stringify(task.error)).toBe('completed');
+    expect(task.input_config.transcription_mode).toBe('provider');
+    expect(task.execution.provider_calls.asr).toMatchObject({ state: 'terminal', count: 1, outcome: 'response_persisted' });
+    expect(task.execution.provider_calls.chat).toMatchObject({ state: 'terminal', count: 1, outcome: 'response_persisted' });
+    expect(calls).toEqual(['asr', 'chat']);
+    expect(capturedHints).toEqual([{ entries: [expect.objectContaining({ entryId: 'entry-provider-mercury', canonical: 'Mercury', variants: ['水星'] })] }]);
+    const frozenDictionary = JSON.parse(await readFile(path.join(directory, task.dictionary_snapshot.path), 'utf8'));
+    expect(frozenDictionary.asr_hints).toMatchObject({ status: 'used', adapter_id: 'fixture_contract_asr', entry_ids: ['entry-provider-mercury'], available_count: 1, input_count: 1, truncated: false });
+    expect(frozenDictionary.asr_hints.input_hash).toMatch(/^[a-f0-9]{64}$/u);
+    const result = await stableTaskResult(input.workspace, await findTaskReadOnly(input.workspace, task.identity.task_id));
+    expect(result.transcription).toMatchObject({ mode: 'provider', asr_call_count: 1 });
+    expect(result.dictionaries).toMatchObject({ match_count: 1, snapshots: [expect.objectContaining({ dictionary_id: dictionary.dictionary_id })] });
+    const attempts = (await readFile(path.join(directory, 'attempts.jsonl'), 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    expect(attempts[0]).toMatchObject({ contract: 'mercury.attempt/v1', transcription_mode: 'provider', asr_call_count: 0 });
+    expect(attempts[1]).toMatchObject({ contract: 'mercury.attempt-result/v1', asr_call_count: 1, chat_call_count: 1 });
+    expect(task.review.status).toMatch(/pending|finalized|not_required/u);
+  });
+
+  it('declares both built-in Volcengine ASR adapters as not supporting per-task dynamic hints', () => {
+    expect(new VolcengineAsrAdapter({ resolveCredential: async () => ({ mode: 'api_key', uid: 'fixture', value: 'fixture' }) }).asrHintsCapability.status).toBe('not_supported');
+    expect(new VolcengineSubtitleAsrAdapter({ readCredential: async () => 'fixture' }).asrHintsCapability.status).toBe('not_supported');
+  });
+
+  it('recovers locally after a provider ASR response is persisted without dispatching ASR twice', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'provider-recovery.mp3');
+    const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
+    const registry = await loadModelRegistryV2(input.workspace);
+    const request = {
+      ...input.request, request_id: 'request-provider-asr-recovery',
+      inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: null },
+      transcription_mode: 'provider', models: { asr: registry.defaults.asr, chat: registry.defaults.chat },
+    };
+    const submitted = await submitExchangeRequest(input.workspace, request);
+    const calls: string[] = []; let crashed = false;
+    await expect(runWorker(
+      input.workspace,
+      { asrAdapter: fixtureAsr(calls), fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' },
+      { v5Fault: async (point, task) => { if (!crashed && point === 'after_response_persisted' && task.execution.provider_calls.asr.state === 'response_persisted') { crashed = true; throw new Error('crash:after_asr_response_persisted'); } } },
+    )).rejects.toThrow('crash:after_asr_response_persisted');
+    await runWorker(input.workspace, { asrAdapter: fixtureAsr(calls), fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    const task = await readV5Task(path.join(input.workspace, 'tasks', submitted.task.identity.task_directory));
+    expect(task.status, JSON.stringify(task.error)).toBe('completed');
+    expect(calls).toEqual(['asr', 'chat']);
+    expect(task.execution.provider_calls.asr).toMatchObject({ state: 'terminal', count: 1, outcome: 'response_persisted' });
+  });
+
+  it('keeps a thrown post-dispatch ASR outcome interrupted and never automatically replays it', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'provider-unknown.mp3');
+    const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
+    const registry = await loadModelRegistryV2(input.workspace);
+    const request = {
+      ...input.request, request_id: 'request-provider-unknown',
+      inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: null },
+      transcription_mode: 'provider', models: { asr: registry.defaults.asr, chat: registry.defaults.chat },
+    };
+    const submitted = await submitExchangeRequest(input.workspace, request);
+    const dispatches: string[] = [];
+    const unknownAsr: AsrAdapter = {
+      adapterId: 'fixture_unknown_asr',
+      async run(adapterInput) {
+        await adapterInput.beforeProviderDispatch?.('volcengine_asr_recognize');
+        dispatches.push(adapterInput.taskId);
+        throw new Error(`socket closed after dispatch; ${'Author'}ization: ${'Bear'}er ${'x'.repeat(40)}`);
+      },
+    };
+    await runWorker(input.workspace, { asrAdapter: unknownAsr, fetch: fixtureFetch([]), readCredential: async () => 'fixture-secret' });
+    await runWorker(input.workspace, { asrAdapter: fixtureAsr(dispatches), fetch: fixtureFetch([]), readCredential: async () => 'fixture-secret' });
+    const task = await readV5Task(path.join(input.workspace, 'tasks', submitted.task.identity.task_directory));
+    expect(task.status).toBe('interrupted');
+    expect(task.execution.provider_calls.asr).toMatchObject({ state: 'in_flight', count: 1, outcome: 'outcome_unknown' });
+    expect(task.error).toMatchObject({ code: 'TASK_INTERRUPTED_PROVIDER_UNKNOWN', retryability: 'unsafe' });
+    expect(JSON.stringify(task.error)).not.toContain('Bearer');
+    expect([null, '<redacted sensitive detail>']).toContain(task.error?.technical?.detail ?? null);
+    expect(dispatches).toHaveLength(1);
+  });
+
   it('persists the stable task directory, replays idempotently, and completes with zero ASR', async () => {
     const input = await prepared();
     const dictionary = await createDictionary(input.workspace, { name: 'Task Terms', scope: 'global' });
@@ -93,6 +236,18 @@ describe('Exchange v1 external transcript task', () => {
     expect(tampered.artifacts.find((entry) => entry.identity === 'calibration_report')).toMatchObject({ exists: true, validation: 'unavailable' });
   });
 
+  it('does not treat a corrupted committed request as absent or overwrite it during replay', async () => {
+    const input = await prepared();
+    input.request.request_id = 'request-corrupt-replay';
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const requestPath = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory, 'request.json');
+    const corrupted = { ...input.request, request_id: 'request-different-but-valid' };
+    await writeFile(requestPath, `${JSON.stringify(corrupted, null, 2)}\n`, { mode: 0o600 });
+    const before = await readFile(requestPath, 'utf8');
+    await expect(submitExchangeRequest(input.workspace, input.request)).rejects.toMatchObject({ code: 'REQUEST_RECORD_INVALID' });
+    expect(await readFile(requestPath, 'utf8')).toBe(before);
+  });
+
   it('retains transcribed output and never publishes calibrated output when Chat fails deterministically', async () => {
     const input = await prepared();
     input.request.request_id = 'request-external-failure';
@@ -119,6 +274,95 @@ describe('Exchange v1 external transcript task', () => {
     expect(events.map((event) => event.sequence)).toEqual(Array.from({ length: 21 }, (_, index) => index + 1));
     expect(new Set(events.map((event) => event.task_revision)).size).toBe(21);
     expect((await readV5Task(directory)).identity.revision).toBe(events.at(-1)!.task_revision);
+  });
+
+  it('does not let stale heartbeat or event snapshots roll back a dispatched Provider checkpoint', async () => {
+    const input = await prepared();
+    input.request.request_id = 'request-provider-checkpoint-monotonic';
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const running = await readV5Task(directory);
+    const started = '2026-08-16T15:00:01.000Z';
+    running.status = 'running'; running.stage = 'calibrating'; running.execution.started_at = started;
+    running.execution.worker_id = 'worker-fixture'; running.execution.heartbeat_at = started;
+    running.execution.attempt_id = 'att-fixture'; running.execution.attempt_count = 1;
+    running.execution.safe_checkpoint = 'chat_not_started';
+    await persistV5Task(directory, running);
+    const stale = structuredClone(await readV5Task(directory));
+    const dispatched = structuredClone(stale);
+    dispatched.execution.provider_calls.chat = { state: 'in_flight', count: 1, outcome: 'outcome_unknown', evidence_ref: null };
+    await persistV5Task(directory, dispatched);
+    stale.execution.heartbeat_at = '2026-08-16T15:00:02.000Z'; stale.updated_at = stale.execution.heartbeat_at;
+    await persistV5Task(directory, stale);
+    await appendV5Event(directory, structuredClone(stale), 'heartbeat_fixture', '旧事件快照不覆盖 dispatch。');
+    expect((await readV5Task(directory)).execution.provider_calls.chat).toEqual({ state: 'in_flight', count: 1, outcome: 'outcome_unknown', evidence_ref: null });
+  });
+
+  it('rejects a stale writer that tries to replace one terminal state with another', async () => {
+    const input = await prepared();
+    input.request.request_id = 'request-terminal-immutable';
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const stale = await readV5Task(directory);
+    const failed = structuredClone(stale);
+    failed.status = 'failed'; failed.stage = null; failed.execution.ended_at = '2026-08-16T15:00:01.000Z';
+    failed.error = {
+      contract: 'mercury.error/v1', code: 'FIXTURE_FAILED', category: 'runtime', message: 'fixture failure',
+      retryability: 'not_applicable', provider_outcome: 'not_dispatched', remediation: ['检查 fixture。'], technical: null, extensions: {},
+    };
+    await persistV5Task(directory, failed);
+    stale.status = 'cancelled'; stale.stage = null; stale.execution.ended_at = '2026-08-16T15:00:02.000Z';
+    await persistV5Task(directory, stale);
+    expect((await readV5Task(directory)).status).toBe('failed');
+  });
+
+  it.each([
+    ['after_claim', 1],
+    ['after_response_persisted', 1],
+    ['terminal_task_before_result', 1],
+    ['after_execute', 1],
+    ['after_review', 1],
+    ['before_finish', 1],
+  ] as const)('recovers the v5 %s crash window locally without repeating Chat', async (point, expectedCalls) => {
+    const input = await prepared();
+    input.request.request_id = `request-v5-crash-${point}`;
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const calls: string[] = [];
+    let injected = false;
+    await expect(runWorker(
+      input.workspace,
+      { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' },
+      { v5Fault: async (current) => { if (!injected && current === point) { injected = true; throw new Error(`crash:${point}`); } } },
+    )).rejects.toThrow(`crash:${point}`);
+    expect(await runWorker(input.workspace, { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' })).toBe('acquired');
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const task = await readV5Task(directory);
+    expect(task.status, JSON.stringify(task)).toBe('completed');
+    expect(calls).toHaveLength(expectedCalls);
+    const result = JSON.parse(await readFile(path.join(directory, 'result.json'), 'utf8'));
+    expect(result.status).toBe('completed');
+    expect((await readV5Events(directory)).some((event) => event.type === 'task_completed')).toBe(true);
+    const attempts = (await readFile(path.join(directory, 'attempts.jsonl'), 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    expect(attempts.filter((entry) => entry.contract === 'mercury.attempt-result/v1')).toHaveLength(1);
+  });
+
+  it('contains a crash after durable dispatch as Provider-unknown and never replays it', async () => {
+    const input = await prepared();
+    input.request.request_id = 'request-v5-crash-after-dispatch';
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const calls: string[] = [];
+    await expect(runWorker(
+      input.workspace,
+      { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' },
+      { v5Fault: async (point) => { if (point === 'after_dispatch_persisted') throw new Error('crash:after_dispatch_persisted'); } },
+    )).rejects.toThrow('crash:after_dispatch_persisted');
+    await runWorker(input.workspace, { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const task = await readV5Task(directory);
+    expect(task.status).toBe('interrupted');
+    expect(task.execution.provider_calls.chat).toMatchObject({ state: 'in_flight', count: 1, outcome: 'outcome_unknown' });
+    expect(task.error?.code).toBe('TASK_INTERRUPTED_PROVIDER_UNKNOWN');
+    expect(calls).toHaveLength(0);
   });
 
   it('keeps v5 tasks on the existing review flow and finalizes an approved SRT without changing time', async () => {

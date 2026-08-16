@@ -1,4 +1,4 @@
-import { lstat, readdir } from 'node:fs/promises';
+import { lstat, readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import type { ExchangeEventV1, ExchangeResultV1, ExchangeTaskV1 } from '../contracts/index.js';
 import { assertExchangeContract } from '../contracts/index.js';
@@ -10,6 +10,7 @@ import { readTaskEvents } from '../background/storage.js';
 import { projectMachineTaskToExchangeResult, projectMachineTaskToExchangeTask } from '../exchange/projection.js';
 import type { TaskRecordV5 } from '../contracts/generated/task-record-v5.js';
 import { cancelV5Task, projectV5Result, projectV5Task, readV5Events, readV5Task } from '../exchange/runtime.js';
+import { readStableJson } from '../exchange/storage.js';
 
 const TASK_ID = /^tsk-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}$/u;
 
@@ -34,9 +35,14 @@ function updatedAtOf(task: CompatibleTask): string { return task.updated_at; }
 
 async function readCompatibleTask(directory: string): Promise<CompatibleTask> {
   try {
-    const raw = JSON.parse(await (await import('node:fs/promises')).readFile(path.join(directory, 'task.json'), 'utf8')) as { schema_version?: string };
+    const target = path.join(directory, 'task.json');
+    const entry = await lstat(target);
+    if (!entry.isFile() || entry.isSymbolicLink() || entry.size > 8 * 1024 * 1024) throw new MercuryError('TASK_RECORD_INVALID', '任务记录不是安全的普通文件或超过大小限制。');
+    const raw = JSON.parse(await readFile(target, 'utf8')) as { schema_version?: string };
     if (raw.schema_version === '5.0.0') return readV5Task(directory);
-  } catch {}
+  } catch (error) {
+    if (error instanceof MercuryError) throw error;
+  }
   const basic = await readTaskRecord(directory);
   const version = (basic as unknown as { schema_version?: string }).schema_version;
   return ['2.0.0', '3.0.0', '4.0.0'].includes(version ?? '') ? readTaskRecordV2(directory) : basic;
@@ -67,7 +73,7 @@ export async function stableTaskView(workspaceRoot: string, record: CompatibleTa
   const machine = await taskMachineView(workspaceRoot, record as unknown as TaskRecordV2);
   let requestId: string | null = null;
   try {
-    const request = assertExchangeContract('request', JSON.parse(await (await import('node:fs/promises')).readFile(path.join(workspaceRoot, 'tasks', record.task_directory, 'request.json'), 'utf8')));
+    const request = assertExchangeContract('request', await readStableJson(path.join(workspaceRoot, 'tasks', record.task_directory, 'request.json'), 'REQUEST_RECORD_INVALID'));
     requestId = request.request_id;
   } catch {}
   return assertExchangeContract('task', projectMachineTaskToExchangeTask(machine, {

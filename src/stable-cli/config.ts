@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
-import { chmod, copyFile, lstat, open, readFile, rename, rm } from 'node:fs/promises';
+import { chmod, lstat, open, readFile, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { validateContract, validateV2Contract } from '../contracts/index.js';
 import { MercuryError } from '../errors.js';
@@ -61,7 +61,41 @@ async function syncFile(filePath: string): Promise<void> {
   try { await handle.sync(); } finally { await handle.close(); }
 }
 
-export async function applyConfigMigration(workspaceRoot: string, expectedPlanId: string): Promise<ConfigMigrationStatus & { backup_path: string }> {
+async function writeExclusiveSynced(target: string, content: string): Promise<void> {
+  const handle = await open(target, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+  try { await handle.writeFile(content, 'utf8'); await handle.sync(); } finally { await handle.close(); }
+  await chmod(target, 0o600);
+}
+
+async function ensureReusableBackup(backup: string, source: string): Promise<void> {
+  try {
+    await writeExclusiveSynced(backup, source);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    const entry = await lstat(backup);
+    if (!entry.isFile() || entry.isSymbolicLink() || await readFile(backup, 'utf8') !== source) {
+      throw new MercuryError('MIGRATION_BACKUP_CONFLICT', '已有迁移备份与当前配置不一致；未修改配置。', { exitCode: 3 });
+    }
+    await chmod(backup, 0o600);
+  }
+}
+
+async function restoreAtomically(target: string, source: string): Promise<void> {
+  const rollback = `${target}.rollback-${process.pid}-${Date.now()}`;
+  try {
+    await writeExclusiveSynced(rollback, source);
+    await rename(rollback, target);
+    await chmod(target, 0o600);
+  } finally {
+    await rm(rollback, { force: true });
+  }
+}
+
+export async function applyConfigMigration(
+  workspaceRoot: string,
+  expectedPlanId: string,
+  options: { faultAfterBackup?: () => Promise<void> | void; faultAfterReplace?: () => Promise<void> | void } = {},
+): Promise<ConfigMigrationStatus & { backup_path: string }> {
   const found = await sourceIfPresent(workspaceRoot);
   if (!found) throw new MercuryError('MODEL_NOT_CONFIGURED', '尚未找到模型配置。', { exitCode: 4, remediation: '运行 mercury 打开交互式 App，在模型中心完成配置。' });
   const expected = planId(found.source);
@@ -69,25 +103,25 @@ export async function applyConfigMigration(workspaceRoot: string, expectedPlanId
   const migrated = migrateModelRegistryV1(found.parsed);
   const target = configPath(workspaceRoot);
   const backup = `${target}.backup-${expected.slice(-12)}`;
-  const temporary = `${target}.migrate-${process.pid}`;
+  const temporary = `${target}.migrate-${process.pid}-${Date.now()}`;
   try {
-    await copyFile(target, backup, constants.COPYFILE_EXCL);
-    await chmod(backup, 0o600);
+    await ensureReusableBackup(backup, found.source);
     await syncFile(backup);
-    const handle = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
-    try { await handle.writeFile(canonicalJson(migrated), 'utf8'); await handle.sync(); } finally { await handle.close(); }
+    await options.faultAfterBackup?.();
+    await writeExclusiveSynced(temporary, canonicalJson(migrated));
     await rename(temporary, target);
     await chmod(target, 0o600);
+    await options.faultAfterReplace?.();
     const validated = validateV2Contract('model-config', JSON.parse(await readFile(target, 'utf8')));
     if (!validated.valid) throw new Error('replacement validation failed');
     return { ...(await inspectConfigMigration(workspaceRoot)), backup_path: backup };
   } catch (error) {
     await rm(temporary, { force: true });
+    if (error instanceof MercuryError && error.code === 'MIGRATION_BACKUP_CONFLICT') throw error;
     try {
       const backupEntry = await lstat(backup);
       if (backupEntry.isFile() && !backupEntry.isSymbolicLink()) {
-        await copyFile(backup, target);
-        await chmod(target, 0o600);
+        await restoreAtomically(target, await readFile(backup, 'utf8'));
       }
     } catch {}
     throw new MercuryError('MIGRATION_FAILED', '配置迁移未完成，已保留或恢复原配置。', { exitCode: 1, remediation: '检查配置目录权限与备份文件后重新执行 --check。' });

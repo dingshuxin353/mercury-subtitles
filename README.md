@@ -101,6 +101,8 @@ mercury worker start --json
 
 查询状态不会偷偷启动 Worker，也不会重复提交任务。Provider 结果不确定时，Mercury 会停下来阻止自动重放，避免重复调用或计费。
 
+`0.3.0-alpha.1` 候选还提供 Exchange Protocol v1：脚本可显式导入 SRT、VTT 或 transcript JSON 作为转写事实源（ASR 0 调用），也可用 `reference` 继续走 ASR；两种模式共用稳定任务、事件、结果、词典快照和审阅合同。全局/项目词典通过 `mercury dictionary ... --json` 管理，任务创建后固定 revision/hash。
+
 [CLI 完整说明 →](https://github.com/dingshuxin353/mercury-subtitles/blob/main/docs/cli.md)
 
 ## 方式二：让 Agent 通过 Skill 使用
@@ -164,7 +166,7 @@ Skill 只使用 Mercury 的机器命令。它不会向你索要 Key，不会自�
 - 输入以中文 MP3 为主；视频、翻译、批量任务、本地 ASR、插件市场和多 Worker 尚未提供。
 - 大于 15 MB 的音频不会发送给 Chat 做强校验，但仍可按文本路径处理；这不是 ASR 的通用大小上限。
 - 内置 ASR：火山音视频字幕、火山极速版。校验模型支持 Vertex AI Gemini、Gemini Developer API 与 OpenAI-compatible Chat endpoint；实际可用性仍取决于你的账号、区域和模型权限。
-- Alpha 版本可能调整机器 JSON 合同；自动化用户升级前请阅读 [CHANGELOG](./CHANGELOG.md)。
+- Exchange Protocol v1 是 V0.3 的稳定外部机器合同；内部 task/job/lock 文件仍不是公共 API。自动化用户升级前请阅读 [CHANGELOG](./CHANGELOG.md)。
 
 ## 常见问题
 

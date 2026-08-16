@@ -123,7 +123,36 @@ describe('Exchange Protocol v1 contracts', () => {
 
   it('rejects secret-shaped extension keys', () => {
     const bad = request({ extensions: { 'com.example': { authorization: 'Bearer secret' } } });
-    expect(() => assertExchangeContract('request', bad)).toThrowError(/扩展字段不得携带凭据/);
+    expect(() => assertExchangeContract('request', bad)).toThrowError(/credential|凭据/iu);
+  });
+
+  it('rejects secret-shaped values throughout extensions, event data, errors, transcripts, and dictionaries', () => {
+    const secret = `Authorization: Bearer ${'x'.repeat(40)}`;
+    expect(validateExchangeContract('request', request({ extensions: { 'com.example': { note: secret } } })).valid).toBe(false);
+    expect(validateExchangeContract('event', {
+      contract: 'mercury.event/v1', event_id: 'evt-1234567890abcdef', task_id: 'tsk-20260816-120000-deadbeef', sequence: 1,
+      occurred_at: now, type: 'fixture', severity: 'error', task_revision: 1, attempt_id: null, stage: null, progress: null,
+      message: '失败', data: { note: secret }, extensions: {},
+    }).valid).toBe(false);
+    expect(validateExchangeContract('error', {
+      contract: 'mercury.error/v1', code: 'FIXTURE_ERROR', category: 'runtime', message: '失败', retryability: 'not_applicable',
+      provider_outcome: 'not_applicable', remediation: ['检查输入。'], technical: { provider_code: null, log_id: null, detail: secret }, extensions: {},
+    }).valid).toBe(false);
+    const secretTranscript = transcript(); secretTranscript.extensions = { 'com.example': { note: secret } };
+    expect(validateExchangeContract('transcript', secretTranscript).valid).toBe(false);
+    const secretDictionary = dictionary(); secretDictionary.entries[0]!.notes = secret;
+    expect(validateExchangeContract('dictionary', secretDictionary).valid).toBe(false);
+  });
+
+  it('rejects deeply nested and oversized arbitrary JSON before schema evaluation', () => {
+    const deep: Record<string, unknown> = {}; let cursor = deep;
+    for (let index = 0; index < 25; index += 1) { const child: Record<string, unknown> = {}; cursor.next = child; cursor = child; }
+    const deepResult = validateExchangeContract('request', request({ extensions: { 'com.example': deep } }));
+    expect(deepResult.valid).toBe(false);
+    if (!deepResult.valid) expect(deepResult.issues.some((entry) => entry.message.includes('递归深度'))).toBe(true);
+    const largeResult = validateExchangeContract('request', request({ extensions: { 'com.example': { note: 'x'.repeat(1_000_000) } } }));
+    expect(largeResult.valid).toBe(false);
+    if (!largeResult.valid) expect(largeResult.issues.some((entry) => entry.message.includes('单个字符串'))).toBe(true);
   });
 
   it('validates complete internal v5 state and rejects missing fields or impossible combinations', () => {
@@ -161,6 +190,9 @@ describe('Exchange Protocol v1 contracts', () => {
     impossible.status = 'completed';
     impossible.execution.ended_at = now;
     expect(validateV5TaskRecord(impossible).valid).toBe(false);
+    const secretTask = structuredClone(record);
+    secretTask.warnings = [`${'Author'}ization: ${'Bear'}er ${'x'.repeat(40)}`];
+    expect(validateV5TaskRecord(secretTask).valid).toBe(false);
   });
 });
 
@@ -173,6 +205,14 @@ describe('stable storage and history projection', () => {
     expect(await readFile(target, 'utf8')).toBe('{\n  "a": {\n    "b": 1,\n    "c": 2\n  },\n  "z": 1\n}\n');
     expect((await stat(target)).mode & 0o777).toBe(0o600);
     expect(await readStableJson(target)).toEqual({ a: { b: 1, c: 2 }, z: 1 });
+  });
+
+  it('rejects oversized stable JSON files before parsing', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'mercury-exchange-large-'));
+    roots.push(root);
+    const target = path.join(root, 'large.json');
+    await writeFile(target, `${JSON.stringify({ payload: 'x'.repeat(8 * 1024 * 1024) })}\n`);
+    await expect(readStableJson(target, 'REQUEST_INVALID')).rejects.toMatchObject({ code: 'REQUEST_INVALID' });
   });
 
   it('repairs only a trailing half-line and rejects middle corruption', async () => {

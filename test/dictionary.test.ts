@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -38,7 +38,10 @@ describe('versioned dictionaries', () => {
     const snapshot = await resolveDictionarySnapshot(root, request([], 'p1', [override]), 'tsk-20260817-000000-aaaaaaaa', '这里说任务名');
     expect(snapshot.entries.find((entry) => entry.entry_id === 'entry-product-name')?.canonical).toBe('Task Name');
     expect(snapshot.matched_entry_ids).toEqual(['entry-product-name']);
-    expect(snapshot.resolved.map((entry) => entry.source)).toEqual(['project_default', 'global_default']);
+    expect(snapshot.resolved.map((entry) => entry.source)).toEqual(['task_override', 'project_default', 'global_default']);
+    const overrideReference = snapshot.resolved[0]!;
+    expect(overrideReference).toMatchObject({ dictionary_id: 'dict-task-override', source: 'task_override' });
+    expect(snapshot.entries[0]).toMatchObject({ revision: overrideReference.revision, dictionary_id: overrideReference.dictionary_id });
     await mutateDictionary(root, project.dictionary_id, projectV2.revision, (current) => { current.entries[0]!.canonical = 'Later Name'; });
     expect(snapshot.entries[0]!.canonical).toBe('Task Name');
     expect(snapshot.resolved.find((entry) => entry.dictionary_id === global.dictionary_id)?.revision).toBe(globalV2.revision);
@@ -46,6 +49,40 @@ describe('versioned dictionaries', () => {
     const conflict = await createDictionary(root, { name: 'Conflict', scope: 'global' });
     const conflictV2 = (await mutateDictionary(root, conflict.dictionary_id, conflict.revision, (current) => current.entries.push(makeDictionaryEntry({ entry_id: 'entry-other', canonical: 'Other', variants: ['格罗包'] })))).dictionary;
     await expect(resolveDictionarySnapshot(root, request([global.dictionary_id, conflictV2.dictionary_id]), 'tsk-20260817-000001-bbbbbbbb', '格罗包')).rejects.toMatchObject({ code: 'DICTIONARY_CONFLICT' });
+
+    const policy = await createDictionary(root, { name: 'Policy', scope: 'global' });
+    const policyV2 = (await mutateDictionary(root, policy.dictionary_id, policy.revision, (current) => {
+      current.entries.push(makeDictionaryEntry({ entry_id: 'entry-api-upper', canonical: 'API', case_sensitive: true, number_sensitive: true }));
+      current.entries.push(makeDictionaryEntry({ entry_id: 'entry-api-lower', canonical: 'API', case_sensitive: false, number_sensitive: true }));
+    })).dictionary;
+    await expect(resolveDictionarySnapshot(root, request([policyV2.dictionary_id]), 'tsk-20260817-000002-cccccccc', 'API')).rejects.toMatchObject({ code: 'DICTIONARY_CONFLICT' });
+    const numeric = await createDictionary(root, { name: 'Numeric', scope: 'global' });
+    const numericV2 = (await mutateDictionary(root, numeric.dictionary_id, numeric.revision, (current) => {
+      current.entries.push(makeDictionaryEntry({ entry_id: 'entry-wan-strict', canonical: 'Wan 3.0', number_sensitive: true }));
+      current.entries.push(makeDictionaryEntry({ entry_id: 'entry-wan-loose', canonical: 'Wan 3.0', number_sensitive: false }));
+    })).dictionary;
+    await expect(resolveDictionarySnapshot(root, request([numericV2.dictionary_id]), 'tsk-20260817-000003-dddddddd', 'Wan 3.0')).rejects.toMatchObject({ code: 'DICTIONARY_CONFLICT' });
+  });
+
+  it('rejects dictionary path symlinks before changing anything outside the workspace', async () => {
+    const root = await workspace();
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    const outside = await mkdtemp(path.join(os.tmpdir(), 'mercury-dictionary-outside-'));
+    await chmod(outside, 0o755);
+    await symlink(outside, path.join(root, 'dictionaries'));
+    await expect(createDictionary(root, { name: 'Unsafe', scope: 'global' })).rejects.toMatchObject({ code: 'DICTIONARY_PATH_UNSAFE' });
+    expect((await stat(outside)).mode & 0o777).toBe(0o755);
+    expect(await readdir(outside)).toEqual([]);
+
+    const safeRoot = await workspace();
+    const first = await createDictionary(safeRoot, { name: 'Safe', scope: 'global' });
+    const outsideDictionary = await mkdtemp(path.join(os.tmpdir(), 'mercury-dictionary-id-outside-'));
+    await chmod(outsideDictionary, 0o755);
+    const unsafeId = 'dict-unsafe-link';
+    await symlink(outsideDictionary, path.join(safeRoot, 'dictionaries', unsafeId));
+    await expect(mutateDictionary(safeRoot, unsafeId, first.revision, () => undefined)).rejects.toMatchObject({ code: 'DICTIONARY_PATH_UNSAFE' });
+    expect((await stat(outsideDictionary)).mode & 0o777).toBe(0o755);
+    expect(await readdir(outsideDictionary)).toEqual([]);
   });
 
   it('supports deterministic CLI dry-run/confirm and JSON/CSV export without dry-run writes', async () => {
@@ -66,5 +103,22 @@ describe('versioned dictionaries', () => {
     expect(JSON.parse(await readFile(jsonOutput, 'utf8')).entries[0].canonical).toBe('API');
     expect(await readFile(csvOutput, 'utf8')).toContain('entry-api-name,API');
     expect((await stat(jsonOutput)).mode & 0o777).toBe(0o600);
+  });
+
+  it('round-trips explicit boolean values and clear operations for editable entry fields', async () => {
+    const root = await workspace();
+    const dictionary = await createDictionary(root, { name: 'Editable', scope: 'global' });
+    const added = await runDictionaryCommand(root, [
+      'entry', 'add', dictionary.dictionary_id, '--revision', dictionary.revision,
+      '--entry-id', 'entry-editable', '--canonical', 'API', '--variant', '接口', '--tag', 'tech',
+      '--notes', 'initial', '--case-sensitive', 'true', '--number-sensitive', 'true', '--json',
+    ]) as any;
+    const edited = await runDictionaryCommand(root, [
+      'entry', 'edit', dictionary.dictionary_id, '--revision', added.dictionary.revision,
+      '--entry-id', 'entry-editable', '--case-sensitive', 'false', '--number-sensitive', 'false',
+      '--clear-variants', '--clear-tags', '--clear-notes', '--json',
+    ]) as any;
+    const entry = edited.dictionary.entries[0];
+    expect(entry).toMatchObject({ case_sensitive: false, number_sensitive: false, variants: [], tags: [], notes: null });
   });
 });

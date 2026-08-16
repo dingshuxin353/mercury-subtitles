@@ -302,6 +302,7 @@ function redactedProviderResponse(value: unknown): unknown {
 
 export class VolcengineAsrAdapter implements AsrAdapter {
   readonly adapterId = 'volcengine_asr' as const;
+  readonly asrHintsCapability = { status: 'not_supported', reason: '内置火山极速版未提供逐任务动态热词映射。' } as const;
 
   private readonly fetch: typeof globalThis.fetch;
   private readonly now: () => Date;
@@ -383,7 +384,8 @@ export class VolcengineAsrAdapter implements AsrAdapter {
     try {
       await input.beforeProviderDispatch?.('volcengine_asr_recognize');
       await this.dependencies.beforeProviderDispatch?.('volcengine_asr_recognize');
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && error.name === 'SimulatedV5Crash') throw error;
       return this.failedResult(input, {
         call: null,
         code: 'PROVIDER_DISPATCH_CHECKPOINT_FAILED',

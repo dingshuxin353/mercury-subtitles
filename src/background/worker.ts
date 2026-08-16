@@ -28,6 +28,8 @@ import {
   heartbeatV5Task,
   isV5TaskDirectory,
   readV5Task,
+  SimulatedV5Crash,
+  type V5FaultPoint,
 } from '../exchange/runtime.js';
 import type { TaskRecordV5 } from '../contracts/generated/task-record-v5.js';
 import { finalizeV5Review, initializeV5Review } from '../review-v5.js';
@@ -329,6 +331,16 @@ type WorkerFaultPoint =
   | 'after_review'
   | 'before_finish';
 
+type V5WorkerFaultPoint = V5FaultPoint | 'after_claim' | 'after_execute' | 'after_review' | 'before_finish';
+
+async function v5CrashFault(
+  fault: ((point: V5WorkerFaultPoint, task: TaskRecordV5) => Promise<void> | void) | undefined,
+  point: V5WorkerFaultPoint,
+  task: TaskRecordV5,
+): Promise<void> {
+  try { await fault?.(point, structuredClone(task)); } catch (error) { throw new SimulatedV5Crash(point, error); }
+}
+
 class SimulatedClaimCrash extends Error {
   constructor(readonly cause: unknown) {
     super(cause instanceof Error ? cause.message : String(cause));
@@ -528,6 +540,7 @@ export async function runWorker(
     now?: () => Date;
     heartbeatIntervalMs?: number;
     fault?: (point: WorkerFaultPoint, task: TaskRecordV2) => Promise<void> | void;
+    v5Fault?: (point: V5WorkerFaultPoint, task: TaskRecordV5) => Promise<void> | void;
     lifecycleFault?: (point: 'after_empty_scan' | 'after_stopping_persisted') => Promise<void> | void;
     heartbeatFault?: () => Promise<void> | void;
   } = {},
@@ -627,7 +640,9 @@ export async function runWorker(
       await queueWorkerWrite();
       try {
         if (v5) {
-          let finalTask = await executeV5Task(directory, dependencies);
+          await v5CrashFault(options.v5Fault, 'after_claim', task as TaskRecordV5);
+          let finalTask = await executeV5Task(directory, dependencies, options.v5Fault);
+          await v5CrashFault(options.v5Fault, 'after_execute', finalTask);
           await heartbeatChain;
           if (heartbeatError) throw heartbeatError;
           if (finalTask.status === 'completed') {
@@ -635,9 +650,11 @@ export async function runWorker(
             if (review.status === 'not_required') await finalizeV5Review(directory);
             finalTask = await readV5Task(directory);
           }
+          await v5CrashFault(options.v5Fault, 'after_review', finalTask);
           await appendV5Event(directory, finalTask, finalTask.status === 'completed' ? 'task_completed' : finalTask.status === 'cancelled' ? 'task_cancelled' : finalTask.status === 'interrupted' ? 'task_interrupted' : 'task_failed', finalTask.status === 'completed' ? '后台任务处理完成。' : '后台任务已结束，请查看状态和下一步。');
           if (finalTask.status === 'completed') await appendV5Event(directory, finalTask, 'review_ready', finalTask.review.status === 'finalized' ? '校验结果无需逐项决定，人工批准稿已生成。' : 'AI 校验已完成，可以开始人工审阅。');
           finalTask = await readV5Task(directory);
+          await v5CrashFault(options.v5Fault, 'before_finish', finalTask);
           await finishV5Job(workspaceRoot, finalTask);
           worker.state = 'idle';
           worker.task_id = null;
@@ -675,6 +692,7 @@ export async function runWorker(
         await options.fault?.('before_finish', finalTask);
         await finishJob(workspaceRoot, finalTask);
       } catch (error) {
+        if (error instanceof SimulatedV5Crash) throw error.cause;
         try {
           const outcome = v5
             ? await containV5Failure(workspaceRoot, job, error)

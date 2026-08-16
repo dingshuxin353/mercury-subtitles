@@ -885,7 +885,8 @@ export class OpenAiChatCalibrationRuntimeV2
     try {
       await input.beforeProviderDispatch?.('openai_chat_calibration');
       await this.dependencies.beforeProviderDispatch?.('openai_chat_calibration');
-    } catch {
+    } catch (cause) {
+      if (cause instanceof Error && cause.name === 'SimulatedV5Crash') throw cause;
       return this.beforeCallFailure(
         input,
         'PROVIDER_DISPATCH_CHECKPOINT_FAILED',
@@ -1200,7 +1201,8 @@ export class GeminiChatCalibrationRuntimeV2
     try {
       await input.beforeProviderDispatch?.('gemini_chat_calibration');
       await this.dependencies.beforeProviderDispatch?.('gemini_chat_calibration');
-    } catch {
+    } catch (cause) {
+      if (cause instanceof Error && cause.name === 'SimulatedV5Crash') throw cause;
       return this.beforeCallFailure(
         input,
         'PROVIDER_DISPATCH_CHECKPOINT_FAILED',

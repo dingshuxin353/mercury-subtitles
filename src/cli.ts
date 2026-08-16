@@ -100,7 +100,9 @@ Mercury 0.3 Alpha.1
   mercury task status|result <task-id> --json
   mercury task list --limit <n> --json
   mercury task watch <task-id> --after <sequence> --jsonl
-  mercury dictionary ... --json
+  mercury dictionary create|list|show ... --json
+  mercury dictionary entry add|edit|remove <dictionary-id> ... --json
+  mercury dictionary validate|import|export ... --json
 
 高级 / 兼容命令（旧实验合同，deprecated）：
   mercury setup [--config <setup.json>] [--confirm-cloud-data]

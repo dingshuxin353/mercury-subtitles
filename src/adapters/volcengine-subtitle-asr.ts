@@ -225,6 +225,7 @@ function normalizeSegments(
 
 export class VolcengineSubtitleAsrAdapter implements AsrAdapter {
   readonly adapterId = 'volcengine_subtitle_asr' as const;
+  readonly asrHintsCapability = { status: 'not_supported', reason: '内置火山音视频字幕未提供逐任务动态热词映射。' } as const;
   private readonly fetch: typeof globalThis.fetch;
   private readonly now: () => Date;
   private readonly createId: () => string;
@@ -273,7 +274,8 @@ export class VolcengineSubtitleAsrAdapter implements AsrAdapter {
     try {
       await input.beforeProviderDispatch?.('volcengine_subtitle_submit');
       await this.dependencies.beforeProviderDispatch?.('volcengine_subtitle_submit');
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && error.name === 'SimulatedV5Crash') throw error;
       return this.failure(input, callId, startedAt, 'PROVIDER_DISPATCH_CHECKPOINT_FAILED', '无法在上传前保存 Provider 调用检查点。', 'artifact_write', false, null, '检查任务目录权限后显式恢复 Worker。', 'not_dispatched');
     }
     let submit: Response;
@@ -315,7 +317,8 @@ export class VolcengineSubtitleAsrAdapter implements AsrAdapter {
     try {
       await input.beforeProviderDispatch?.('volcengine_subtitle_query');
       await this.dependencies.beforeProviderDispatch?.('volcengine_subtitle_query');
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && error.name === 'SimulatedV5Crash') throw error;
       return this.failure(input, callId, startedAt, 'PROVIDER_QUERY_CHECKPOINT_FAILED', `任务已提交，但无法在查询前保存调用检查点（task id=${jobId}）。`, 'artifact_write', false, jobId, '保留 task id；修复本地任务目录后只读续查，绝不能重新提交音频。', 'outcome_unknown');
     }
     let queried: Response;

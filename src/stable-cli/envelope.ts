@@ -1,5 +1,6 @@
 import type { ExchangeErrorV1 } from '../contracts/index.js';
 import { MercuryError } from '../errors.js';
+import { sensitiveTextIssues } from '../contracts/validation/security.js';
 
 export const STABLE_CLI_CONTRACT = 'mercury.cli/v1' as const;
 
@@ -22,7 +23,7 @@ export function stableSuccess<T>(command: string, data: T, version: string): Sta
 }
 
 function category(code: string): ExchangeErrorV1['category'] {
-  if (/^(?:INPUT|TRANSCRIPT|SRT|VTT|REQUEST_INVALID|CLI_)/u.test(code)) return 'input';
+  if (/^(?:INPUT|TRANSCRIPT|SRT|VTT|REQUEST_INVALID|CLI_|DICTIONARY_IMPORT_INVALID)/u.test(code)) return 'input';
   if (/^(?:MODEL|CONFIG|MIGRATION)/u.test(code)) return 'config';
   if (/^(?:CONTRACT|MACHINE_CONTRACT)/u.test(code)) return 'compatibility';
   if (/^(?:TASK_STATE|REQUEST_ID_CONFLICT|DICTIONARY_(?:CONFLICT|REVISION_CONFLICT|ENTRY_CONFLICT|SCOPE_MISMATCH))/u.test(code)) return 'conflict';
@@ -44,7 +45,10 @@ export function stableErrorFrom(error: unknown): { error: ExchangeErrorV1; exitC
   return {
     error: {
       contract: 'mercury.error/v1', code: mercury.code, category: category(mercury.code),
-      message: mercury.message.replace(/\s*(?:Provider detail|provider detail)=.*$/iu, '').trim(),
+      message: (() => {
+        const message = mercury.message.replace(/\s*(?:Provider detail|provider detail)=.*$/iu, '').trim();
+        return sensitiveTextIssues(message).length > 0 ? '操作失败，原始错误包含敏感信息，已脱敏。' : message;
+      })(),
       retryability: 'not_applicable', provider_outcome: 'not_applicable',
       remediation: [mercury.remediation ?? '请核对命令、合同版本与本地状态后重试。'],
       technical: null, extensions: {},

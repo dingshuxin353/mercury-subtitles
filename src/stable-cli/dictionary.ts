@@ -79,8 +79,11 @@ export async function runDictionaryCommand(workspace: string, args: string[]): P
   if (operation === 'show') { ensureOnly(args.slice(2), ['--revision']); const id = args[1]; if (!id || id.startsWith('--')) throw new MercuryError('CLI_ARGUMENT_INVALID', 'dictionary show 必须提供词典 ID。', { exitCode: 2 }); return readDictionary(workspace, id, option(args, '--revision')); }
   if (operation === 'entry') {
     const action = args[1]; const id = args[2]; if (!['add', 'edit', 'remove'].includes(action ?? '') || !id || id.startsWith('--')) throw new MercuryError('CLI_ARGUMENT_INVALID', 'dictionary entry 需要 add|edit|remove 和词典 ID。', { exitCode: 2 });
-    const commandArgs = args.slice(3); ensureOnly(commandArgs, ['--revision', '--entry-id', '--canonical', '--variant', '--kind', '--language', '--notes', '--tag', '--enabled'], ['--case-sensitive', '--number-sensitive']);
+    const commandArgs = args.slice(3); ensureOnly(commandArgs, ['--revision', '--entry-id', '--canonical', '--variant', '--kind', '--language', '--notes', '--tag', '--enabled', '--case-sensitive', '--number-sensitive'], ['--clear-variants', '--clear-tags', '--clear-notes']);
     const expected = required(commandArgs, '--revision'); const entryId = required(commandArgs, '--entry-id');
+    if (commandArgs.includes('--clear-variants') && commandArgs.includes('--variant')) throw new MercuryError('CLI_ARGUMENT_INVALID', '--clear-variants 不能与 --variant 同时使用。', { exitCode: 2 });
+    if (commandArgs.includes('--clear-tags') && commandArgs.includes('--tag')) throw new MercuryError('CLI_ARGUMENT_INVALID', '--clear-tags 不能与 --tag 同时使用。', { exitCode: 2 });
+    if (commandArgs.includes('--clear-notes') && option(commandArgs, '--notes') !== undefined) throw new MercuryError('CLI_ARGUMENT_INVALID', '--clear-notes 不能与 --notes 同时使用。', { exitCode: 2 });
     return mutateDictionary(workspace, id, expected, (current) => {
       const index = current.entries.findIndex((entry) => entry.entry_id === entryId);
       if (action === 'remove') { if (index < 0) throw new MercuryError('DICTIONARY_ENTRY_NOT_FOUND', `未找到条目 ${entryId}。`, { exitCode: 2 }); current.entries.splice(index, 1); return; }
@@ -90,13 +93,13 @@ export async function runDictionaryCommand(workspace: string, args: string[]): P
       const canonical = option(commandArgs, '--canonical') ?? previous?.canonical; if (!canonical) throw new MercuryError('CLI_OPTION_VALUE_MISSING', '--canonical 缺少参数值。', { exitCode: 2 });
       const entry = makeDictionaryEntry({
         ...previous, entry_id: entryId, canonical,
-        ...(commandArgs.includes('--variant') ? { variants: values(commandArgs, '--variant') } : {}),
+        ...(commandArgs.includes('--clear-variants') ? { variants: [] } : commandArgs.includes('--variant') ? { variants: values(commandArgs, '--variant') } : {}),
         ...(option(commandArgs, '--kind') ? { kind: option(commandArgs, '--kind') as Entry['kind'] } : {}),
         ...(option(commandArgs, '--language') ? { language: option(commandArgs, '--language')! } : {}),
-        case_sensitive: commandArgs.includes('--case-sensitive') || previous?.case_sensitive === true,
-        number_sensitive: commandArgs.includes('--number-sensitive') || previous?.number_sensitive === true,
-        ...(option(commandArgs, '--notes') !== undefined ? { notes: option(commandArgs, '--notes')! } : {}),
-        ...(commandArgs.includes('--tag') ? { tags: values(commandArgs, '--tag') } : {}),
+        case_sensitive: bool(option(commandArgs, '--case-sensitive'), previous?.case_sensitive ?? false),
+        number_sensitive: bool(option(commandArgs, '--number-sensitive'), previous?.number_sensitive ?? false),
+        ...(commandArgs.includes('--clear-notes') ? { notes: null } : option(commandArgs, '--notes') !== undefined ? { notes: option(commandArgs, '--notes')! } : {}),
+        ...(commandArgs.includes('--clear-tags') ? { tags: [] } : commandArgs.includes('--tag') ? { tags: values(commandArgs, '--tag') } : {}),
         enabled: bool(option(commandArgs, '--enabled'), previous?.enabled ?? true),
       });
       if (index >= 0) current.entries[index] = entry; else current.entries.push(entry);

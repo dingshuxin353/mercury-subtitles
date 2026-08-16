@@ -24,6 +24,28 @@ mercury calibrate --audio "/path/to/input.mp3" --srt "/path/to/reference.srt" --
 
 保存返回的 `task_id`。机器调用如需安全重放，应先用稳定逻辑身份派生 `request_id`，并在同一次用户请求的重试中复用它；用户明确要求重新跑时应创建新的逻辑身份。
 
+V0.3 的稳定入口使用 Exchange request：
+
+```bash
+mercury input inspect --file "/绝对路径/subtitle.vtt" --format vtt --role transcript-source --json
+mercury task submit --request "/绝对路径/request.json" --json
+```
+
+`transcription_mode=provided` 只接受显式 `transcript_source`，并保证 ASR 为 0；`transcription_mode=provider` 的可选字幕必须声明 `reference`，仍会执行 ASR。两种模式共用同一 v5 幂等、后台、词典、结果和审阅链路。
+
+## 词典
+
+```bash
+mercury dictionary create --name "产品术语" --scope global --json
+mercury dictionary list --json
+mercury dictionary show <dictionary-id> --json
+mercury dictionary entry add <dictionary-id> --revision <revision> --entry-id entry-api --canonical API --case-sensitive true --number-sensitive false --json
+mercury dictionary entry edit <dictionary-id> --revision <revision> --entry-id entry-api --case-sensitive false --clear-variants --clear-tags --clear-notes --json
+mercury dictionary entry remove <dictionary-id> --revision <revision> --entry-id entry-api --json
+```
+
+布尔值必须显式写 `true` 或 `false`。`--clear-variants`、`--clear-tags` 和 `--clear-notes` 表达清空意图；所有写操作都要求当前 revision，陈旧编辑会失败而不是覆盖。
+
 ## 查询和恢复
 
 ```bash

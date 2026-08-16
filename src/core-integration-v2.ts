@@ -301,7 +301,7 @@ async function interruptProviderUnknown(
   await finishReport(root, task, snapshot, calibration, null);
   return task;
 }
-function legacyAsrEntry(
+export function legacyAsrEntry(
   entry: ModelSnapshotV2['models']['asr'],
 ): ModelSnapshotEntry {
   return {

@@ -5,6 +5,8 @@ import commonSchema from '../../schemas/exchange/v1/common.schema.json' with { t
 import errorSchema from '../../schemas/exchange/v1/error.schema.json' with { type: 'json' };
 import type { TaskRecordV5 } from './generated/task-record-v5.js';
 import { MercuryError } from '../errors.js';
+import { sensitiveInformationIssues } from './validation/security.js';
+import { exchangeJsonResourceIssues } from './exchange-v1.js';
 
 export type V5ValidationIssue = { path: string; message: string };
 export type V5ValidationResult =
@@ -53,6 +55,10 @@ function semanticIssues(value: TaskRecordV5): V5ValidationIssue[] {
 }
 
 export function validateV5TaskRecord(value: unknown): V5ValidationResult {
+  const resourceIssues = exchangeJsonResourceIssues(value);
+  if (resourceIssues.length > 0) return { valid: false, value: null, issues: resourceIssues };
+  const securityIssues = sensitiveInformationIssues(value).map((entry) => ({ path: entry.path, message: entry.message }));
+  if (securityIssues.length > 0) return { valid: false, value: null, issues: securityIssues };
   const validate = ajv.getSchema(taskRecordSchema.$id)!;
   if (!validate(value)) {
     return { valid: false, value: null, issues: (validate.errors ?? []).map((error: ErrorObject) => ({ path: error.instancePath || '/', message: error.message ?? error.keyword })) };

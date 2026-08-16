@@ -2,15 +2,18 @@ import { createHash, randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
 import { chmod, copyFile, lstat, mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
-import type { CalibrationResult, CalibrationResultV3, ExchangeEventV1, ExchangeRequestV1, ExchangeResultV1, ExchangeTaskV1, ExchangeTranscriptV1, ModelSnapshotEntryV2, TranscriptRaw } from '../contracts/index.js';
+import type { AsrAdapter, AsrHintsCapableAdapter, CalibrationResult, CalibrationResultV3, ExchangeEventV1, ExchangeRequestV1, ExchangeResultV1, ExchangeTaskV1, ExchangeTranscriptV1, ModelSnapshotEntryV2, TranscriptRaw } from '../contracts/index.js';
 import type { TaskRecordV5 } from '../contracts/generated/task-record-v5.js';
 import { assertExchangeContract, validateContract } from '../contracts/index.js';
 import { assertV5TaskRecord } from '../contracts/v5.js';
 import { MercuryError } from '../errors.js';
-import { inspectTranscriptInput } from '../external-input.js';
+import { inspectTranscriptInput, serializeTranscriptSrt } from '../external-input.js';
 import { loadModelRegistryV2, snapshotModelV2 } from '../models-v2.js';
-import { readCredentialReference, readMp3DurationMs } from '../models.js';
+import { readCredentialReference, readMp3DurationMs, resolveVolcengineCredentialReference } from '../models.js';
 import { CHAT_INLINE_AUDIO_LIMIT_BYTES, createChatCalibrationRuntimeV2, type ChatCalibrationV2Dependencies } from '../adapters/chat-calibration-v2.js';
+import { VolcengineAsrAdapter, type ResolvedVolcengineCredential } from '../adapters/volcengine-asr.js';
+import { VolcengineSubtitleAsrAdapter } from '../adapters/volcengine-subtitle-asr.js';
+import { legacyAsrEntry } from '../core-integration-v2.js';
 import { parseReferenceSrt, runSubtitleCore, type CalibratedTranscript } from '../subtitle-core/index.js';
 import { serializeCalibratedSrt, validateSrtFile } from '../output-report/srt.js';
 import { createTaskId, safeAudioStem, sha256File } from '../tasks.js';
@@ -20,8 +23,20 @@ import { ensureRuntimeLayout, jsonFingerprint, readJob, readRequest, requestIdHa
 import { JOB_CONTRACT_VERSION, REQUEST_CONTRACT_VERSION, type BackgroundJobV1, type BackgroundRequestV1 } from '../background/types.js';
 import { resolveDictionarySnapshot, type ResolvedDictionarySnapshot } from '../dictionary.js';
 import { withOwnedLock } from '../background/owned-lock.js';
+import { sensitiveTextIssues } from '../contracts/validation/security.js';
 
 type ProviderCall = TaskRecordV5['execution']['provider_calls']['chat'];
+export type V5FaultPoint = 'after_dispatch_persisted' | 'after_response_persisted' | 'terminal_task_before_result';
+export class SimulatedV5Crash extends Error {
+  constructor(readonly point: V5FaultPoint | 'after_claim' | 'after_execute' | 'after_review' | 'before_finish', readonly cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = 'SimulatedV5Crash';
+  }
+}
+
+async function crashFault(fault: ((point: V5FaultPoint, task: TaskRecordV5) => Promise<void> | void) | undefined, point: V5FaultPoint, task: TaskRecordV5): Promise<void> {
+  try { await fault?.(point, structuredClone(task)); } catch (error) { throw new SimulatedV5Crash(point, error); }
+}
 const TASK_ID = /^tsk-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}$/u;
 const TERMINAL = new Set(['needs_input', 'completed', 'failed', 'cancelled', 'interrupted']);
 
@@ -79,13 +94,39 @@ export async function persistV5Task(directory: string, task: TaskRecordV5): Prom
       if (current.identity.task_id !== checked.identity.task_id || current.identity.request_fingerprint !== checked.identity.request_fingerprint) {
         throw new MercuryError('TASK_RECORD_INVALID', 'v5 task 写入 identity 冲突。');
       }
-      if (TERMINAL.has(current.status) && !TERMINAL.has(checked.status)) checked = current;
-      else {
-        checked.identity.revision = Math.max(checked.identity.revision, current.identity.revision);
-        checked.execution.cancel_requested_at ??= current.execution.cancel_requested_at;
-        if ((current.execution.heartbeat_at ?? '') > (checked.execution.heartbeat_at ?? '')) checked.execution.heartbeat_at = current.execution.heartbeat_at;
-        if (current.updated_at > checked.updated_at) checked.updated_at = current.updated_at;
+      // revision is a compare-and-swap token. A writer that read an older task may
+      // refresh heartbeat-like data, but it may never replace business state.
+      if (checked.identity.revision < current.identity.revision) {
+        Object.assign(task, structuredClone(current));
+        return;
       }
+      if (TERMINAL.has(current.status) && checked.status !== current.status) {
+        throw new MercuryError('TASK_STATE_TRANSITION_INVALID', `任务终态不可从 ${current.status} 改写为 ${checked.status}。`);
+      }
+      const allowed: Record<string, Set<string>> = {
+        queued: new Set(['queued', 'running', 'cancelled', 'failed']),
+        running: new Set(['running', 'queued', 'completed', 'failed', 'cancelled', 'interrupted', 'needs_input']),
+        pausing: new Set(['pausing', 'paused', 'cancelled', 'interrupted']),
+        paused: new Set(['paused', 'queued', 'cancelled']),
+        needs_input: new Set(['needs_input']), completed: new Set(['completed']), failed: new Set(['failed']),
+        cancelled: new Set(['cancelled']), interrupted: new Set(['interrupted']),
+      };
+      if (!allowed[current.status]?.has(checked.status)) {
+        throw new MercuryError('TASK_STATE_TRANSITION_INVALID', `任务状态不可从 ${current.status} 转换为 ${checked.status}。`);
+      }
+      const callRank = { not_started: 0, in_flight: 1, response_persisted: 2, terminal: 3 } as const;
+      for (const role of ['asr', 'chat'] as const) {
+        const before = current.execution.provider_calls[role];
+        const after = checked.execution.provider_calls[role];
+        if (callRank[after.state] < callRank[before.state] || after.count < before.count) {
+          throw new MercuryError('PROVIDER_CHECKPOINT_REGRESSION', `${role} Provider 检查点不可回退。`);
+        }
+      }
+      checked.identity.revision = Math.max(checked.identity.revision, current.identity.revision + 1);
+      checked.execution.cancel_requested_at ??= current.execution.cancel_requested_at;
+      if (current.status === 'running' && checked.status === 'running' && current.execution.worker_id === checked.execution.worker_id
+        && (current.execution.heartbeat_at ?? '') > (checked.execution.heartbeat_at ?? '')) checked.execution.heartbeat_at = current.execution.heartbeat_at;
+      if (current.updated_at > checked.updated_at) checked.updated_at = current.updated_at;
     }
     await writeStableJsonAtomic(path.join(directory, 'task.json'), assertV5TaskRecord(checked));
     Object.assign(task, structuredClone(checked));
@@ -122,19 +163,20 @@ export async function appendV5Event(directory: string, task: TaskRecordV5, type:
     const events = await stableEvents(directory);
     const sequence = (events.at(-1)?.sequence ?? 0) + 1;
     const revision = Math.max(current.identity.revision, events.at(-1)?.task_revision ?? 0) + 1;
+    const next = structuredClone(current);
     const event = assertExchangeContract('event', {
       contract: 'mercury.event/v1', event_id: `evt-${randomBytes(8).toString('hex')}`, task_id: task.identity.task_id,
       sequence, occurred_at: new Date().toISOString(), type, severity: type.includes('failed') || type.includes('interrupted') ? 'error' : 'info',
-      task_revision: revision, attempt_id: task.execution.attempt_id, stage: task.stage, progress: null,
+      task_revision: revision, attempt_id: current.execution.attempt_id, stage: current.stage, progress: null,
       message: message.replace(/[\r\n\u0000-\u001f]/gu, ' ').slice(0, 500), data, extensions: {},
     });
     await appendStableJsonLine(path.join(directory, 'events.jsonl'), event);
-    task.identity.revision = revision;
-    task.execution.cancel_requested_at ??= current.execution.cancel_requested_at;
-    task.updated_at = event.occurred_at;
-    await persistV5Task(directory, task);
+    next.identity.revision = revision;
+    next.updated_at = event.occurred_at;
+    await persistV5Task(directory, next);
+    Object.assign(task, structuredClone(next));
     return event;
-  }, { errorCode: 'EVENT_LOG_LOCKED', errorMessage: '任务事件正在由另一个 Mercury 进程追加。' });
+  }, { waitMs: 15_000, errorCode: 'EVENT_LOG_LOCKED', errorMessage: '任务事件正在由另一个 Mercury 进程追加。' });
 }
 
 function srtFromTranscript(transcript: ExchangeTranscriptV1): string {
@@ -148,7 +190,12 @@ function srtFromTranscript(transcript: ExchangeTranscriptV1): string {
 
 interface ModelSnapshotV3 {
   contract: 'mercury.model-snapshot/v3'; snapshot_id: string; task_id: string; captured_at: string;
-  models: { asr: null; chat: ModelSnapshotEntryV2 }; evidence_mode: 'text' | 'audio_multimodal'; non_strong_reason: string | null;
+  models: { asr: ModelSnapshotEntryV2 | null; chat: ModelSnapshotEntryV2 }; evidence_mode: 'text' | 'audio_multimodal'; non_strong_reason: string | null;
+}
+
+export interface ExchangeRuntimeDependencies extends ChatCalibrationV2Dependencies {
+  asrAdapter?: AsrAdapter | AsrHintsCapableAdapter;
+  resolveAsrCredential?: (reference: string) => Promise<ResolvedVolcengineCredential>;
 }
 
 function selectChat(registry: Awaited<ReturnType<typeof loadModelRegistryV2>>, taskId: string, explicit: string): ModelSnapshotEntryV2 {
@@ -156,6 +203,15 @@ function selectChat(registry: Awaited<ReturnType<typeof loadModelRegistryV2>>, t
   if (!model) throw new MercuryError('MODEL_SELECTION_INVALID', `Chat 模型 ${explicit} 不存在或类别不匹配。`, { exitCode: 4 });
   if (!model.cloud_data_confirmation.confirmed || !['transcript', 'context'].every((kind) => model.cloud_data_confirmation.data_categories.includes(kind as any))) {
     throw new MercuryError('CLOUD_DATA_NOT_CONFIRMED', '所选 Chat 尚未确认本次转录与上下文发送。', { exitCode: 4 });
+  }
+  return snapshotModelV2(model, taskId);
+}
+
+function selectAsr(registry: Awaited<ReturnType<typeof loadModelRegistryV2>>, taskId: string, explicit: string): ModelSnapshotEntryV2 {
+  const model = registry.models.find((entry) => entry.model_id === explicit && entry.category === 'asr');
+  if (!model) throw new MercuryError('MODEL_SELECTION_INVALID', `ASR 模型 ${explicit} 不存在或类别不匹配。`, { exitCode: 4 });
+  if (!model.cloud_data_confirmation.confirmed || !model.cloud_data_confirmation.data_categories.includes('audio')) {
+    throw new MercuryError('CLOUD_DATA_NOT_CONFIRMED', '所选 ASR 尚未确认音频发送。', { exitCode: 4 });
   }
   return snapshotModelV2(model, taskId);
 }
@@ -175,21 +231,25 @@ function initialCall(outcome: ProviderCall['outcome'] = 'not_dispatched'): Provi
 }
 
 async function createTaskDirectory(workspace: string, request: ExchangeRequestV1, taskId: string, directoryName: string): Promise<TaskRecordV5> {
-  if (request.transcription_mode !== 'provided' || request.inputs.transcript?.role !== 'transcript_source') {
-    throw new MercuryError('CONTRACT_UNSUPPORTED', '0.3.0-alpha.1 的稳定 submit 先支持 provided transcript；provider/reference 请继续使用兼容 calibrate。', { exitCode: 5 });
-  }
-  const inspected = await inspectTranscriptInput({ filePath: request.inputs.transcript.path, format: request.inputs.transcript.format, role: 'transcript_source' });
-  if (inspected.sha256 !== request.inputs.transcript.sha256) throw new MercuryError('INPUT_HASH_MISMATCH', '转录输入 hash 与 request 不一致。', { exitCode: 2 });
+  const provided = request.transcription_mode === 'provided';
+  if (provided && request.inputs.transcript?.role !== 'transcript_source') throw new MercuryError('TRANSCRIPT_ROLE_REQUIRED', 'provided 模式必须提供 transcript_source。', { exitCode: 2 });
+  if (!provided && request.inputs.transcript && request.inputs.transcript.role !== 'reference') throw new MercuryError('TRANSCRIPT_ROLE_REQUIRED', 'provider 模式的外部字幕只能声明 reference。', { exitCode: 2 });
+  if (!provided && !request.inputs.media) throw new MercuryError('REQUEST_INVALID', 'provider 模式必须提供媒体输入。', { exitCode: 2 });
+  const inspected = request.inputs.transcript
+    ? await inspectTranscriptInput({ filePath: request.inputs.transcript.path, format: request.inputs.transcript.format, role: request.inputs.transcript.role })
+    : null;
+  if (inspected && inspected.sha256 !== request.inputs.transcript!.sha256) throw new MercuryError('INPUT_HASH_MISMATCH', `${provided ? '转录' : '参考字幕'}输入 hash 与 request 不一致。`, { exitCode: 2 });
   let mediaBytes: number | null = null;
   let mediaDuration: number | null = null;
   if (request.inputs.media) {
     if (await sha256File(request.inputs.media.path) !== request.inputs.media.sha256) throw new MercuryError('INPUT_HASH_MISMATCH', '媒体输入 hash 与 request 不一致。', { exitCode: 2 });
     mediaBytes = (await regular(request.inputs.media.path)).size;
     mediaDuration = await readMp3DurationMs(request.inputs.media.path);
-    if ((inspected.transcript.segments.at(-1)?.end_ms ?? 0) > mediaDuration + 1500) throw new MercuryError('TRANSCRIPT_IMPORT_INVALID', '转录末尾超过媒体时长 1500ms 容忍范围。', { exitCode: 2 });
+    if (provided && (inspected!.transcript.segments.at(-1)?.end_ms ?? 0) > mediaDuration + 1500) throw new MercuryError('TRANSCRIPT_IMPORT_INVALID', '转录末尾超过媒体时长 1500ms 容忍范围。', { exitCode: 2 });
   }
   const registry = await loadModelRegistryV2(workspace);
   const chat = selectChat(registry, taskId, request.models.chat);
+  const asr = provided ? null : selectAsr(registry, taskId, request.models.asr!);
   const decision = evidence(chat, mediaBytes);
   const createdAt = request.created_at;
   const staging = path.join(workspace, 'tasks', `.${directoryName}.staging-${process.pid}-${randomBytes(4).toString('hex')}`);
@@ -198,41 +258,44 @@ async function createTaskDirectory(workspace: string, request: ExchangeRequestV1
   try {
     for (const child of ['input', 'work', 'output']) await mkdir(path.join(staging, child), { mode: 0o700 });
     await writeStableJsonAtomic(path.join(staging, 'request.json'), request);
-    const sourceExtension = request.inputs.transcript.format === 'transcript_json' ? 'json' : request.inputs.transcript.format;
-    const transcriptRelative = `input/transcript-source.${sourceExtension}`;
-    await copyVerified(request.inputs.transcript.path, path.join(staging, transcriptRelative), request.inputs.transcript.sha256);
+    const sourceExtension = request.inputs.transcript ? (request.inputs.transcript.format === 'transcript_json' ? 'json' : request.inputs.transcript.format) : null;
+    const transcriptRelative = request.inputs.transcript ? `input/${provided ? 'transcript-source' : 'reference-source'}.${sourceExtension}` : null;
+    if (request.inputs.transcript && transcriptRelative) await copyVerified(request.inputs.transcript.path, path.join(staging, transcriptRelative), request.inputs.transcript.sha256);
     let media: TaskRecordV5['inputs']['media'] = null;
     if (request.inputs.media) {
       const relative = `input/media${path.extname(request.inputs.media.path).toLocaleLowerCase('en-US') || '.mp3'}`;
       const bytes = await copyVerified(request.inputs.media.path, path.join(staging, relative), request.inputs.media.sha256);
       media = { original_path: request.inputs.media.path, workspace_path: relative, sha256: request.inputs.media.sha256, bytes, mime_type: request.inputs.media.mime_type };
     }
-    await writeStableJsonAtomic(path.join(staging, 'work/transcript.normalized.json'), inspected.transcript);
-    const snapshot: ModelSnapshotV3 = { contract: 'mercury.model-snapshot/v3', snapshot_id: `${taskId}-models`, task_id: taskId, captured_at: createdAt, models: { asr: null, chat }, evidence_mode: decision.mode, non_strong_reason: decision.reason };
+    if (provided) await writeStableJsonAtomic(path.join(staging, 'work/transcript.normalized.json'), inspected!.transcript);
+    if (!provided && inspected) await writeFile0600(path.join(staging, 'input/reference.srt'), serializeTranscriptSrt(inspected.transcript));
+    const snapshot: ModelSnapshotV3 = { contract: 'mercury.model-snapshot/v3', snapshot_id: `${taskId}-models`, task_id: taskId, captured_at: createdAt, models: { asr, chat }, evidence_mode: decision.mode, non_strong_reason: decision.reason };
     await writeStableJsonAtomic(path.join(staging, 'work/model-snapshot.json'), snapshot);
-    const dictionarySnapshot = await resolveDictionarySnapshot(workspace, request, taskId, inspected.transcript.text);
+    const dictionarySnapshot = await resolveDictionarySnapshot(workspace, request, taskId, provided ? inspected!.transcript.text : '');
     await writeStableJsonAtomic(path.join(staging, 'work/dictionary-snapshot.json'), dictionarySnapshot);
-    const stem = safeAudioStem(path.basename(request.inputs.media?.path ?? request.inputs.transcript.path).replace(/\.(?:srt|vtt|json)$/iu, '')) || 'subtitle';
+    const stem = safeAudioStem(path.basename(request.inputs.media?.path ?? request.inputs.transcript!.path).replace(/\.(?:srt|vtt|json)$/iu, '')) || 'subtitle';
     const transcribedRelative = `output/${stem}.transcribed.srt`;
-    const handle = await open(path.join(staging, transcribedRelative), constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
-    try { await handle.writeFile(srtFromTranscript(inspected.transcript), 'utf8'); await handle.sync(); } finally { await handle.close(); }
+    if (provided) {
+      const handle = await open(path.join(staging, transcribedRelative), constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+      try { await handle.writeFile(srtFromTranscript(inspected!.transcript), 'utf8'); await handle.sync(); } finally { await handle.close(); }
+    }
     const fingerprint = jsonFingerprint(JSON.parse(canonicalJson(request)));
     const task = assertV5TaskRecord({
       schema_version: '5.0.0', identity: { task_id: taskId, request_id: request.request_id, request_fingerprint: fingerprint, task_directory: directoryName, revision: 0 },
       created_at: createdAt, updated_at: createdAt, status: 'queued', stage: null,
-      input_config: { transcription_mode: 'provided', calibration_mode: request.calibration.mode, source_language: request.calibration.source_language, evidence_mode: decision.mode },
+      input_config: { transcription_mode: request.transcription_mode, calibration_mode: request.calibration.mode, source_language: request.calibration.source_language, evidence_mode: decision.mode },
       inputs: {
         media,
-        transcript_source: { original_path: request.inputs.transcript.path, workspace_path: transcriptRelative, sha256: request.inputs.transcript.sha256, bytes: inspected.bytes, mime_type: request.inputs.transcript.format === 'srt' ? 'application/x-subrip' : request.inputs.transcript.format === 'vtt' ? 'text/vtt' : 'application/json', format: request.inputs.transcript.format, role: 'transcript_source' },
-        reference: null,
+        transcript_source: provided ? { original_path: request.inputs.transcript!.path, workspace_path: transcriptRelative!, sha256: request.inputs.transcript!.sha256, bytes: inspected!.bytes, mime_type: request.inputs.transcript!.format === 'srt' ? 'application/x-subrip' : request.inputs.transcript!.format === 'vtt' ? 'text/vtt' : 'application/json', format: request.inputs.transcript!.format, role: 'transcript_source' as const } : null,
+        reference: !provided && request.inputs.transcript ? { original_path: request.inputs.transcript.path, workspace_path: transcriptRelative!, sha256: request.inputs.transcript.sha256, bytes: inspected!.bytes, mime_type: request.inputs.transcript.format === 'srt' ? 'application/x-subrip' : request.inputs.transcript.format === 'vtt' ? 'text/vtt' : 'application/json', format: request.inputs.transcript.format, role: 'reference' as const } : null,
       },
-      models: { asr: null, chat: request.models.chat, snapshot_path: 'work/model-snapshot.json', snapshot_sha256: await sha256File(path.join(staging, 'work/model-snapshot.json')) },
+      models: { asr: request.models.asr, chat: request.models.chat, snapshot_path: 'work/model-snapshot.json', snapshot_sha256: await sha256File(path.join(staging, 'work/model-snapshot.json')) },
       dictionary_snapshot: { path: 'work/dictionary-snapshot.json', sha256: await sha256File(path.join(staging, 'work/dictionary-snapshot.json')), resolved: dictionarySnapshot.resolved },
       execution: { queued_at: createdAt, started_at: null, ended_at: null, worker_id: null, heartbeat_at: null, attempt_id: null, attempt_count: 0, safe_checkpoint: 'queued', provider_calls: { asr: initialCall(), chat: initialCall() }, cancel_requested_at: null },
       artifacts: {
-        transcript: { path: 'work/transcript.normalized.json', sha256: await sha256File(path.join(staging, 'work/transcript.normalized.json')), validation: 'passed' },
-        transcribed: { path: transcribedRelative, sha256: await sha256File(path.join(staging, transcribedRelative)), validation: 'passed' }, calibrated: null, approved: null, report: null,
-      }, review: { status: 'not_ready', pending_count: null }, warnings: [...inspected.warnings, ...(decision.reason ? [`Chat 使用 text-only：${decision.reason}`] : [])], error: null,
+        transcript: provided ? { path: 'work/transcript.normalized.json', sha256: await sha256File(path.join(staging, 'work/transcript.normalized.json')), validation: 'passed' as const } : null,
+        transcribed: provided ? { path: transcribedRelative, sha256: await sha256File(path.join(staging, transcribedRelative)), validation: 'passed' as const } : null, calibrated: null, approved: null, report: null,
+      }, review: { status: 'not_ready', pending_count: null }, warnings: [...(inspected?.warnings ?? []), ...(decision.reason ? [`Chat 使用 text-only：${decision.reason}`] : [])], error: null,
     });
     await writeStableJsonAtomic(path.join(staging, 'task.json'), task);
     await rename(staging, final);
@@ -262,7 +325,11 @@ export async function submitExchangeRequest(workspaceInput: string, raw: unknown
     const reserved = await reserveRequest(workspace, reservation);
     if (reserved.record.input_fingerprint !== fingerprint) throw new MercuryError('REQUEST_ID_CONFLICT', '同一 request ID 已绑定到不同请求；原任务未改变。', { exitCode: 3 });
     if (reserved.record.state === 'committed') {
-      const task = await readV5Task(taskRoot(workspace, reserved.record.task_directory!));
+      const directory = taskRoot(workspace, reserved.record.task_directory!);
+      const stored = assertExchangeContract('request', await readStableJson(path.join(directory, 'request.json'), 'REQUEST_RECORD_INVALID'));
+      if (stored.request_id !== request.request_id || jsonFingerprint(JSON.parse(canonicalJson(stored))) !== fingerprint) throw new MercuryError('REQUEST_RECORD_INVALID', '历史稳定 request 损坏或与预留记录不一致；Mercury 不会覆盖。');
+      const task = await readV5Task(directory);
+      if (task.identity.request_fingerprint !== fingerprint) throw new MercuryError('TASK_RECORD_INVALID', '历史 v5 task fingerprint 与稳定 request 不一致。');
       return { task, replayed: true };
     }
     await writeRequest(workspace, { ...reserved.record, owner: reservation.owner, updated_at: new Date().toISOString() });
@@ -275,7 +342,7 @@ export async function submitExchangeRequest(workspaceInput: string, raw: unknown
       ? await readV5Task(expectedDirectory)
       : await createTaskDirectory(workspace, request, taskId, directoryName);
     const directory = taskRoot(workspace, directoryName);
-    if ((await stableEvents(directory)).length === 0) await appendV5Event(directory, task, 'task_queued', '任务已持久化并加入本地后台队列。', { transcription_mode: 'provided', asr_call_count: 0 });
+    if ((await stableEvents(directory)).length === 0) await appendV5Event(directory, task, 'task_queued', '任务已持久化并加入本地后台队列。', { transcription_mode: request.transcription_mode, asr_call_count: 0 });
     const job: BackgroundJobV1 = { contract_version: JOB_CONTRACT_VERSION, task_id: taskId, task_directory: directoryName, state: 'queued', created_at: request.created_at, updated_at: new Date().toISOString(), claim_token: null, worker_id: null };
     const jobPath = path.join(workspace, 'runtime', 'jobs', `${taskId}.json`);
     const existingJob = await lstat(jobPath).then(() => true).catch((error) => {
@@ -305,15 +372,15 @@ function legacyTranscript(task: TaskRecordV5, transcript: ExchangeTranscriptV1, 
   } as unknown as TranscriptRaw;
 }
 
-function preflight(task: TaskRecordV5, transcript: TranscriptRaw, snapshot: ModelSnapshotV3, normalizedSrt: string) {
+function preflight(task: TaskRecordV5, transcript: TranscriptRaw, snapshot: ModelSnapshotV3, referenceSrt: string | null) {
   const at = new Date().toISOString();
-  const calibration = { schema_version: '1.0.0', task_id: task.identity.task_id, created_at: at, status: 'completed', request: { transcript_ref: 'work/transcript.raw.json', reference_srt_ref: 'input/reference.srt', mode: task.input_config.calibration_mode }, model_snapshot_ref: snapshot.snapshot_id, call: { call_id: 'preflight', model_snapshot_entry_ref: snapshot.models.chat.snapshot_entry_id, started_at: at, ended_at: at, outcome: 'completed', error_ref: null }, suggestions: [], warnings: [], errors: [] } as unknown as CalibrationResult;
+  const calibration = { schema_version: '1.0.0', task_id: task.identity.task_id, created_at: at, status: 'completed', request: { transcript_ref: 'work/transcript.raw.json', reference_srt_ref: referenceSrt ? 'input/reference.srt' : null, mode: referenceSrt ? task.input_config.calibration_mode : null }, model_snapshot_ref: snapshot.snapshot_id, call: { call_id: 'preflight', model_snapshot_entry_ref: snapshot.models.chat.snapshot_entry_id, started_at: at, ended_at: at, outcome: 'completed', error_ref: null }, suggestions: [], warnings: [], errors: [] } as unknown as CalibrationResult;
   const checked = validateContract('calibration-result', calibration);
   if (!checked.valid) throw new MercuryError('UPSTREAM_CALIBRATION_INVALID', checked.issues.map((issue) => `${issue.path} ${issue.message}`).join('; '));
   return runSubtitleCore({
     transcript,
     calibrationResult: checked.value,
-    referenceSrtText: normalizedSrt, requestedMode: task.input_config.calibration_mode,
+    referenceSrtText: referenceSrt, requestedMode: referenceSrt ? task.input_config.calibration_mode : null,
   });
 }
 
@@ -328,12 +395,17 @@ function toLegacy(value: CalibrationResultV3): CalibrationResult {
 }
 
 function exchangeError(code: string, message: string, providerOutcome: 'not_dispatched' | 'known_terminal' | 'response_persisted' | 'outcome_unknown' | 'not_applicable', detail: string | null = null, category: 'input' | 'config' | 'provider' | 'runtime' | 'compatibility' | 'security' | 'conflict' = 'provider'): TaskRecordV5['error'] {
-  return { contract: 'mercury.error/v1', code, category, message: message.replace(/\s*(?:Provider detail|provider detail)=.*$/iu, '').trim(), retryability: providerOutcome === 'outcome_unknown' ? 'unsafe' : category === 'runtime' ? 'not_applicable' : 'after_user_action', provider_outcome: providerOutcome, remediation: [providerOutcome === 'outcome_unknown' ? '不要自动重试；请查看技术证据后由用户决定。' : category === 'runtime' ? '保留当前任务证据并检查本地文件；不要重复调用 Provider。' : '检查模型配置后使用新的 request ID 创建任务。'], technical: detail ? { provider_code: null, log_id: null, detail: detail.slice(0, 2000) } : null, extensions: {} };
+  const publicMessage = message.replace(/\s*(?:Provider detail|provider detail)=.*$/iu, '').trim();
+  const safeMessage = sensitiveTextIssues(publicMessage).length > 0 ? 'Provider 或本地处理返回了包含敏感信息的错误；详情已脱敏。' : publicMessage;
+  const normalizedDetail = detail?.replace(/[\u0000-\u001f\u007f]/gu, ' ').slice(0, 2000) ?? null;
+  const safeDetail = normalizedDetail && sensitiveTextIssues(normalizedDetail).length === 0 ? normalizedDetail : normalizedDetail ? '<redacted sensitive detail>' : null;
+  return { contract: 'mercury.error/v1', code, category, message: safeMessage, retryability: providerOutcome === 'outcome_unknown' ? 'unsafe' : category === 'runtime' ? 'not_applicable' : 'after_user_action', provider_outcome: providerOutcome, remediation: [providerOutcome === 'outcome_unknown' ? '不要自动重试；请查看技术证据后由用户决定。' : category === 'runtime' ? '保留当前任务证据并检查本地文件；不要重复调用 Provider。' : '检查模型配置后使用新的 request ID 创建任务。'], technical: safeDetail ? { provider_code: null, log_id: null, detail: safeDetail } : null, extensions: {} };
 }
 
 async function writeReport(directory: string, task: TaskRecordV5, snapshot: ModelSnapshotV3, calibration: CalibrationResultV3 | null): Promise<void> {
   const dictionary = await readStableJson(managed(directory, task.dictionary_snapshot.path), 'DICTIONARY_RECORD_INVALID') as ResolvedDictionarySnapshot;
-  const text = ['# Mercury 字幕校准工作报告', '', `- 任务 ID：\`${task.identity.task_id}\``, '- 转写来源：外部提供（ASR 调用数：0）', `- 外部格式：${task.inputs.transcript_source?.format ?? '—'}`, `- 原件 SHA-256：${task.inputs.transcript_source?.sha256 ?? '—'}`, `- 规范化 SHA-256：${task.artifacts.transcript?.sha256 ?? '—'}`, `- Chat：${snapshot.models.chat.name} / ${snapshot.models.chat.provider_model}`, `- 校验证据：${task.input_config.evidence_mode === 'audio_multimodal' ? '完整转录 + 音频' : '完整转录'}`, `- Chat 调用：${task.execution.provider_calls.chat.count}`, `- 完整覆盖：${calibration ? `${calibration.strategy.input_unit_count}/${calibration.strategy.returned_unit_count} ${calibration.strategy.coverage_complete ? '通过' : '失败'}` : '未形成'}`, `- 词典快照：${task.dictionary_snapshot.sha256}`, `- 词典 revision：${dictionary.resolved.map((entry) => `${entry.dictionary_id}@${entry.revision}`).join('，') || '无'}`, `- 相关词典条目：${dictionary.matched_entry_ids.join('，') || '无'}`, `- ASR hints：${dictionary.asr_hints.status}（${dictionary.asr_hints.entry_ids.length} 项）`, `- 警告：${task.warnings.join('；') || '无'}`, `- 错误：${task.error ? `${task.error.code}：${task.error.message}` : '无'}`, ''].join('\n');
+  const source = task.input_config.transcription_mode === 'provided' ? '外部提供' : `${snapshot.models.asr?.name ?? 'ASR Provider'}`;
+  const text = ['# Mercury 字幕校准工作报告', '', `- 任务 ID：\`${task.identity.task_id}\``, `- 转写来源：${source}（ASR 调用数：${task.execution.provider_calls.asr.count}）`, `- 外部格式：${task.inputs.transcript_source?.format ?? task.inputs.reference?.format ?? '—'}`, `- 原件 SHA-256：${task.inputs.transcript_source?.sha256 ?? task.inputs.media?.sha256 ?? '—'}`, `- 规范化 SHA-256：${task.artifacts.transcript?.sha256 ?? '—'}`, `- Chat：${snapshot.models.chat.name} / ${snapshot.models.chat.provider_model}`, `- 校验证据：${task.input_config.evidence_mode === 'audio_multimodal' ? '完整转录 + 音频' : '完整转录'}`, `- Chat 调用：${task.execution.provider_calls.chat.count}`, `- 完整覆盖：${calibration ? `${calibration.strategy.input_unit_count}/${calibration.strategy.returned_unit_count} ${calibration.strategy.coverage_complete ? '通过' : '失败'}` : '未形成'}`, `- 词典快照：${task.dictionary_snapshot.sha256}`, `- 词典 revision：${dictionary.resolved.map((entry) => `${entry.dictionary_id}@${entry.revision}`).join('，') || '无'}`, `- 相关词典条目：${dictionary.matched_entry_ids.join('，') || '无'}`, `- ASR hints：${dictionary.asr_hints.status}（发送 ${dictionary.asr_hints.input_count}/${dictionary.asr_hints.available_count} 项${dictionary.asr_hints.truncated ? '，已按 Adapter 上限截断' : ''}）`, `- 警告：${task.warnings.join('；') || '无'}`, `- 错误：${task.error ? `${task.error.code}：${task.error.message}` : '无'}`, ''].join('\n');
   await writeFile0600(path.join(directory, 'output/calibration-report.md'), text);
   task.artifacts.report = { path: 'output/calibration-report.md', sha256: await sha256File(path.join(directory, 'output/calibration-report.md')), validation: 'passed' };
 }
@@ -346,22 +418,161 @@ async function writeFile0600(target: string, content: string): Promise<void> {
   await chmod(target, 0o600);
 }
 
-export async function executeV5Task(directory: string, dependencies: ChatCalibrationV2Dependencies = {}): Promise<TaskRecordV5> {
+function exchangeTranscriptFromProvider(task: TaskRecordV5, raw: TranscriptRaw, snapshot: ModelSnapshotV3): ExchangeTranscriptV1 {
+  const rawHash = digest(canonicalJson(raw));
+  const segments = raw.segments.map((segment, index) => ({
+    segment_id: `seg-${digest(`${segment.segment_id}\n${segment.start_ms}\n${segment.end_ms}\n${segment.text}`).slice(0, 16)}`,
+    index, start_ms: segment.start_ms, end_ms: segment.end_ms, text: segment.text,
+    words: segment.words.map((word) => ({ text: word.text, start_ms: word.start_ms, end_ms: word.end_ms, confidence: word.confidence })),
+  }));
+  const value = {
+    contract: 'mercury.transcript/v1' as const,
+    transcript_id: `trn-${rawHash.slice(0, 24)}`, created_at: raw.created_at, language: raw.audio.language,
+    duration_ms: raw.audio.duration_ms, text: raw.full_text, segments,
+    source: {
+      kind: 'provider' as const, format: 'provider_json' as const,
+      system: snapshot.models.asr?.plugin_id ?? 'asr', external_id: raw.call.provider_request_id ?? null,
+      generated_at: raw.call.ended_at, content_sha256: rawHash, original_path: null,
+      original_sha256: raw.audio.sha256, normalized_sha256: '0'.repeat(64),
+    },
+    warnings: raw.warnings.map((warning) => typeof warning === 'string' ? warning : JSON.stringify(warning)).slice(0, 1000), extensions: {},
+  };
+  const hashMaterial = structuredClone(value);
+  hashMaterial.source.normalized_sha256 = '0'.repeat(64);
+  value.source.normalized_sha256 = digest(canonicalJson(hashMaterial));
+  return assertExchangeContract('transcript', value);
+}
+
+function refreshDictionaryMatches(snapshot: ResolvedDictionarySnapshot, text: string): void {
+  const matched = snapshot.entries.filter((entry) => {
+    const haystack = entry.case_sensitive ? text.normalize('NFC') : text.normalize('NFC').toLocaleLowerCase('en-US');
+    return [entry.canonical, ...entry.variants].some((form) => haystack.includes(entry.case_sensitive ? form.normalize('NFC') : form.normalize('NFC').toLocaleLowerCase('en-US')));
+  }).map((entry) => entry.entry_id);
+  snapshot.matched_entry_ids = matched;
+  snapshot.chat_context_entry_ids = matched;
+}
+
+async function prepareProviderTranscript(
+  directory: string,
+  taskInput: TaskRecordV5,
+  snapshot: ModelSnapshotV3,
+  dictionarySnapshot: ResolvedDictionarySnapshot,
+  dependencies: ExchangeRuntimeDependencies,
+  fault?: (point: V5FaultPoint, task: TaskRecordV5) => Promise<void> | void,
+): Promise<{ task: TaskRecordV5; transcript: ExchangeTranscriptV1; legacy: TranscriptRaw } | null> {
+  let task = taskInput;
+  if (!snapshot.models.asr || !task.inputs.media) throw new MercuryError('MODEL_SNAPSHOT_INVALID', 'provider v5 任务缺少 ASR 模型或媒体。');
+  const media = task.inputs.media;
+  const audioPath = managed(directory, media.workspace_path);
+  if (await sha256File(audioPath) !== media.sha256) throw new MercuryError('INPUT_COPY_HASH_MISMATCH', '任务音频副本 hash 不匹配。');
+  const duration = await readMp3DurationMs(audioPath);
+  task.stage = 'transcribing'; task.execution.safe_checkpoint = 'asr_not_started'; task.updated_at = new Date().toISOString(); await persistV5Task(directory, task);
+  task = await readV5Task(directory);
+  if (task.execution.cancel_requested_at) { await cancelV5AtBoundary(directory, task); return null; }
+  const evidenceRef = task.execution.provider_calls.asr.evidence_ref;
+  let raw: TranscriptRaw;
+  if (evidenceRef && ['response_persisted', 'terminal'].includes(task.execution.provider_calls.asr.state)) {
+    const candidate = await readStableJson(managed(directory, evidenceRef), 'ASR_ARTIFACT_INVALID');
+    const checked = validateContract('transcript.raw', candidate);
+    if (!checked.valid) throw new MercuryError('ASR_ARTIFACT_INVALID', checked.issues.map((entry) => `${entry.path} ${entry.message}`).join('; '));
+    raw = checked.value;
+  } else {
+    const asr = dependencies.asrAdapter ?? (snapshot.models.asr.plugin_id === 'volcengine_subtitle_asr'
+      ? new VolcengineSubtitleAsrAdapter({ readCredential: dependencies.readCredential ?? readCredentialReference, ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}) })
+      : new VolcengineAsrAdapter({ resolveCredential: dependencies.resolveAsrCredential ?? resolveVolcengineCredentialReference, ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}) }));
+    const hintCapability = (asr as Partial<AsrHintsCapableAdapter>).asrHintsCapability
+      ?? { status: 'not_supported' as const, reason: 'Adapter 未声明 asr_hints 能力。' };
+    if (hintCapability.status === 'supported' && (!Number.isSafeInteger(hintCapability.maxEntries) || hintCapability.maxEntries < 1 || hintCapability.maxEntries > 1_000)) {
+      throw new MercuryError('ASR_HINTS_CAPABILITY_INVALID', 'ASR Adapter 声明的 hints 上限无效；未调用 Provider。');
+    }
+    const hintEntries = hintCapability.status === 'supported'
+      ? dictionarySnapshot.entries.slice(0, hintCapability.maxEntries).map((entry) => ({
+        entryId: entry.entry_id, canonical: entry.canonical, variants: [...entry.variants], language: entry.language,
+        caseSensitive: entry.case_sensitive, numberSensitive: entry.number_sensitive,
+      }))
+      : [];
+    dictionarySnapshot.asr_hints = hintCapability.status === 'not_supported'
+      ? { status: 'not_supported', adapter_id: asr.adapterId, entry_ids: [], available_count: dictionarySnapshot.entries.length, input_count: 0, truncated: false, input_hash: null, reason: hintCapability.reason }
+      : hintEntries.length === 0
+        ? { status: 'not_applicable', adapter_id: asr.adapterId, entry_ids: [], available_count: 0, input_count: 0, truncated: false, input_hash: null, reason: '任务词典没有可发送的条目。' }
+        : { status: 'used', adapter_id: asr.adapterId, entry_ids: hintEntries.map((entry) => entry.entryId), available_count: dictionarySnapshot.entries.length, input_count: hintEntries.length, truncated: hintEntries.length < dictionarySnapshot.entries.length, input_hash: digest(canonicalJson(hintEntries)), reason: null };
+    await writeStableJsonAtomic(path.join(directory, task.dictionary_snapshot.path), dictionarySnapshot);
+    task.dictionary_snapshot.sha256 = await sha256File(path.join(directory, task.dictionary_snapshot.path));
+    task.dictionary_snapshot.resolved = dictionarySnapshot.resolved;
+    task.updated_at = new Date().toISOString();
+    await persistV5Task(directory, task);
+    const result = await asr.run({
+      taskId: task.identity.task_id, modelSnapshotRef: snapshot.snapshot_id, model: legacyAsrEntry(snapshot.models.asr) as any,
+      audio: { sourcePath: audioPath, pathRef: media.workspace_path, sha256: media.sha256, durationMs: duration, mimeType: 'audio/mpeg', language: 'zh-CN' },
+      asrHints: { entries: hintEntries },
+      beforeProviderDispatch: async () => {
+        task = await readV5Task(directory);
+        if (task.execution.cancel_requested_at) throw new MercuryError('TASK_CANCELLED', '任务已请求取消，未调用 ASR。');
+        task.execution.provider_calls.asr = { state: 'in_flight', count: 1, outcome: 'outcome_unknown', evidence_ref: null };
+        task.updated_at = new Date().toISOString(); await persistV5Task(directory, task);
+        await crashFault(fault, 'after_dispatch_persisted', task);
+        await appendV5Event(directory, task, 'provider_dispatched', 'ASR 转写请求已发送。', { capability: 'transcription', count: 1 });
+      },
+    });
+    if (result.kind === 'failure') {
+      task = await readV5Task(directory);
+      const certainty = result.failure.provider_outcome_certainty ?? (task.execution.provider_calls.asr.state === 'in_flight' ? 'outcome_unknown' : 'not_dispatched');
+      task.execution.provider_calls.asr = { state: certainty === 'outcome_unknown' ? 'in_flight' : 'terminal', count: task.execution.provider_calls.asr.count, outcome: certainty, evidence_ref: null };
+      task.status = certainty === 'outcome_unknown' ? 'interrupted' : 'failed'; task.stage = null; task.execution.ended_at = new Date().toISOString();
+      task.error = exchangeError(certainty === 'outcome_unknown' ? 'TASK_INTERRUPTED_PROVIDER_UNKNOWN' : result.failure.errors[0]!.code, result.failure.errors[0]!.message, certainty, result.failure.errors[0]!.message);
+      await writeReport(directory, task, snapshot, null); await persistV5Task(directory, task); await crashFault(fault, 'terminal_task_before_result', task); await writeV5Result(directory, task); return null;
+    }
+    raw = result.artifact;
+    const checked = validateContract('transcript.raw', raw);
+    if (!checked.valid || raw.task_id !== task.identity.task_id || raw.model_snapshot_ref !== snapshot.snapshot_id || raw.audio.sha256 !== media.sha256) throw new MercuryError('ASR_ARTIFACT_INVALID', 'ASR 产物与任务、模型或音频证据不一致。');
+    await writeStableJsonAtomic(path.join(directory, 'work/transcript.raw.json'), raw);
+    task = await readV5Task(directory);
+    task.execution.provider_calls.asr = { state: 'response_persisted', count: 1, outcome: 'response_persisted', evidence_ref: 'work/transcript.raw.json' };
+    task.execution.safe_checkpoint = 'asr_response_persisted'; await persistV5Task(directory, task);
+    await crashFault(fault, 'after_response_persisted', task);
+  }
+  const transcript = exchangeTranscriptFromProvider(task, raw, snapshot);
+  await writeStableJsonAtomic(path.join(directory, 'work/transcript.normalized.json'), transcript);
+  const transcribedRelative = `output/${safeAudioStem(path.basename(media.original_path))}.transcribed.srt`;
+  await writeFile0600(path.join(directory, transcribedRelative), srtFromTranscript(transcript));
+  refreshDictionaryMatches(dictionarySnapshot, transcript.text);
+  await writeStableJsonAtomic(path.join(directory, task.dictionary_snapshot.path), dictionarySnapshot);
+  task = await readV5Task(directory);
+  task.dictionary_snapshot.sha256 = await sha256File(path.join(directory, task.dictionary_snapshot.path));
+  task.artifacts.transcript = { path: 'work/transcript.normalized.json', sha256: await sha256File(path.join(directory, 'work/transcript.normalized.json')), validation: 'passed' };
+  task.artifacts.transcribed = { path: transcribedRelative, sha256: await sha256File(path.join(directory, transcribedRelative)), validation: 'passed' };
+  task.execution.provider_calls.asr = { state: 'terminal', count: 1, outcome: 'response_persisted', evidence_ref: 'work/transcript.raw.json' };
+  task.updated_at = new Date().toISOString(); await persistV5Task(directory, task);
+  return { task, transcript, legacy: raw };
+}
+
+export async function executeV5Task(directory: string, dependencies: ExchangeRuntimeDependencies = {}, fault?: (point: V5FaultPoint, task: TaskRecordV5) => Promise<void> | void): Promise<TaskRecordV5> {
   let task = await readV5Task(directory);
   if (task.status !== 'running') throw new MercuryError('TASK_EXECUTION_STATE_INVALID', `v5 任务状态不能执行：${task.status}`);
   if (await sha256File(managed(directory, task.models.snapshot_path)) !== task.models.snapshot_sha256) throw new MercuryError('MODEL_SNAPSHOT_INVALID', '模型快照 hash 与任务记录不一致。');
   if (await sha256File(managed(directory, task.dictionary_snapshot.path)) !== task.dictionary_snapshot.sha256) throw new MercuryError('DICTIONARY_RECORD_INVALID', '词典快照 hash 与任务记录不一致。');
-  if (!task.artifacts.transcript || await sha256File(managed(directory, task.artifacts.transcript.path)) !== task.artifacts.transcript.sha256) throw new MercuryError('TRANSCRIPT_IMPORT_INVALID', '规范化转录缺失或 hash 不一致。');
   const snapshot = await readStableJson(managed(directory, task.models.snapshot_path), 'MODEL_SNAPSHOT_INVALID') as ModelSnapshotV3;
-  const transcript = assertExchangeContract('transcript', await readStableJson(managed(directory, task.artifacts.transcript!.path), 'TRANSCRIPT_IMPORT_INVALID'));
   const dictionarySnapshot = await readStableJson(managed(directory, task.dictionary_snapshot.path), 'DICTIONARY_RECORD_INVALID') as ResolvedDictionarySnapshot;
   if (dictionarySnapshot.contract !== 'mercury.dictionary-snapshot/v1' || dictionarySnapshot.task_id !== task.identity.task_id) throw new MercuryError('DICTIONARY_RECORD_INVALID', '任务词典快照 identity 无效。');
-  const legacy = legacyTranscript(task, transcript, snapshot);
+  let transcript: ExchangeTranscriptV1;
+  let legacy: TranscriptRaw;
+  if (task.input_config.transcription_mode === 'provider') {
+    const prepared = await prepareProviderTranscript(directory, task, snapshot, dictionarySnapshot, dependencies, fault);
+    if (!prepared) return readV5Task(directory);
+    task = prepared.task; transcript = prepared.transcript; legacy = prepared.legacy;
+  } else {
+    if (!task.artifacts.transcript || await sha256File(managed(directory, task.artifacts.transcript.path)) !== task.artifacts.transcript.sha256) throw new MercuryError('TRANSCRIPT_IMPORT_INVALID', '规范化转录缺失或 hash 不一致。');
+    transcript = assertExchangeContract('transcript', await readStableJson(managed(directory, task.artifacts.transcript.path), 'TRANSCRIPT_IMPORT_INVALID'));
+    legacy = legacyTranscript(task, transcript, snapshot);
+  }
   let calibration: CalibrationResultV3 | null = null;
   const existing = task.execution.provider_calls.chat.evidence_ref;
   try {
     const normalizedSrt = srtFromTranscript(transcript);
-    const initial = preflight(task, legacy, snapshot, normalizedSrt);
+    const referenceText = task.inputs.reference
+      ? await readFile(path.join(directory, 'input/reference.srt'), 'utf8')
+      : task.input_config.transcription_mode === 'provided' ? normalizedSrt : null;
+    const initial = preflight(task, legacy, snapshot, referenceText);
     if (initial.status !== 'completed' || initial.alignment === null) throw new MercuryError(initial.issues[0]?.code ?? 'ALIGNMENT_FAILED', initial.issues[0]?.message ?? '外部转录无法形成合法校验单元。');
     await writeStableJsonAtomic(path.join(directory, 'work/alignment.json'), initial.alignment);
     task.stage = 'calibrating'; task.execution.safe_checkpoint = 'chat_not_started'; task.updated_at = new Date().toISOString(); await persistV5Task(directory, task);
@@ -374,7 +585,7 @@ export async function executeV5Task(directory: string, dependencies: ChatCalibra
       const media = task.inputs.media;
       const result = await runtime.run({
         taskId: task.identity.task_id, modelSnapshotRef: snapshot.snapshot_id, model: snapshot.models.chat, transcript: legacy, alignment: initial.alignment,
-        referenceSrt: { pathRef: 'input/reference.srt', text: normalizedSrt }, mode: task.input_config.calibration_mode, evidenceMode: task.input_config.evidence_mode,
+        referenceSrt: referenceText ? { pathRef: 'input/reference.srt', text: referenceText } : null, mode: referenceText ? task.input_config.calibration_mode : null, evidenceMode: task.input_config.evidence_mode,
         nonStrongReason: (snapshot.non_strong_reason as any) ?? null,
         dictionaryContext: {
           snapshot_refs: dictionarySnapshot.resolved.map(({ dictionary_id, revision, content_hash }) => ({ dictionary_id, revision, content_hash })),
@@ -386,23 +597,25 @@ export async function executeV5Task(directory: string, dependencies: ChatCalibra
           if (task.execution.cancel_requested_at) throw new MercuryError('TASK_CANCELLED', '任务已请求取消，未调用 Chat。');
           task.execution.provider_calls.chat = { state: 'in_flight', count: 1, outcome: 'outcome_unknown', evidence_ref: null };
           task.updated_at = new Date().toISOString(); await persistV5Task(directory, task);
-          await appendV5Event(directory, task, 'provider_dispatched', 'Chat 校验请求已发送；ASR 调用数仍为 0。', { capability: 'calibration', count: 1 });
+          await crashFault(fault, 'after_dispatch_persisted', task);
+          await appendV5Event(directory, task, 'provider_dispatched', `Chat 校验请求已发送；ASR 调用数为 ${task.execution.provider_calls.asr.count}。`, { capability: 'calibration', count: 1, asr_call_count: task.execution.provider_calls.asr.count });
         },
       });
       if (result.kind === 'failure') {
         task = await readV5Task(directory);
-        const reportedCertainty = result.failure.provider_outcome_certainty ?? (result.failure.call ? 'known_terminal' : 'not_dispatched');
-        const certainty = task.execution.provider_calls.chat.state === 'in_flight' ? 'outcome_unknown' : reportedCertainty;
+        const reportedCertainty = result.failure.provider_outcome_certainty;
+        const certainty = reportedCertainty ?? (task.execution.provider_calls.chat.state === 'in_flight' ? 'outcome_unknown' : result.failure.call ? 'known_terminal' : 'not_dispatched');
         task.execution.provider_calls.chat = { state: certainty === 'outcome_unknown' ? 'in_flight' : 'terminal', count: task.execution.provider_calls.chat.count, outcome: certainty, evidence_ref: null };
         task.status = certainty === 'outcome_unknown' ? 'interrupted' : 'failed'; task.stage = null; task.execution.ended_at = new Date().toISOString();
         task.error = exchangeError(certainty === 'outcome_unknown' ? 'TASK_INTERRUPTED_PROVIDER_UNKNOWN' : result.failure.errors[0]!.code, result.failure.errors[0]!.message, certainty, result.failure.errors[0]!.message);
-        await writeReport(directory, task, snapshot, null); await persistV5Task(directory, task); await writeV5Result(directory, task); return task;
+        await writeReport(directory, task, snapshot, null); await persistV5Task(directory, task); await crashFault(fault, 'terminal_task_before_result', task); await writeV5Result(directory, task); return task;
       }
       calibration = result.artifact;
       await writeStableJsonAtomic(path.join(directory, 'work/calibration-result.json'), calibration);
       task = await readV5Task(directory);
       task.execution.provider_calls.chat = { state: 'response_persisted', count: 1, outcome: 'response_persisted', evidence_ref: 'work/calibration-result.json' };
       task.execution.safe_checkpoint = 'chat_response_persisted'; await persistV5Task(directory, task);
+      await crashFault(fault, 'after_response_persisted', task);
       if (calibration.status === 'failed') {
         const certainty = calibration.provider_outcome_certainty ?? 'known_terminal';
         task.execution.provider_calls.chat = { state: certainty === 'outcome_unknown' ? 'in_flight' : 'terminal', count: 1, outcome: certainty === 'outcome_unknown' ? 'outcome_unknown' : 'response_persisted', evidence_ref: 'work/calibration-result.json' };
@@ -410,13 +623,13 @@ export async function executeV5Task(directory: string, dependencies: ChatCalibra
         task.stage = null; task.execution.ended_at = new Date().toISOString();
         const issue = calibration.errors[0]! as { code: string; message: string };
         task.error = exchangeError(certainty === 'outcome_unknown' ? 'TASK_INTERRUPTED_PROVIDER_UNKNOWN' : issue.code, issue.message, certainty === 'outcome_unknown' ? 'outcome_unknown' : 'response_persisted', issue.message);
-        await writeReport(directory, task, snapshot, calibration); await persistV5Task(directory, task); await writeV5Result(directory, task); return task;
+        await writeReport(directory, task, snapshot, calibration); await persistV5Task(directory, task); await crashFault(fault, 'terminal_task_before_result', task); await writeV5Result(directory, task); return task;
       }
     }
     task = await readV5Task(directory);
     if (task.execution.cancel_requested_at) return cancelV5AtBoundary(directory, task);
     if (!calibration || calibration.status !== 'completed') throw new MercuryError('CALIBRATION_RESULT_INVALID', 'Chat 未形成完整可用的校验正文。');
-    const subtitle = runSubtitleCore({ transcript: legacy, calibrationResult: toLegacy(calibration), referenceSrtText: normalizedSrt, requestedMode: task.input_config.calibration_mode });
+    const subtitle = runSubtitleCore({ transcript: legacy, calibrationResult: toLegacy(calibration), referenceSrtText: referenceText, requestedMode: referenceText ? task.input_config.calibration_mode : null });
     if (subtitle.status !== 'completed') throw new MercuryError(subtitle.issues[0]?.code ?? 'SUBTITLE_CORE_FAILED', subtitle.issues[0]?.message ?? '字幕规则应用失败。');
     for (const modification of subtitle.artifact.modifications.filter((entry) => entry.applied)) {
       const reference = modification.evidence.calibration_suggestion_ref;
@@ -434,24 +647,26 @@ export async function executeV5Task(directory: string, dependencies: ChatCalibra
     const calibratedRelative = `output/${stem}.calibrated.srt`;
     await writeFile0600(path.join(directory, calibratedRelative), serializeCalibratedSrt(subtitle.artifact));
     const audioDuration = task.inputs.media ? await readMp3DurationMs(managed(directory, task.inputs.media.workspace_path)) : (transcript.duration_ms ?? transcript.segments.at(-1)!.end_ms);
-    const parsedBaseline = parseReferenceSrt(normalizedSrt);
-    const validation = await validateSrtFile(path.join(directory, calibratedRelative), { audioDurationMs: audioDuration, expectedSegments: subtitle.artifact.segments, mode: subtitle.artifact.mode, referenceSegments: parsedBaseline.ok ? parsedBaseline.segments : null });
+    const parsedBaseline = referenceText ? parseReferenceSrt(referenceText) : null;
+    const validation = await validateSrtFile(path.join(directory, calibratedRelative), { audioDurationMs: audioDuration, expectedSegments: subtitle.artifact.segments, mode: subtitle.artifact.mode, referenceSegments: parsedBaseline?.ok ? parsedBaseline.segments : null });
     if (!validation.valid) throw new MercuryError('OUTPUT_VALIDATION_FAILED', validation.checks.filter((item) => item.status === 'failed').map((item) => item.message).join('; '));
     task = await readV5Task(directory);
     task.artifacts.calibrated = { path: calibratedRelative, sha256: await sha256File(path.join(directory, calibratedRelative)), validation: 'passed' };
     task.status = 'completed'; task.stage = null; task.execution.ended_at = new Date().toISOString(); task.execution.safe_checkpoint = 'outputs_validated';
     task.execution.provider_calls.chat = { state: 'terminal', count: Math.max(1, task.execution.provider_calls.chat.count), outcome: 'response_persisted', evidence_ref: 'work/calibration-result.json' };
     task.error = null; task.review = { status: 'pending', pending_count: calibration.corrected_units.filter((unit) => unit.changed).length };
-    await writeReport(directory, task, snapshot, calibration); await persistV5Task(directory, task); await writeV5Result(directory, task); return task;
+    await writeReport(directory, task, snapshot, calibration); await persistV5Task(directory, task); await crashFault(fault, 'terminal_task_before_result', task); await writeV5Result(directory, task); return task;
   } catch (error) {
+    if (error instanceof SimulatedV5Crash) throw error;
     task = await readV5Task(directory);
     if (TERMINAL.has(task.status)) return task;
-    if (task.execution.provider_calls.chat.state === 'in_flight') {
-      task.status = 'interrupted'; task.error = exchangeError('TASK_INTERRUPTED_PROVIDER_UNKNOWN', 'Chat 请求已发送，但结果无法确认。', 'outcome_unknown', error instanceof Error ? error.message : String(error));
+    const unknownRole = task.execution.provider_calls.asr.state === 'in_flight' ? 'ASR' : task.execution.provider_calls.chat.state === 'in_flight' ? 'Chat' : null;
+    if (unknownRole) {
+      task.status = 'interrupted'; task.error = exchangeError('TASK_INTERRUPTED_PROVIDER_UNKNOWN', `${unknownRole} 请求已发送，但结果无法确认。`, 'outcome_unknown', error instanceof Error ? error.message : String(error));
     } else {
       task.status = 'failed'; task.error = exchangeError(error instanceof MercuryError ? error.code : 'TASK_PIPELINE_FAILED', error instanceof Error ? error.message : '本地处理失败。', task.execution.provider_calls.chat.outcome, error instanceof Error ? error.message : null, 'runtime');
     }
-    task.stage = null; task.execution.ended_at = new Date().toISOString(); await writeReport(directory, task, snapshot, calibration); await persistV5Task(directory, task); await writeV5Result(directory, task); return task;
+    task.stage = null; task.execution.ended_at = new Date().toISOString(); await writeReport(directory, task, snapshot, calibration); await persistV5Task(directory, task); await crashFault(fault, 'terminal_task_before_result', task); await writeV5Result(directory, task); return task;
   }
 }
 
@@ -512,17 +727,19 @@ export async function projectV5Result(directory: string, taskInput?: TaskRecordV
   if (await sha256File(managed(directory, task.models.snapshot_path)) !== task.models.snapshot_sha256) throw new MercuryError('MODEL_SNAPSHOT_INVALID', '模型快照 hash 与任务记录不一致。');
   if (await sha256File(managed(directory, task.dictionary_snapshot.path)) !== task.dictionary_snapshot.sha256) throw new MercuryError('DICTIONARY_RECORD_INVALID', '词典快照 hash 与任务记录不一致。');
   const modelSnapshot = await readStableJson(managed(directory, task.models.snapshot_path), 'MODEL_SNAPSHOT_INVALID') as ModelSnapshotV3;
-  if (modelSnapshot.contract !== 'mercury.model-snapshot/v3' || modelSnapshot.task_id !== task.identity.task_id || modelSnapshot.models.chat.model_id !== task.models.chat) throw new MercuryError('MODEL_SNAPSHOT_INVALID', '模型快照 identity 与任务记录不一致。');
+  if (modelSnapshot.contract !== 'mercury.model-snapshot/v3' || modelSnapshot.task_id !== task.identity.task_id
+    || modelSnapshot.models.chat.model_id !== task.models.chat
+    || (modelSnapshot.models.asr?.model_id ?? null) !== task.models.asr) throw new MercuryError('MODEL_SNAPSHOT_INVALID', '模型快照 identity 与任务记录不一致。');
   return assertExchangeContract('result', {
     contract: 'mercury.result/v1', task_id: task.identity.task_id, status: task.status, attempt_id: task.execution.attempt_id, produced_at: task.updated_at,
-    inputs: [task.inputs.media ? { kind: 'media', sha256: task.inputs.media.sha256, source: 'provided' } : null, { kind: 'transcript', sha256: task.inputs.transcript_source!.sha256, source: 'provided' }].filter(Boolean),
-    transcription: { mode: 'provided', asr_call_count: 0, transcript_path: managed(directory, task.artifacts.transcript!.path), transcript_sha256: task.artifacts.transcript!.sha256 },
+    inputs: [task.inputs.media ? { kind: 'media', sha256: task.inputs.media.sha256, source: 'provided' } : null, task.inputs.transcript_source ? { kind: 'transcript', sha256: task.inputs.transcript_source.sha256, source: 'provided' } : null, task.inputs.reference ? { kind: 'reference', sha256: task.inputs.reference.sha256, source: 'reference' } : null].filter(Boolean),
+    transcription: { mode: task.input_config.transcription_mode, asr_call_count: task.execution.provider_calls.asr.count, transcript_path: task.artifacts.transcript ? managed(directory, task.artifacts.transcript.path) : null, transcript_sha256: task.artifacts.transcript?.sha256 ?? null },
     dictionaries: await (async () => {
       const snapshot = await readStableJson(managed(directory, task.dictionary_snapshot.path), 'DICTIONARY_RECORD_INVALID') as ResolvedDictionarySnapshot;
       return { snapshots: task.dictionary_snapshot.resolved, conflict_count: snapshot.conflicts.length, match_count: snapshot.matched_entry_ids.length };
     })(), artifacts: view.artifacts,
     review: { status: view.review.status, pending_count: view.review.pending_count, approved: ['finalized', 'not_required'].includes(view.review.status) },
-    calls: [{ provider: 'asr', capability: 'transcription', count: 0, outcome: 'not_dispatched' }, { provider: modelSnapshot.models.chat.plugin_id, capability: 'calibration', count: task.execution.provider_calls.chat.count, outcome: task.execution.provider_calls.chat.outcome }],
+    calls: [{ provider: modelSnapshot.models.asr?.plugin_id ?? 'asr', capability: 'transcription', count: task.execution.provider_calls.asr.count, outcome: task.execution.provider_calls.asr.outcome }, { provider: modelSnapshot.models.chat.plugin_id, capability: 'calibration', count: task.execution.provider_calls.chat.count, outcome: task.execution.provider_calls.chat.outcome }],
     warnings: task.warnings, error: task.error, next_action: view.next_action, extensions: {},
   });
 }
@@ -536,8 +753,8 @@ export async function claimV5Job(workspace: string, job: BackgroundJobV1, worker
     if (task.status !== 'queued' || currentJob.state !== 'queued' || task.execution.cancel_requested_at) return null;
     const at = new Date().toISOString(); task.status = 'running'; task.stage = 'preparing'; task.execution.started_at = at; task.execution.worker_id = workerId; task.execution.heartbeat_at = at; task.execution.attempt_id = `att-${randomBytes(8).toString('hex')}`; task.execution.attempt_count += 1; task.execution.safe_checkpoint = 'claimed';
     await persistV5Task(directory, task); currentJob.state = 'claimed'; currentJob.worker_id = workerId; currentJob.claim_token = randomBytes(16).toString('hex'); currentJob.updated_at = at; await writeJob(workspace, currentJob);
-    await appendStableJsonLine(path.join(directory, 'attempts.jsonl'), { contract: 'mercury.attempt/v1', task_id: task.identity.task_id, attempt_id: task.execution.attempt_id, number: task.execution.attempt_count, started_at: at, transcription_mode: 'provided', asr_call_count: 0 });
-    await appendV5Event(directory, task, 'worker_claimed', '后台 Worker 已开始处理外部转录任务。', { attempt: task.execution.attempt_count }); return task;
+    await appendStableJsonLine(path.join(directory, 'attempts.jsonl'), { contract: 'mercury.attempt/v1', task_id: task.identity.task_id, attempt_id: task.execution.attempt_id, number: task.execution.attempt_count, started_at: at, transcription_mode: task.input_config.transcription_mode, asr_call_count: task.execution.provider_calls.asr.count });
+    await appendV5Event(directory, task, 'worker_claimed', `后台 Worker 已开始处理${task.input_config.transcription_mode === 'provided' ? '外部转录' : 'Provider 转写'}任务。`, { attempt: task.execution.attempt_count, transcription_mode: task.input_config.transcription_mode }); return task;
   });
 }
 
@@ -547,14 +764,21 @@ export async function finishV5Job(workspace: string, task: TaskRecordV5): Promis
     const current = await readV5Task(directory);
     if (!TERMINAL.has(current.status)) throw new MercuryError('JOB_TASK_STATE_CONFLICT', 'v5 任务尚未终结。');
     const job = await readJob(workspace, current.identity.task_id);
-    if (job.state !== 'terminal') {
-      job.state = 'terminal'; job.updated_at = new Date().toISOString(); await writeJob(workspace, job);
+    const attemptsPath = path.join(directory, 'attempts.jsonl');
+    const attemptRecords = await readFile(attemptsPath, 'utf8').then((source) => source.split('\n').filter(Boolean).map((line) => JSON.parse(line) as { contract?: string; attempt_id?: string })).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
+    });
+    if (!attemptRecords.some((entry) => entry.contract === 'mercury.attempt-result/v1' && entry.attempt_id === current.execution.attempt_id)) {
       await appendStableJsonLine(path.join(directory, 'attempts.jsonl'), {
         contract: 'mercury.attempt-result/v1', task_id: current.identity.task_id, attempt_id: current.execution.attempt_id,
         number: current.execution.attempt_count, ended_at: current.execution.ended_at, status: current.status,
         asr_call_count: current.execution.provider_calls.asr.count, chat_call_count: current.execution.provider_calls.chat.count,
         safe_checkpoint: current.execution.safe_checkpoint,
       });
+    }
+    if (job.state !== 'terminal') {
+      job.state = 'terminal'; job.updated_at = new Date().toISOString(); await writeJob(workspace, job);
     }
   });
 }
@@ -577,14 +801,46 @@ export async function auditV5Job(workspace: string, listed: BackgroundJobV1): Pr
     const task = await readV5Task(directory); const job = await readJob(workspace, listed.task_id);
     const eventRevision = (await stableEvents(directory)).at(-1)?.task_revision ?? 0;
     if (eventRevision > task.identity.revision) { task.identity.revision = eventRevision; task.updated_at = new Date().toISOString(); await persistV5Task(directory, task); }
-    if (TERMINAL.has(task.status)) { if (job.state !== 'terminal') { job.state = 'terminal'; job.updated_at = new Date().toISOString(); await writeJob(workspace, job); } return; }
+    if (TERMINAL.has(task.status)) {
+      if (task.status === 'completed') {
+        const reviewRuntime = await import('../review-v5.js');
+        const review = await reviewRuntime.initializeV5Review(directory);
+        if (review.status === 'not_required') await reviewRuntime.finalizeV5Review(directory);
+      }
+      let current = await readV5Task(directory);
+      const terminalType = current.status === 'completed' ? 'task_completed' : current.status === 'cancelled' ? 'task_cancelled' : current.status === 'interrupted' ? 'task_interrupted' : 'task_failed';
+      const events = await stableEvents(directory);
+      if (!events.some((event) => event.type === terminalType)) {
+        await appendV5Event(directory, current, terminalType, '后台任务已在安全审计中确认终态。');
+        current = await readV5Task(directory);
+      }
+      await writeV5Result(directory, current);
+      const attemptsPath = path.join(directory, 'attempts.jsonl');
+      const attemptRecords = await readFile(attemptsPath, 'utf8').then((source) => source.split('\n').filter(Boolean).map((line) => JSON.parse(line) as { contract?: string; attempt_id?: string })).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+        throw error;
+      });
+      if (!attemptRecords.some((entry) => entry.contract === 'mercury.attempt-result/v1' && entry.attempt_id === current.execution.attempt_id)) {
+        await appendStableJsonLine(attemptsPath, {
+          contract: 'mercury.attempt-result/v1', task_id: current.identity.task_id, attempt_id: current.execution.attempt_id,
+          number: current.execution.attempt_count, ended_at: current.execution.ended_at, status: current.status,
+          asr_call_count: current.execution.provider_calls.asr.count, chat_call_count: current.execution.provider_calls.chat.count,
+          safe_checkpoint: current.execution.safe_checkpoint,
+        });
+      }
+      if (job.state !== 'terminal') { job.state = 'terminal'; job.updated_at = new Date().toISOString(); await writeJob(workspace, job); }
+      return;
+    }
     if (task.status === 'queued' && job.state === 'queued') return;
     const calls = Object.values(task.execution.provider_calls);
     const call = task.execution.provider_calls.chat;
     if (calls.some((entry) => entry.state === 'in_flight')) {
       task.status = 'interrupted'; task.stage = null; task.execution.ended_at = new Date().toISOString(); task.error = exchangeError('TASK_INTERRUPTED_PROVIDER_UNKNOWN', 'Worker 中断时 Provider 结果无法确认。', 'outcome_unknown'); job.state = 'terminal';
     } else {
-      task.status = 'queued'; task.stage = null; task.execution.started_at = null; task.execution.worker_id = null; task.execution.heartbeat_at = null; task.execution.attempt_id = null; task.execution.safe_checkpoint = call.state === 'response_persisted' ? 'chat_response_persisted' : 'queued'; job.state = 'queued'; job.worker_id = null; job.claim_token = null;
+      task.status = 'queued'; task.stage = null; task.execution.started_at = null; task.execution.worker_id = null; task.execution.heartbeat_at = null; task.execution.attempt_id = null;
+      task.execution.safe_checkpoint = call.state === 'response_persisted' ? 'chat_response_persisted'
+        : task.execution.provider_calls.asr.state === 'response_persisted' ? 'asr_response_persisted' : 'queued';
+      job.state = 'queued'; job.worker_id = null; job.claim_token = null;
     }
     task.updated_at = new Date().toISOString(); job.updated_at = task.updated_at; await persistV5Task(directory, task); await writeJob(workspace, job);
   });
@@ -602,7 +858,7 @@ export async function containV5Failure(workspace: string, listed: BackgroundJobV
     if (TERMINAL.has(task.status)) { job.state = 'terminal'; job.updated_at = new Date().toISOString(); await writeJob(workspace, job); return 'terminal'; }
     const call = task.execution.provider_calls.chat;
     if (Object.values(task.execution.provider_calls).some((entry) => entry.state === 'in_flight')) { task.status = 'interrupted'; task.error = exchangeError('TASK_INTERRUPTED_PROVIDER_UNKNOWN', '后台执行异常时 Provider 结果无法确认。', 'outcome_unknown'); job.state = 'terminal'; }
-    else if (call.state === 'response_persisted') { task.status = 'queued'; task.stage = null; task.execution.started_at = null; task.execution.worker_id = null; task.execution.heartbeat_at = null; task.execution.attempt_id = null; job.state = 'queued'; job.worker_id = null; job.claim_token = null; }
+    else if (call.state === 'response_persisted' || task.execution.provider_calls.asr.state === 'response_persisted') { task.status = 'queued'; task.stage = null; task.execution.started_at = null; task.execution.worker_id = null; task.execution.heartbeat_at = null; task.execution.attempt_id = null; task.execution.safe_checkpoint = call.state === 'response_persisted' ? 'chat_response_persisted' : 'asr_response_persisted'; job.state = 'queued'; job.worker_id = null; job.claim_token = null; }
     else { task.status = 'failed'; task.error = exchangeError(error instanceof MercuryError ? error.code : 'WORKER_JOB_FAILED_BEFORE_PROVIDER', '后台任务在 Provider 调用前遇到内部错误；未自动重试。', 'not_dispatched'); job.state = 'terminal'; }
     task.stage = null; if (task.status !== 'queued') task.execution.ended_at = new Date().toISOString(); task.updated_at = new Date().toISOString(); job.updated_at = task.updated_at; await persistV5Task(directory, task); await writeJob(workspace, job); await writeV5Result(directory, task); return task.status === 'queued' ? 'requeued' : 'terminal';
   });

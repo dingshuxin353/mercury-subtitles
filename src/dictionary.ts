@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
-import { chmod, lstat, mkdir, readFile, readdir } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readFile, readdir, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import type { ExchangeDictionaryV1, ExchangeRequestV1 } from './contracts/index.js';
 import type { Entry } from './contracts/generated/exchange-dictionary-v1.js';
 import type { DictionaryReference } from './contracts/generated/task-record-v5.js';
+import type { AsrHintsEvidence } from './contracts/adapters/asr.js';
 import { assertExchangeContract } from './contracts/index.js';
 import { MercuryError } from './errors.js';
 import { withOwnedLock } from './background/owned-lock.js';
@@ -18,7 +19,8 @@ export interface ResolvedDictionarySnapshot {
   contract: 'mercury.dictionary-snapshot/v1'; task_id: string; created_at: string;
   resolved: DictionaryReference[]; entries: Array<Entry & { source: DictionaryReference['source']; dictionary_id: string; revision: string }>;
   conflicts: Array<{ key: string; entry_ids: string[] }>;
-  matched_entry_ids: string[]; chat_context_entry_ids: string[]; asr_hints: { status: 'not_applicable' | 'not_supported' | 'used'; entry_ids: string[] };
+  matched_entry_ids: string[]; chat_context_entry_ids: string[];
+  asr_hints: AsrHintsEvidence;
   extensions: Record<string, unknown>;
 }
 
@@ -55,13 +57,33 @@ function versioned(value: Omit<ExchangeDictionaryV1, 'revision' | 'content_hash'
 async function assertDirectorySafe(target: string): Promise<void> {
   const entry = await lstat(target);
   if (!entry.isDirectory() || entry.isSymbolicLink()) throw new MercuryError('DICTIONARY_PATH_UNSAFE', '词典路径必须是普通目录。');
+  const parentReal = await realpath(path.dirname(target));
+  const targetReal = await realpath(target);
+  if (path.dirname(targetReal) !== parentReal) throw new MercuryError('DICTIONARY_PATH_UNSAFE', '词典路径真实位置超出预期父目录。');
+}
+async function ensurePlainDirectory(target: string, parent: string): Promise<void> {
+  await assertDirectorySafe(parent);
+  try {
+    await assertDirectorySafe(target);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    await mkdir(target, { recursive: false, mode: 0o700 });
+    await assertDirectorySafe(target);
+  }
+  await chmod(target, 0o700);
 }
 async function ensureDictionaryRoot(workspace: string, id?: string): Promise<string> {
-  const root = dictionariesRoot(workspace); await mkdir(root, { recursive: true, mode: 0o700 }); await chmod(root, 0o700); await assertDirectorySafe(root);
+  const workspaceRoot = path.resolve(workspace);
+  await ensurePlainDirectory(workspaceRoot, path.dirname(workspaceRoot));
+  const root = dictionariesRoot(workspace); await ensurePlainDirectory(root, workspaceRoot);
   if (!id) return root;
-  const directory = dictionaryRoot(workspace, id); await mkdir(path.join(directory, 'revisions'), { recursive: true, mode: 0o700 }); await chmod(directory, 0o700); await chmod(path.join(directory, 'revisions'), 0o700); await assertDirectorySafe(directory); return directory;
+  const directory = dictionaryRoot(workspace, id); await ensurePlainDirectory(directory, root); await ensurePlainDirectory(path.join(directory, 'revisions'), directory); return directory;
 }
 async function readPointer(workspace: string, id: string): Promise<DictionaryPointerV1> {
+  await assertDirectorySafe(path.resolve(workspace));
+  await assertDirectorySafe(dictionariesRoot(workspace));
+  await assertDirectorySafe(dictionaryRoot(workspace, id));
+  await assertDirectorySafe(path.join(dictionaryRoot(workspace, id), 'revisions'));
   const value = await readStableJson(pointerPath(workspace, id), 'DICTIONARY_NOT_FOUND') as DictionaryPointerV1;
   if (value.contract !== 'mercury.dictionary-pointer/v1' || value.dictionary_id !== id || !/^rev-[a-f0-9]{12,64}$/u.test(value.current_revision)) throw new MercuryError('DICTIONARY_RECORD_INVALID', '词典当前指针损坏或 identity 错置。');
   return value;
@@ -106,7 +128,11 @@ export async function readDictionary(workspace: string, id: string, revision?: s
 
 export async function listDictionaries(workspace: string, filter: { scope?: 'global' | 'project'; projectKey?: string } = {}): Promise<ExchangeDictionaryV1[]> {
   let entries;
-  try { entries = await readdir(dictionariesRoot(workspace), { withFileTypes: true }); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
+  try {
+    await assertDirectorySafe(path.resolve(workspace));
+    await assertDirectorySafe(dictionariesRoot(workspace));
+    entries = await readdir(dictionariesRoot(workspace), { withFileTypes: true });
+  } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
   const result: ExchangeDictionaryV1[] = [];
   for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
     if (!entry.isDirectory() || entry.isSymbolicLink() || !DICTIONARY_ID.test(entry.name)) continue;
@@ -161,11 +187,24 @@ export async function resolveDictionarySnapshot(workspace: string, request: Exch
   }).filter((value): value is NonNullable<typeof value> => value !== null).sort((a, b) => a.priority - b.priority || a.dictionary.dictionary_id.localeCompare(b.dictionary.dictionary_id));
   const resolved: DictionaryReference[] = ranked.map(({ dictionary, source }) => ({ dictionary_id: dictionary.dictionary_id, revision: dictionary.revision, content_hash: dictionary.content_hash, source }));
   const candidates: Array<Entry & { source: DictionaryReference['source']; dictionary_id: string; revision: string; priority: number }> = [];
-  for (const override of request.dictionaries.task_overrides) candidates.push({ ...override, source: 'task_override', dictionary_id: 'dict-task-override', revision: `rev-${hash(canonicalJson(override)).slice(0, 20)}`, priority: 1 });
+  const orderedOverrides = [...request.dictionaries.task_overrides].sort((a, b) => a.entry_id.localeCompare(b.entry_id));
+  if (orderedOverrides.length > 0) {
+    const overrideHash = hash(canonicalJson(orderedOverrides));
+    const overrideRevision = `rev-${overrideHash.slice(0, 20)}`;
+    resolved.unshift({ dictionary_id: 'dict-task-override', revision: overrideRevision, content_hash: overrideHash, source: 'task_override' });
+    for (const override of orderedOverrides) candidates.push({ ...override, source: 'task_override', dictionary_id: 'dict-task-override', revision: overrideRevision, priority: 1 });
+  }
   for (const value of ranked) for (const entry of value.dictionary.entries.filter((candidate) => candidate.enabled)) candidates.push({ ...entry, source: value.source, dictionary_id: value.dictionary.dictionary_id, revision: value.dictionary.revision, priority: value.priority });
   const entries = new Map<string, typeof candidates[number]>();
   for (const candidate of candidates.sort((a, b) => a.priority - b.priority)) if (!entries.has(candidate.entry_id)) entries.set(candidate.entry_id, candidate);
-  const spelling = new Map<string, typeof candidates[number]>(); const conflicts: ResolvedDictionarySnapshot['conflicts'] = [];
+  const spelling = new Map<string, typeof candidates[number]>(); const canonicalPolicies = new Map<string, typeof candidates[number]>(); const conflicts: ResolvedDictionarySnapshot['conflicts'] = [];
+  for (const candidate of entries.values()) {
+    const policyKey = candidate.canonical.normalize('NFC').toLocaleLowerCase('und');
+    const existing = canonicalPolicies.get(policyKey);
+    if (existing && (existing.case_sensitive !== candidate.case_sensitive || existing.number_sensitive !== candidate.number_sensitive)) {
+      conflicts.push({ key: hash(`policy:${policyKey}`).slice(0, 12), entry_ids: [existing.entry_id, candidate.entry_id].sort() });
+    } else if (!existing) canonicalPolicies.set(policyKey, candidate);
+  }
   for (const candidate of entries.values()) for (const form of [candidate.canonical, ...candidate.variants]) {
     const key = normalizedKey(form, candidate.case_sensitive); const existing = spelling.get(key);
     if (existing && existing.canonical !== candidate.canonical) conflicts.push({ key: hash(key).slice(0, 12), entry_ids: [existing.entry_id, candidate.entry_id].sort() });
@@ -174,5 +213,12 @@ export async function resolveDictionarySnapshot(workspace: string, request: Exch
   if (conflicts.length > 0) throw new MercuryError('DICTIONARY_CONFLICT', `词典存在 ${conflicts.length} 组写法冲突；任务未提交。`, { exitCode: 3 });
   const effective = [...entries.values()].map(({ priority: _priority, ...entry }) => entry).sort((a, b) => a.entry_id.localeCompare(b.entry_id));
   const matched = effective.filter((entry) => [entry.canonical, ...entry.variants].some((form) => normalizedKey(transcriptText, entry.case_sensitive).includes(normalizedKey(form, entry.case_sensitive))));
-  return { contract: 'mercury.dictionary-snapshot/v1', task_id: taskId, created_at: request.created_at, resolved, entries: effective, conflicts: [], matched_entry_ids: matched.map((entry) => entry.entry_id), chat_context_entry_ids: matched.map((entry) => entry.entry_id), asr_hints: { status: request.transcription_mode === 'provided' ? 'not_applicable' : 'not_supported', entry_ids: [] }, extensions: {} };
+  return {
+    contract: 'mercury.dictionary-snapshot/v1', task_id: taskId, created_at: request.created_at, resolved, entries: effective, conflicts: [],
+    matched_entry_ids: matched.map((entry) => entry.entry_id), chat_context_entry_ids: matched.map((entry) => entry.entry_id),
+    asr_hints: request.transcription_mode === 'provided'
+      ? { status: 'not_applicable', adapter_id: null, entry_ids: [], available_count: effective.length, input_count: 0, truncated: false, input_hash: null, reason: '外部提供转录不会调用 ASR。' }
+      : { status: 'pending', adapter_id: null, entry_ids: [], available_count: effective.length, input_count: 0, truncated: false, input_hash: null, reason: '等待所选 ASR adapter 声明能力。' },
+    extensions: {},
+  };
 }

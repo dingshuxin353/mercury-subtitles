@@ -3,7 +3,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { runCli } from '../src/cli.js';
+import { applyConfigMigration, inspectConfigMigration } from '../src/stable-cli/config.js';
+import { stableErrorFrom } from '../src/stable-cli/envelope.js';
 import { sha256File } from '../src/tasks.js';
+import { MercuryError } from '../src/errors.js';
 
 function capture(home: string) {
   const stdout: string[] = [];
@@ -75,6 +78,31 @@ describe('stable CLI v1 protocol and configuration', () => {
     const backup = envelope.data.backup_path;
     expect((await stat(backup)).mode & 0o777).toBe(0o600);
     expect(await sha256File(backup)).toBe(before);
+  });
+
+  it('reuses an identical migration backup after an injected failure and retries successfully', async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), 'mercury-stable-migrate-retry-'));
+    const workspace = path.join(home, 'mercury-workspace');
+    const configDirectory = path.join(workspace, 'config');
+    await mkdir(configDirectory, { recursive: true });
+    const target = path.join(configDirectory, 'model-config.json');
+    await cp(path.join(process.cwd(), 'test/fixtures/valid/model-config.json'), target);
+    const before = await sha256File(target);
+    const plan = await inspectConfigMigration(workspace);
+    await expect(applyConfigMigration(workspace, plan.plan_id!, { faultAfterBackup: () => { throw new Error('fixture crash'); } })).rejects.toMatchObject({ code: 'MIGRATION_FAILED' });
+    expect(await sha256File(target)).toBe(before);
+    const after = await applyConfigMigration(workspace, plan.plan_id!);
+    expect(after.state).toBe('current');
+    expect(await sha256File(after.backup_path)).toBe(before);
+    expect((await stat(after.backup_path)).mode & 0o777).toBe(0o600);
+  });
+
+  it('classifies invalid dictionary imports as stable input errors', () => {
+    const { error } = stableErrorFrom(new MercuryError('DICTIONARY_IMPORT_INVALID', 'bad import', { exitCode: 2 }));
+    expect(error.category).toBe('input');
+    const secretError = stableErrorFrom(new MercuryError('REQUEST_INVALID', `bad ${'Author'}ization: ${'Bear'}er ${'x'.repeat(40)}`, { exitCode: 2 })).error;
+    expect(secretError.message).toContain('已脱敏');
+    expect(JSON.stringify(secretError)).not.toContain('Bearer');
   });
 
   it('uses a strict stable error envelope for bad machine arguments', async () => {

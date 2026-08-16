@@ -16,6 +16,7 @@ import type { ExchangeErrorV1 } from './generated/exchange-error-v1.js';
 import type { ExchangeTranscriptV1 } from './generated/exchange-transcript-v1.js';
 import type { ExchangeDictionaryV1 } from './generated/exchange-dictionary-v1.js';
 import { MercuryError } from '../errors.js';
+import { sensitiveInformationIssues } from './validation/security.js';
 
 export const EXCHANGE_CONTRACTS = {
   request: 'mercury.exchange.request/v1',
@@ -63,19 +64,38 @@ function issue(path: string, message: string): ExchangeValidationIssue {
   return { path, message };
 }
 
-function containsSensitiveKey(value: unknown): boolean {
-  if (Array.isArray(value)) return value.some(containsSensitiveKey);
-  if (typeof value !== 'object' || value === null) return false;
-  return Object.entries(value).some(([key, child]) =>
-    /^(?:authorization|api[_-]?key|access[_-]?token|secret|credential)$/iu.test(key)
-    || containsSensitiveKey(child));
+export function exchangeJsonResourceIssues(value: unknown): ExchangeValidationIssue[] {
+  const issues: ExchangeValidationIssue[] = [];
+  const queue: Array<{ value: unknown; path: string; depth: number }> = [{ value, path: '/', depth: 0 }];
+  let nodes = 0;
+  let stringBytes = 0;
+  while (queue.length > 0) {
+    const current = queue.pop()!;
+    nodes += 1;
+    if (nodes > 20_000) { issues.push(issue(current.path, '合同 JSON 节点总量超过 20,000')); break; }
+    if (current.depth > 20) { issues.push(issue(current.path, '合同 JSON 递归深度超过 20')); continue; }
+    if (typeof current.value === 'string') {
+      stringBytes += Buffer.byteLength(current.value, 'utf8');
+      if (Buffer.byteLength(current.value, 'utf8') > 256_000) issues.push(issue(current.path, '单个字符串超过 256,000 bytes'));
+      continue;
+    }
+    if (Array.isArray(current.value)) {
+      if (current.value.length > 10_000) issues.push(issue(current.path, '数组元素超过 10,000'));
+      current.value.forEach((entry, index) => queue.push({ value: entry, path: `${current.path}/${index}`, depth: current.depth + 1 }));
+      continue;
+    }
+    if (typeof current.value === 'object' && current.value !== null) {
+      const entries = Object.entries(current.value);
+      if (entries.length > 1_000) issues.push(issue(current.path, '对象属性超过 1,000'));
+      entries.forEach(([key, child]) => queue.push({ value: child, path: `${current.path}/${key.replaceAll('~', '~0').replaceAll('/', '~1')}`, depth: current.depth + 1 }));
+    }
+  }
+  if (stringBytes > 2_000_000) issues.push(issue('/', '合同字符串总量超过 2,000,000 bytes'));
+  return issues;
 }
 
 function semanticIssues(name: ExchangeContractName, value: any): ExchangeValidationIssue[] {
   const issues: ExchangeValidationIssue[] = [];
-  if (containsSensitiveKey(value.extensions)) {
-    issues.push(issue('/extensions', '扩展字段不得携带凭据或授权头'));
-  }
   if (name === 'request') {
     const transcriptSource = value.inputs.transcript?.role === 'transcript_source';
     if (value.transcription_mode === 'provided') {
@@ -166,6 +186,10 @@ export function validateExchangeContract<N extends ExchangeContractName>(
   name: N,
   value: unknown,
 ): ExchangeValidationResult<ExchangeContractTypeMap[N]> {
+  const resources = exchangeJsonResourceIssues(value);
+  if (resources.length > 0) return { valid: false, value: null, issues: resources };
+  const security = sensitiveInformationIssues(value).map((entry) => issue(entry.path, entry.message));
+  if (security.length > 0) return { valid: false, value: null, issues: security };
   const validate = ajv.getSchema(schemas[name].$id) as ValidateFunction;
   if (!validate(value)) return { valid: false, value: null, issues: schemaIssues(validate.errors) };
   const issues = semanticIssues(name, value);
