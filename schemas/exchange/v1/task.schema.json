@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercury.local/schemas/exchange/v1/task.schema.json",
+  "title": "ExchangeTaskV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "task_id", "request_id", "revision", "created_at", "updated_at", "status", "stage", "progress", "worker", "pause", "cancel", "retry", "attempt", "artifacts", "review", "error", "next_action", "source_schema_version", "capabilities", "extensions"],
+  "properties": {
+    "contract": { "const": "mercury.task/v1" },
+    "task_id": { "$ref": "common.schema.json#/$defs/taskId" },
+    "request_id": { "anyOf": [{ "type": "null" }, { "$ref": "common.schema.json#/$defs/requestId" }] },
+    "revision": { "type": "integer", "minimum": 0 },
+    "created_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "updated_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "status": { "enum": ["queued", "running", "pausing", "paused", "needs_input", "completed", "failed", "cancelled", "interrupted"] },
+    "stage": { "type": ["string", "null"], "maxLength": 100 },
+    "progress": { "$ref": "common.schema.json#/$defs/progress" },
+    "worker": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "heartbeat_at"],
+      "properties": {
+        "status": { "enum": ["active", "inactive", "unknown"] },
+        "heartbeat_at": { "anyOf": [{ "type": "null" }, { "$ref": "common.schema.json#/$defs/timestamp" }] }
+      }
+    },
+    "pause": { "$ref": "#/$defs/actionCapability" },
+    "cancel": { "$ref": "#/$defs/actionCapability" },
+    "retry": { "$ref": "#/$defs/actionCapability" },
+    "attempt": {
+      "type": "object", "additionalProperties": false,
+      "required": ["attempt_id", "count"],
+      "properties": {
+        "attempt_id": { "type": ["string", "null"], "maxLength": 100 },
+        "count": { "type": "integer", "minimum": 0, "maximum": 1000 }
+      }
+    },
+    "artifacts": { "type": "array", "maxItems": 20, "items": { "$ref": "common.schema.json#/$defs/artifact" } },
+    "review": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "pending_count"],
+      "properties": {
+        "status": { "enum": ["unsupported", "not_ready", "pending", "in_progress", "ready", "not_required", "finalized", "invalid"] },
+        "pending_count": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "error": { "anyOf": [{ "type": "null" }, { "$ref": "error.schema.json" }] },
+    "next_action": { "type": "string", "minLength": 1, "maxLength": 1000, "pattern": "\\S" },
+    "source_schema_version": { "type": "string", "minLength": 1, "maxLength": 40 },
+    "capabilities": {
+      "type": "object", "additionalProperties": false,
+      "required": ["pause", "resume", "retry", "review", "dictionary_snapshot", "provided_transcript"],
+      "properties": {
+        "pause": { "$ref": "common.schema.json#/$defs/capability" },
+        "resume": { "$ref": "common.schema.json#/$defs/capability" },
+        "retry": { "$ref": "common.schema.json#/$defs/capability" },
+        "review": { "$ref": "common.schema.json#/$defs/capability" },
+        "dictionary_snapshot": { "$ref": "common.schema.json#/$defs/capability" },
+        "provided_transcript": { "$ref": "common.schema.json#/$defs/capability" }
+      }
+    },
+    "extensions": { "$ref": "common.schema.json#/$defs/extensions" }
+  },
+  "$defs": {
+    "actionCapability": {
+      "type": "object", "additionalProperties": false,
+      "required": ["allowed", "reason"],
+      "properties": {
+        "allowed": { "type": "boolean" },
+        "reason": { "type": ["string", "null"], "maxLength": 500 }
+      }
+    }
+  }
+}

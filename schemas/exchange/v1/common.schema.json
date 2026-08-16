@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercury.local/schemas/exchange/v1/common.schema.json",
+  "title": "MercuryExchangeCommonV1",
+  "$defs": {
+    "timestamp": { "type": "string", "format": "date-time" },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "nonBlank": { "type": "string", "minLength": 1, "maxLength": 500, "pattern": "\\S" },
+    "absolutePath": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^/" },
+    "taskRelativePath": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?=\\S(?:.*\\S)?$)[^\\\\]+$" },
+    "taskId": { "type": "string", "pattern": "^tsk-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}$" },
+    "requestId": { "type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[^\\s\\u0000-\\u001f]+$" },
+    "extensions": {
+      "type": "object",
+      "maxProperties": 32,
+      "propertyNames": { "pattern": "^(?:[a-z0-9-]+\\.)+[a-z0-9-]+$" },
+      "additionalProperties": true
+    },
+    "progress": {
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["completed", "total", "unit"],
+          "properties": {
+            "completed": { "type": "number", "minimum": 0 },
+            "total": { "type": "number", "exclusiveMinimum": 0 },
+            "unit": { "enum": ["items", "milliseconds", "bytes", "percent"] }
+          }
+        }
+      ]
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identity", "exists", "path", "sha256", "validation"],
+      "properties": {
+        "identity": { "enum": ["transcript", "transcribed_srt", "calibrated_srt", "approved_srt", "calibration_report"] },
+        "exists": { "type": "boolean" },
+        "path": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/absolutePath" }] },
+        "sha256": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/sha256" }] },
+        "validation": { "enum": ["passed", "pending", "unavailable"] }
+      }
+    },
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["supported", "reason"],
+      "properties": {
+        "supported": { "type": "boolean" },
+        "reason": { "type": ["string", "null"], "maxLength": 300 }
+      }
+    },
+    "dictionaryReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dictionary_id", "revision", "content_hash", "source"],
+      "properties": {
+        "dictionary_id": { "type": "string", "pattern": "^dict-[a-z0-9][a-z0-9-]{2,63}$" },
+        "revision": { "type": "string", "pattern": "^rev-[a-f0-9]{12,64}$" },
+        "content_hash": { "$ref": "#/$defs/sha256" },
+        "source": { "enum": ["task_override", "explicit_project", "project_default", "explicit_global", "global_default"] }
+      }
+    }
+  }
+}

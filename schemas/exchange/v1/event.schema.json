@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercury.local/schemas/exchange/v1/event.schema.json",
+  "title": "ExchangeEventV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "event_id", "task_id", "sequence", "occurred_at", "type", "severity", "task_revision", "attempt_id", "stage", "progress", "message", "data", "extensions"],
+  "properties": {
+    "contract": { "const": "mercury.event/v1" },
+    "event_id": { "type": "string", "pattern": "^evt-[a-f0-9]{16,64}$" },
+    "task_id": { "$ref": "common.schema.json#/$defs/taskId" },
+    "sequence": { "type": "integer", "minimum": 1 },
+    "occurred_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "type": { "type": "string", "minLength": 1, "maxLength": 100, "pattern": "^[a-z][a-z0-9_]*$" },
+    "severity": { "enum": ["info", "warning", "error"] },
+    "task_revision": { "type": "integer", "minimum": 0 },
+    "attempt_id": { "type": ["string", "null"], "maxLength": 100 },
+    "stage": { "type": ["string", "null"], "maxLength": 100 },
+    "progress": { "$ref": "common.schema.json#/$defs/progress" },
+    "message": { "type": "string", "minLength": 1, "maxLength": 500, "pattern": "\\S" },
+    "data": { "type": "object", "maxProperties": 50, "additionalProperties": true },
+    "extensions": { "$ref": "common.schema.json#/$defs/extensions" }
+  }
+}
