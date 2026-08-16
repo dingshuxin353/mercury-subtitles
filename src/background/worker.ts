@@ -106,7 +106,6 @@ export async function workerStatus(workspaceRoot: string, now = Date.now()): Pro
   stale: boolean;
   worker: WorkerRecord | null;
 }> {
-  await ensureRuntimeLayout(workspaceRoot);
   const worker = await readWorkerRecord(workspaceRoot);
   if (!worker) return { running: false, stale: false, worker: null };
   const stale = worker.state === 'stopping' || now - new Date(worker.heartbeat_at).getTime() > WORKER_STALE_AFTER_MS || !processAlive(worker.pid);

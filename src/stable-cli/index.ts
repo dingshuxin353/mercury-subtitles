@@ -7,7 +7,7 @@ import { stableFailure, stableSuccess } from './envelope.js';
 import { createdAtOf, decodeTaskCursor, findTaskReadOnly, listTasksReadOnly, stableCancelTask, stableEventsAfter, stableTaskResult, stableTaskView, taskCursor, taskIdOf } from './tasks.js';
 import { readStableJson, writeStableJsonAtomic } from '../exchange/storage.js';
 import { projectV5Task, submitExchangeRequest } from '../exchange/runtime.js';
-import { startDetachedWorker } from '../background/worker.js';
+import { startDetachedWorker, workerStatus } from '../background/worker.js';
 import { inspectTranscriptInput, type TranscriptInputFormat, type TranscriptInputRole } from '../external-input.js';
 import { assertExchangeContract, type ExchangeRequestV1 } from '../contracts/index.js';
 import { runDictionaryCommand } from './dictionary.js';
@@ -45,6 +45,7 @@ export async function tryRunStableCli(args: string[], context: StableCliContext)
     : args[0] === 'dictionary' && args[1] ? `dictionary.${args[1]}`
     : args[0] === 'config' && args[1] === 'status' ? 'config.status'
       : args[0] === 'config' && args[1] === 'migrate' ? 'config.migrate'
+        : args[0] === 'worker' && args[1] === 'status' && args.includes('--json') ? 'worker.status'
         : args[0] === 'task' && args[1] && (args.includes('--json') || args.includes('--jsonl')) ? `task.${args[1]}`
         : null;
   if (!command) return null;
@@ -64,6 +65,17 @@ export async function tryRunStableCli(args: string[], context: StableCliContext)
         machine_contract: 'mercury.cli/v1', input_formats: ['srt', 'vtt', 'transcript_json'], query_commands_are_read_only: true,
       };
       else throw new MercuryError('CLI_COMMAND_INVALID', `不支持的协议命令：${args[1]}`, { exitCode: 2 });
+    } else if (args[0] === 'worker') {
+      exactJson(args.slice(2));
+      const status = await workerStatus(context.workspaceRoot);
+      data = {
+        running: status.running,
+        stale: status.stale,
+        state: status.worker?.state ?? 'stopped',
+        task_id: status.worker?.task_id ?? null,
+        heartbeat_at: status.worker?.heartbeat_at ?? null,
+        diagnostic_count: status.worker?.diagnostic_count ?? 0,
+      };
     } else if (args[0] === 'dictionary') {
       if (!args.includes('--json')) throw new MercuryError('CLI_ARGUMENT_INVALID', '稳定词典命令必须使用 --json。', { exitCode: 2 });
       data = await runDictionaryCommand(context.workspaceRoot, args.slice(1));

@@ -47,6 +47,29 @@ describe('stable CLI v1 protocol and configuration', () => {
     await expect(lstat(path.join(home, 'mercury-workspace'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it('returns worker status through the stable envelope without creating workspace state', async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), 'mercury-stable-worker-status-'));
+    const output = capture(home);
+    expect(await runCli(['worker', 'status', '--json'], output.io)).toBe(0);
+    expect(output.stderr).toEqual([]);
+    expect(output.stdout).toHaveLength(1);
+    expect(JSON.parse(output.stdout[0]!)).toMatchObject({
+      contract: 'mercury.cli/v1',
+      command: 'worker.status',
+      ok: true,
+      data: {
+        running: false,
+        stale: false,
+        state: 'stopped',
+        task_id: null,
+        heartbeat_at: null,
+        diagnostic_count: 0,
+      },
+      error: null,
+    });
+    await expect(lstat(path.join(home, 'mercury-workspace'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('checks a v1 migration read-only, applies only the matching plan, and preserves a 0600 backup', async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), 'mercury-stable-migrate-'));
     const configDirectory = path.join(home, 'mercury-workspace', 'config');
