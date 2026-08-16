@@ -88,7 +88,7 @@
     "ajv-formats": "3.0.1"
   },
   "devDependencies": {
-    "@types/node": "24.13.3",
+    "@types/node": "26.2.0",
     "json-schema-to-typescript": "15.0.4",
     "typescript": "5.9.3",
     "vitest": "4.1.10"
