@@ -1858,7 +1858,7 @@ export async function runCli(
       } else {
         io.stdout(
           `Mercury 字幕 Skill：${data.installed ? data.compatible ? '已安装且兼容' : '已安装但需处理冲突或更新' : '尚未安装'}\n` +
-          `位置：${data.install_path}\n` +
+          `位置：${data.installed ? data.install_path : data.recommended_install_path}\n` +
           `${data.duplicate_installations ? `检测到 ${data.installations.length} 份安装，请人工检查后保留需要的一份。\n` : ''}` +
           `推荐安装/更新：${data.recommended_install_command}\n`,
         );

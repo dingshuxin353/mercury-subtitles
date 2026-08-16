@@ -195,7 +195,7 @@ export async function skillStatus(
     install_path: selected?.path ?? (
       targetParent
         ? path.join(path.resolve(targetParent), MERCURY_SKILL_NAME)
-        : recommendedInstallPath
+        : legacyInstallPath
     ),
     installed,
     compatible,

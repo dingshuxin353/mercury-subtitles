@@ -68,6 +68,9 @@ describe('V02-D004 packaged Mercury skill', () => {
       installations: [],
     });
     expect(status.install_path).toBe(
+      path.join(home, '.codex', 'skills', 'mercury-subtitles'),
+    );
+    expect(status.recommended_install_path).toBe(
       path.join(currentDirectory, '.agents', 'skills', 'mercury-subtitles'),
     );
     expect(await exists(path.join(home, '.agents'))).toBe(false);
