@@ -8,6 +8,8 @@ import { readTaskRecordV2, type TaskRecordV2 } from '../tasks-v2.js';
 import { cancelBackgroundTask, taskMachineView } from '../background/runtime.js';
 import { readTaskEvents } from '../background/storage.js';
 import { projectMachineTaskToExchangeResult, projectMachineTaskToExchangeTask } from '../exchange/projection.js';
+import type { TaskRecordV5 } from '../contracts/generated/task-record-v5.js';
+import { cancelV5Task, projectV5Result, projectV5Task, readV5Events, readV5Task } from '../exchange/runtime.js';
 
 const TASK_ID = /^tsk-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}$/u;
 
@@ -23,46 +25,69 @@ async function tasksRootIfPresent(workspaceRoot: string): Promise<string | null>
   }
 }
 
-async function readCompatibleTask(directory: string): Promise<TaskRecord | TaskRecordV2> {
+type CompatibleTask = TaskRecord | TaskRecordV2 | TaskRecordV5;
+
+function taskIdOf(task: CompatibleTask): string { return 'identity' in task ? task.identity.task_id : task.task_id; }
+function taskDirectoryOf(task: CompatibleTask): string { return 'identity' in task ? task.identity.task_directory : task.task_directory; }
+function createdAtOf(task: CompatibleTask): string { return task.created_at; }
+function updatedAtOf(task: CompatibleTask): string { return task.updated_at; }
+
+async function readCompatibleTask(directory: string): Promise<CompatibleTask> {
+  try {
+    const raw = JSON.parse(await (await import('node:fs/promises')).readFile(path.join(directory, 'task.json'), 'utf8')) as { schema_version?: string };
+    if (raw.schema_version === '5.0.0') return readV5Task(directory);
+  } catch {}
   const basic = await readTaskRecord(directory);
   const version = (basic as unknown as { schema_version?: string }).schema_version;
   return ['2.0.0', '3.0.0', '4.0.0'].includes(version ?? '') ? readTaskRecordV2(directory) : basic;
 }
 
-export async function listTasksReadOnly(workspaceRoot: string): Promise<Array<TaskRecord | TaskRecordV2>> {
+export async function listTasksReadOnly(workspaceRoot: string): Promise<CompatibleTask[]> {
   const root = await tasksRootIfPresent(workspaceRoot);
   if (!root) return [];
   const entries = await readdir(root, { withFileTypes: true });
-  const tasks: Array<TaskRecord | TaskRecordV2> = [];
+  const tasks: CompatibleTask[] = [];
   for (const entry of entries) {
     if (!entry.isDirectory() || !/^tsk-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}-.+$/u.test(entry.name)) continue;
     tasks.push(await readCompatibleTask(path.join(root, entry.name)));
   }
-  return tasks.sort((left, right) => right.created_at.localeCompare(left.created_at) || right.task_id.localeCompare(left.task_id));
+  return tasks.sort((left, right) => createdAtOf(right).localeCompare(createdAtOf(left)) || taskIdOf(right).localeCompare(taskIdOf(left)));
 }
 
-export async function findTaskReadOnly(workspaceRoot: string, taskId: string): Promise<TaskRecord | TaskRecordV2> {
+export async function findTaskReadOnly(workspaceRoot: string, taskId: string): Promise<CompatibleTask> {
   if (!TASK_ID.test(taskId)) throw new MercuryError('TASK_ID_INVALID', `任务 ID 格式无效：${taskId}`, { exitCode: 2 });
-  const tasks = (await listTasksReadOnly(workspaceRoot)).filter((task) => task.task_id === taskId);
+  const tasks = (await listTasksReadOnly(workspaceRoot)).filter((task) => taskIdOf(task) === taskId);
   if (tasks.length === 0) throw new MercuryError('TASK_NOT_FOUND', `未找到任务：${taskId}`);
   if (tasks.length > 1) throw new MercuryError('TASK_ID_CONFLICT', `检测到重复任务 ID：${taskId}`, { exitCode: 3 });
   return tasks[0]!;
 }
 
-export async function stableTaskView(workspaceRoot: string, record: TaskRecord | TaskRecordV2): Promise<ExchangeTaskV1> {
+export async function stableTaskView(workspaceRoot: string, record: CompatibleTask): Promise<ExchangeTaskV1> {
+  if ('identity' in record) return projectV5Task(path.join(workspaceRoot, 'tasks', record.identity.task_directory), record);
   const machine = await taskMachineView(workspaceRoot, record as unknown as TaskRecordV2);
+  let requestId: string | null = null;
+  try {
+    const request = assertExchangeContract('request', JSON.parse(await (await import('node:fs/promises')).readFile(path.join(workspaceRoot, 'tasks', record.task_directory, 'request.json'), 'utf8')));
+    requestId = request.request_id;
+  } catch {}
   return assertExchangeContract('task', projectMachineTaskToExchangeTask(machine, {
+    requestId,
     sourceSchemaVersion: String((record as unknown as { schema_version?: string }).schema_version ?? '1.0.0'),
     updatedAt: record.updated_at,
   }));
 }
 
-export async function stableTaskResult(workspaceRoot: string, record: TaskRecord | TaskRecordV2): Promise<ExchangeResultV1> {
+export async function stableTaskResult(workspaceRoot: string, record: CompatibleTask): Promise<ExchangeResultV1> {
+  if ('identity' in record) return projectV5Result(path.join(workspaceRoot, 'tasks', record.identity.task_directory), record);
   const machine = await taskMachineView(workspaceRoot, record as unknown as TaskRecordV2);
   return assertExchangeContract('result', projectMachineTaskToExchangeResult(machine, { producedAt: record.updated_at }));
 }
 
-export async function stableCancelTask(workspaceRoot: string, record: TaskRecord | TaskRecordV2): Promise<{ pending: boolean; task: ExchangeTaskV1 }> {
+export async function stableCancelTask(workspaceRoot: string, record: CompatibleTask): Promise<{ pending: boolean; task: ExchangeTaskV1 }> {
+  if ('identity' in record) {
+    const cancelled = await cancelV5Task(workspaceRoot, record);
+    return { pending: cancelled.pending, task: await stableTaskView(workspaceRoot, cancelled.task) };
+  }
   if ((record as unknown as { schema_version?: string }).schema_version !== '4.0.0') {
     throw new MercuryError('CONTRACT_UNSUPPORTED', '此历史任务不支持稳定取消。', { exitCode: 5 });
   }
@@ -70,7 +95,8 @@ export async function stableCancelTask(workspaceRoot: string, record: TaskRecord
   return { pending: cancelled.pending, task: await stableTaskView(workspaceRoot, cancelled.task) };
 }
 
-export async function stableEventsAfter(workspaceRoot: string, record: TaskRecord | TaskRecordV2, after: number): Promise<ExchangeEventV1[]> {
+export async function stableEventsAfter(workspaceRoot: string, record: CompatibleTask, after: number): Promise<ExchangeEventV1[]> {
+  if ('identity' in record) return readV5Events(path.join(workspaceRoot, 'tasks', record.identity.task_directory), after);
   if ((record as unknown as { schema_version?: string }).schema_version !== '4.0.0') return [];
   const taskDirectory = path.join(workspaceRoot, 'tasks', record.task_directory);
   return (await readTaskEvents(taskDirectory, after)).map((event) => assertExchangeContract('event', {
@@ -85,9 +111,11 @@ export async function stableEventsAfter(workspaceRoot: string, record: TaskRecor
   }));
 }
 
-export function taskCursor(task: TaskRecord | TaskRecordV2): string {
-  return Buffer.from(`${task.created_at}\n${task.task_id}`, 'utf8').toString('base64url');
+export function taskCursor(task: CompatibleTask): string {
+  return Buffer.from(`${createdAtOf(task)}\n${taskIdOf(task)}`, 'utf8').toString('base64url');
 }
+
+export { taskIdOf, taskDirectoryOf, createdAtOf, updatedAtOf };
 
 export function decodeTaskCursor(cursor: string): { createdAt: string; taskId: string } {
   try {

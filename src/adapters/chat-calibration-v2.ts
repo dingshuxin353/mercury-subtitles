@@ -727,7 +727,7 @@ abstract class CompleteCalibrationRuntimeBase {
       return this.beforeCallFailure(
         input,
         'CALIBRATION_FAILURE_ARTIFACT_INVALID',
-        '校准失败证据无法形成合法产物。',
+        `校准失败证据无法形成合法产物：${checked.issues.map((issue) => `${issue.path} ${issue.message}`).join('; ')}`,
         'artifact_write',
       );
     }

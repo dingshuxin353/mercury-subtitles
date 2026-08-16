@@ -18,6 +18,18 @@ import {
   writeJob,
 } from './storage.js';
 import { acquireOwnedLock, type OwnedLock } from './owned-lock.js';
+import {
+  auditV5Job,
+  appendV5Event,
+  claimV5Job,
+  containV5Failure,
+  executeV5Task,
+  finishV5Job,
+  heartbeatV5Task,
+  isV5TaskDirectory,
+  readV5Task,
+} from '../exchange/runtime.js';
+import type { TaskRecordV5 } from '../contracts/generated/task-record-v5.js';
 
 const HEARTBEAT_INTERVAL_MS = 2_000;
 export const WORKER_STALE_AFTER_MS = 15_000;
@@ -102,6 +114,10 @@ export async function auditInterruptedTasks(workspaceRoot: string): Promise<Set<
   for (const listedJob of scan.jobs) {
     try {
       const directory = taskDirectoryForJob(workspaceRoot, listedJob);
+      if (await isV5TaskDirectory(directory)) {
+        await auditV5Job(workspaceRoot, listedJob);
+        continue;
+      }
       await withTaskTransitionLock(directory, async () => {
       const job = await readJob(workspaceRoot, listedJob.task_id);
       const task = await readBackgroundTaskForJob(workspaceRoot, job);
@@ -486,6 +502,10 @@ async function heartbeatWorkerAndTask(
   if (!worker.task_id) return;
   const job = await readJob(workspaceRoot, worker.task_id);
   const directory = taskDirectoryForJob(workspaceRoot, job);
+  if (await isV5TaskDirectory(directory)) {
+    await heartbeatV5Task(workspaceRoot, worker.task_id, worker.worker_id, at);
+    return;
+  }
   await updateTaskRecordV2(directory, (task) => {
     if (task.execution.status === 'running' && task.execution.worker_id === worker.worker_id) {
       task.execution.heartbeat_at = at;
@@ -569,13 +589,18 @@ export async function runWorker(
         }
         break;
       }
-      let task: TaskRecordV2 | null;
+      let task: TaskRecordV2 | TaskRecordV5 | null;
+      const directory = taskDirectoryForJob(workspaceRoot, job);
+      const v5 = await isV5TaskDirectory(directory);
       try {
-        task = await claimJob(workspaceRoot, worker.worker_id, job, options.fault);
+        task = v5
+          ? await claimV5Job(workspaceRoot, job, worker.worker_id)
+          : await claimJob(workspaceRoot, worker.worker_id, job, options.fault);
       } catch (error) {
         if (error instanceof SimulatedClaimCrash) throw error.cause;
         try {
-          await containJobFailure(workspaceRoot, job, error);
+          if (v5) await containV5Failure(workspaceRoot, job, error);
+          else await containJobFailure(workspaceRoot, job, error);
         } catch (containError) {
           quarantined.add(job.task_id);
           worker.diagnostic_count = quarantined.size;
@@ -592,11 +617,23 @@ export async function runWorker(
       }
       if (!task) continue;
       worker.state = 'running';
-      worker.task_id = task.task_id;
+      worker.task_id = 'identity' in task ? task.identity.task_id : task.task_id;
       await queueWorkerWrite();
-      const directory = path.join(workspaceRoot, 'tasks', task.task_directory);
       try {
-        await options.fault?.('after_claim', task);
+        if (v5) {
+          let finalTask = await executeV5Task(directory, dependencies);
+          await heartbeatChain;
+          if (heartbeatError) throw heartbeatError;
+          await appendV5Event(directory, finalTask, finalTask.status === 'completed' ? 'task_completed' : finalTask.status === 'cancelled' ? 'task_cancelled' : finalTask.status === 'interrupted' ? 'task_interrupted' : 'task_failed', finalTask.status === 'completed' ? '后台任务处理完成。' : '后台任务已结束，请查看状态和下一步。');
+          finalTask = await readV5Task(directory);
+          await finishV5Job(workspaceRoot, finalTask);
+          worker.state = 'idle';
+          worker.task_id = null;
+          await queueWorkerWrite();
+          continue;
+        }
+        const v4Task = task as TaskRecordV2;
+        await options.fault?.('after_claim', v4Task);
         let finalTask = await executeCalibrationTaskV2(directory, dependencies);
         await options.fault?.('after_execute', finalTask);
         await heartbeatChain;
@@ -627,12 +664,9 @@ export async function runWorker(
         await finishJob(workspaceRoot, finalTask);
       } catch (error) {
         try {
-          const outcome = await containJobFailure(
-            workspaceRoot,
-            job,
-            error,
-            !localRecoveryAttempted.has(job.task_id),
-          );
+          const outcome = v5
+            ? await containV5Failure(workspaceRoot, job, error)
+            : await containJobFailure(workspaceRoot, job, error, !localRecoveryAttempted.has(job.task_id));
           if (outcome === 'requeued') localRecoveryAttempted.add(job.task_id);
         } catch (containError) {
           quarantined.add(job.task_id);
