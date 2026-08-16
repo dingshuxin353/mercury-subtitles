@@ -77,6 +77,9 @@ async function ordinaryPath(relative) {
 
 for (const required of requiredPaths) await ordinaryPath(required);
 for (const entry of await readdir(snapshotRoot)) {
+  // Finder may recreate this ignored metadata file while a local checkout is
+  // open. It cannot enter the public Git history because .gitignore excludes it.
+  if (entry === '.DS_Store') continue;
   if (!allowedTopLevel.has(entry)) {
     throw new Error(`Public snapshot contains non-allowlisted top-level path: ${entry}`);
   }
@@ -85,6 +88,7 @@ for (const entry of await readdir(snapshotRoot)) {
 async function collect(directory, root = directory) {
   const files = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
+    if (entry.name === '.DS_Store') continue;
     if (entry.isSymbolicLink()) {
       throw new Error(`Public snapshot contains symlink: ${path.relative(root, path.join(directory, entry.name))}`);
     }
