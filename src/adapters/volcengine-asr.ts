@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { dirname, extname, resolve } from 'node:path';
 import type {
@@ -348,12 +348,21 @@ export class VolcengineAsrAdapter implements AsrAdapter {
 
     let audioData: Buffer;
     try {
-      audioData = await readFile(input.audio.sourcePath);
+      audioData = input.audio.verifiedBytes ? Buffer.from(input.audio.verifiedBytes) : await readFile(input.audio.sourcePath);
     } catch {
       return this.failedResult(input, {
         call: null,
         code: 'ASR_AUDIO_READ_FAILED',
         message: 'The task audio copy could not be read.',
+        stage: 'media_decode',
+        retryable: false
+      });
+    }
+    if (input.audio.verifiedBytes && createHash('sha256').update(audioData).digest('hex') !== input.audio.sha256) {
+      return this.failedResult(input, {
+        call: null,
+        code: 'ASR_AUDIO_HASH_MISMATCH',
+        message: 'The verified task audio bytes do not match the recorded hash.',
         stage: 'media_decode',
         retryable: false
       });

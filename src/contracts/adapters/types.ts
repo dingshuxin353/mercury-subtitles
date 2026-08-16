@@ -5,6 +5,12 @@ import type { AsrHintsDispatchEvidence, AsrHintsInput } from './asr.js';
 
 export interface AdapterAudioInput {
   sourcePath: string;
+  /**
+   * Bytes already read and verified by the owning runtime from one open file
+   * handle. When present, an Adapter must dispatch these exact bytes and must
+   * not reopen sourcePath for the request body.
+   */
+  verifiedBytes?: Uint8Array;
   pathRef: string;
   sha256: string;
   durationMs: number;

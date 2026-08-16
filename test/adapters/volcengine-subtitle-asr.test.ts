@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -28,6 +29,33 @@ async function input(): Promise<AsrAdapterInput> {
 }
 
 describe('Volcengine subtitle ASR built-in plugin', () => {
+  it('submits the runtime-verified bytes even if the task path changes during credential resolution', async () => {
+    const adapterInput = await input();
+    const verified = Buffer.from('ID3 fixture');
+    const changed = Buffer.from('ID3 changed after verification');
+    adapterInput.audio.verifiedBytes = verified;
+    adapterInput.audio.sha256 = createHash('sha256').update(verified).digest('hex');
+    let submitted: Buffer | null = null;
+    let calls = 0;
+    const result = await new VolcengineSubtitleAsrAdapter({
+      readCredential: async () => {
+        await writeFile(adapterInput.audio.sourcePath, changed);
+        return 'fixture-access-token';
+      },
+      fetch: async (_url, init) => {
+        calls += 1;
+        if (calls === 1) {
+          submitted = Buffer.from(init?.body as Buffer);
+          return Response.json({ code: 0, message: 'Success', id: 'job-verified-buffer' });
+        }
+        return Response.json({ code: 0, message: 'Success', id: 'job-verified-buffer', utterances: [{ text: '字幕完成', start_time: 0, end_time: 1000 }] });
+      },
+    }).run(adapterInput);
+    expect(result.kind).toBe('artifact');
+    expect(submitted).toEqual(verified);
+    expect(submitted).not.toEqual(changed);
+  });
+
   it('classifies submit transport uncertainty, known HTTP errors, and malformed submit responses', async () => {
     const cases: Array<{
       fetch: typeof globalThis.fetch;

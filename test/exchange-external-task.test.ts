@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -16,8 +16,25 @@ import { VolcengineSubtitleAsrAdapter } from '../src/adapters/volcengine-subtitl
 import { canonicalJson } from '../src/exchange/storage.js';
 import { readJob } from '../src/background/storage.js';
 import { createChatCalibrationRuntimeV2 } from '../src/adapters/chat-calibration-v2.js';
+import { readVerifiedV5Review } from '../src/review-v5.js';
 
 function sha(value: Buffer | string) { return createHash('sha256').update(value).digest('hex'); }
+
+async function directoryManifest(root: string): Promise<string[]> {
+  const output: string[] = [];
+  const visit = async (directory: string): Promise<void> => {
+    for (const name of (await readdir(directory)).sort()) {
+      const absolute = path.join(directory, name);
+      const relative = path.relative(root, absolute);
+      const entry = await lstat(absolute);
+      if (entry.isSymbolicLink()) output.push(`${relative}:link:${await readlink(absolute)}`);
+      else if (entry.isDirectory()) { output.push(`${relative}:directory:${entry.mode & 0o777}`); await visit(absolute); }
+      else output.push(`${relative}:file:${entry.mode & 0o777}:${entry.size}:${sha(await readFile(absolute))}`);
+    }
+  };
+  await visit(root);
+  return output;
+}
 
 async function prepared() {
   const home = await mkdtemp(path.join(os.tmpdir(), 'mercury-exchange-task-'));
@@ -185,9 +202,70 @@ describe('Exchange v1 external transcript task', () => {
     expect(cancelled.task).toMatchObject({ status: 'cancelled', artifacts: { transcript: null, transcribed: null, calibrated: null, approved: null } });
     expect(cancelled.task.execution.provider_calls).toMatchObject({ asr: { state: 'not_started', count: 0 }, chat: { state: 'not_started', count: 0 } });
     expect(await readJob(input.workspace, submitted.task.identity.task_id)).toMatchObject({ state: 'terminal' });
-    expect((await readV5Events(directory)).filter((event) => event.type === 'task_cancelled')).toHaveLength(1);
+    expect((await readV5Events(directory)).filter((event) => event.type === 'task_cancelled')).toEqual([
+      expect.objectContaining({ data: expect.objectContaining({ asr_call_count: 0, chat_call_count: 0, transcribed_available: false }) }),
+    ]);
     const result = await stableTaskResult(input.workspace, await findTaskReadOnly(input.workspace, submitted.task.identity.task_id));
     expect(result).toMatchObject({ status: 'cancelled', next_action: '任务已取消；尚未产生字幕文件。' });
+  });
+
+  it('reports an existing verified provided transcript consistently when cancelled while queued', async () => {
+    const input = await prepared();
+    input.request.request_id = 'request-provided-queued-cancel';
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const cancelled = await cancelV5Task(input.workspace, submitted.task);
+    expect(cancelled.pending).toBe(false);
+    expect(cancelled.task).toMatchObject({
+      status: 'cancelled',
+      artifacts: { transcribed: { validation: 'passed' }, calibrated: null, approved: null },
+      execution: { provider_calls: { asr: { count: 0 }, chat: { count: 0 } } },
+    });
+    const event = (await readV5Events(directory)).findLast((entry) => entry.type === 'task_cancelled');
+    expect(event).toMatchObject({
+      message: '任务已取消；纯转写字幕仍可使用。',
+      data: { asr_call_count: 0, chat_call_count: 0, transcribed_available: true },
+    });
+    const result = await stableTaskResult(input.workspace, await findTaskReadOnly(input.workspace, submitted.task.identity.task_id));
+    expect(result.next_action).toBe('任务已取消；纯转写字幕仍可使用。');
+    expect(result.artifacts.find((entry) => entry.identity === 'transcribed_srt')).toMatchObject({ exists: true, validation: 'passed' });
+  });
+
+  it('cancels a running provided task before Chat dispatch while preserving the verified transcript', async () => {
+    const input = await prepared();
+    input.request.request_id = 'request-provided-running-pre-chat-cancel';
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    let entered!: () => void; let release!: () => void;
+    const atChat = new Promise<void>((resolve) => { entered = resolve; });
+    const continueChat = new Promise<void>((resolve) => { release = resolve; });
+    const calls: string[] = [];
+    const chatRuntime = {
+      capability: 'calibration' as const,
+      async run(runtimeInput: Parameters<ReturnType<typeof createChatCalibrationRuntimeV2>['run']>[0]) {
+        entered();
+        await continueChat;
+        return createChatCalibrationRuntimeV2(runtimeInput.model, {
+          fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret',
+        }).run(runtimeInput);
+      },
+    };
+    const worker = runWorker(input.workspace, { chatRuntime, readCredential: async () => 'fixture-secret' });
+    await atChat;
+    expect((await cancelV5Task(input.workspace, await readV5Task(directory))).pending).toBe(true);
+    release();
+    await worker;
+    const task = await readV5Task(directory);
+    expect(task).toMatchObject({
+      status: 'cancelled',
+      artifacts: { transcribed: { validation: 'passed' }, calibrated: null, approved: null },
+      execution: { provider_calls: { asr: { count: 0 }, chat: { state: 'not_started', count: 0 } } },
+    });
+    expect(calls).toEqual([]);
+    expect((await readV5Events(directory)).findLast((entry) => entry.type === 'task_cancelled')).toMatchObject({
+      data: { asr_call_count: 0, chat_call_count: 0, transcribed_available: true },
+    });
+    expect((await stableTaskView(input.workspace, await findTaskReadOnly(input.workspace, task.identity.task_id))).next_action).toBe('任务已取消；纯转写字幕仍可使用。');
   });
 
   it('cancels a running provider task at the pre-ASR boundary without dispatching ASR or Chat', async () => {
@@ -549,6 +627,118 @@ describe('Exchange v1 external transcript task', () => {
     expect(task.error?.message).not.toContain('结果无法确认');
     expect(task.execution.provider_calls.chat).toMatchObject({ state: 'terminal', count: 1, outcome: 'known_terminal', evidence_ref: null });
     expect(calls).toEqual(['chat']);
+  });
+
+  it.each(['content', 'task', 'entry', 'missing', 'symlink'] as const)('makes status, result, and review reject the same %s-invalid pinned model snapshot without writes', async (_case) => {
+    const input = await prepared();
+    input.request.request_id = `request-model-snapshot-read-${_case}`;
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    await runWorker(input.workspace, { fetch: fixtureFetch([]), readCredential: async () => 'fixture-secret' });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const task = await readV5Task(directory);
+    const snapshotPath = path.join(directory, task.models.snapshot_path);
+    const original = await readFile(snapshotPath, 'utf8');
+    if (_case === 'missing') {
+      await rm(snapshotPath);
+    } else if (_case === 'symlink') {
+      const outside = path.join(input.home, 'outside-model-snapshot.json');
+      await writeFile(outside, original, { mode: 0o600 });
+      await rm(snapshotPath);
+      await symlink(outside, snapshotPath);
+    } else {
+      const snapshot = JSON.parse(original);
+      if (_case === 'content') snapshot.models.chat.name = 'tampered display name';
+      if (_case === 'task') snapshot.task_id = 'tsk-20260816-000000-deadbeef';
+      if (_case === 'entry') snapshot.models.chat.snapshot_entry_id = 'entry-wrong';
+      const serialized = canonicalJson(snapshot);
+      await writeFile(snapshotPath, serialized, { mode: 0o600 });
+      if (_case !== 'content') {
+        task.models.snapshot_sha256 = sha(serialized);
+        await persistV5Task(directory, task);
+      }
+    }
+    const before = await directoryManifest(directory);
+    const found = await findTaskReadOnly(input.workspace, task.identity.task_id);
+    await expect(stableTaskView(input.workspace, found)).rejects.toMatchObject({ code: 'MODEL_SNAPSHOT_INVALID' });
+    await expect(stableTaskResult(input.workspace, found)).rejects.toMatchObject({ code: 'MODEL_SNAPSHOT_INVALID' });
+    await expect(readVerifiedV5Review(directory)).rejects.toMatchObject({ code: 'MODEL_SNAPSHOT_INVALID' });
+    expect(await directoryManifest(directory)).toEqual(before);
+  });
+
+  it.each(['asr_invalid', 'asr_known_failure', 'chat_invalid', 'chat_known_failure'] as const)('commits %s as known terminal before recoverable result/report derivation', async (_case) => {
+    const input = await prepared();
+    const calls: string[] = [];
+    let dependencies: Parameters<typeof runWorker>[1];
+    let request: any = { ...input.request };
+    if (_case.startsWith('asr')) {
+      const audio = path.join(input.home, `${_case}.mp3`);
+      const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
+      const registry = await loadModelRegistryV2(input.workspace);
+      request = {
+        ...input.request, request_id: `request-terminal-first-${_case}`,
+        inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: null },
+        transcription_mode: 'provider', models: { asr: registry.defaults.asr, chat: registry.defaults.chat },
+      };
+      const asrAdapter: AsrAdapter = _case === 'asr_invalid' ? {
+        adapterId: 'fixture_terminal_first_invalid_asr',
+        async run(adapterInput) {
+          const returned = await fixtureAsr(calls).run(adapterInput);
+          if (returned.kind === 'artifact') returned.artifact.task_id = 'tsk-20260816-000000-deadbeef';
+          return returned;
+        },
+      } : {
+        adapterId: 'fixture_terminal_first_known_asr',
+        async run(adapterInput) {
+          await adapterInput.beforeProviderDispatch?.('volcengine_asr_recognize');
+          calls.push('asr');
+          const at = new Date().toISOString();
+          const error = { error_id: 'error-known-asr', code: 'FIXTURE_KNOWN_ASR', message: 'Known ASR response.', stage: 'model_call' as const, retryable: false };
+          return { kind: 'failure', failure: { failure_id: 'failure-known-asr', task_id: adapterInput.taskId, role: 'asr', model_snapshot_ref: adapterInput.modelSnapshotRef, occurred_at: at, provider_outcome_certainty: 'known_terminal', errors: [error], warnings: [], call: { call_id: 'call-known-asr', model_snapshot_entry_ref: adapterInput.model.snapshot_entry_id, started_at: at, ended_at: at, provider_request_id: 'provider-known-asr', outcome: 'failed', error_ref: error.error_id }, staging: [] } };
+        },
+      };
+      dependencies = { asrAdapter, fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' };
+    } else {
+      request.request_id = `request-terminal-first-${_case}`;
+      const chatRuntime = _case === 'chat_invalid' ? {
+        capability: 'calibration' as const,
+        async run(runtimeInput: Parameters<ReturnType<typeof createChatCalibrationRuntimeV2>['run']>[0]) {
+          const returned = await createChatCalibrationRuntimeV2(runtimeInput.model, { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' }).run(runtimeInput);
+          if (returned.kind === 'artifact') returned.artifact.task_id = 'tsk-20260816-000000-deadbeef';
+          return returned;
+        },
+      } : {
+        capability: 'calibration' as const,
+        async run(runtimeInput: Parameters<ReturnType<typeof createChatCalibrationRuntimeV2>['run']>[0]) {
+          await runtimeInput.beforeProviderDispatch?.('openai_chat_calibration');
+          calls.push('chat');
+          const at = new Date().toISOString();
+          const error = { error_id: 'error-known-chat', code: 'FIXTURE_KNOWN_CHAT', message: 'Known Chat response.', stage: 'model_call' as const, retryable: false };
+          return { kind: 'failure' as const, failure: { failure_id: 'failure-known-chat', task_id: runtimeInput.taskId, role: 'calibration' as const, model_snapshot_ref: runtimeInput.modelSnapshotRef, occurred_at: at, provider_outcome_certainty: 'known_terminal' as const, errors: [error] as [typeof error], warnings: [], call: { call_id: 'call-known-chat', model_snapshot_entry_ref: runtimeInput.model.snapshot_entry_id, started_at: at, ended_at: at, provider_request_id: 'provider-known-chat', outcome: 'failed' as const, error_ref: error.error_id }, staging: [] as [] } };
+        },
+      };
+      dependencies = { chatRuntime, readCredential: async () => 'fixture-secret' };
+    }
+    const submitted = await submitExchangeRequest(input.workspace, request);
+    let crashed = false;
+    await expect(runWorker(input.workspace, dependencies, {
+      v5Fault: async (point, task) => {
+        if (!crashed && point === 'terminal_task_before_result' && task.error?.provider_outcome === 'known_terminal') {
+          crashed = true;
+          throw new Error(`crash:terminal-first-${_case}`);
+        }
+      },
+    })).rejects.toThrow(`crash:terminal-first-${_case}`);
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const durable = await readV5Task(directory);
+    const role = _case.startsWith('asr') ? 'asr' : 'chat';
+    expect(durable).toMatchObject({ status: 'failed', error: { provider_outcome: 'known_terminal' } });
+    expect(durable.execution.provider_calls[role]).toMatchObject({ state: 'terminal', count: 1, outcome: 'known_terminal' });
+    const callsBeforeRecovery = [...calls];
+    await runWorker(input.workspace, dependencies);
+    expect(calls).toEqual(callsBeforeRecovery);
+    const recovered = await readV5Task(directory);
+    expect(recovered).toMatchObject({ status: 'failed', error: { provider_outcome: 'known_terminal' } });
+    expect(JSON.parse(await readFile(path.join(directory, 'result.json'), 'utf8'))).toMatchObject({ status: 'failed', error: { provider_outcome: 'known_terminal' } });
   });
 
   it('keeps a thrown post-dispatch ASR outcome interrupted and never automatically replays it', async () => {

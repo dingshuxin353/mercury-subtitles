@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { dirname, extname, resolve } from 'node:path';
 import type {
@@ -267,9 +267,12 @@ export class VolcengineSubtitleAsrAdapter implements AsrAdapter {
     const authHeaders = { Authorization: `Bearer; ${credential.token}` };
     let audioBody: Buffer;
     try {
-      audioBody = await readFile(input.audio.sourcePath);
+      audioBody = input.audio.verifiedBytes ? Buffer.from(input.audio.verifiedBytes) : await readFile(input.audio.sourcePath);
     } catch {
       return this.failure(input, callId, startedAt, 'ASR_INPUT_FILE_UNAVAILABLE', '任务中的 MP3 副本不可用。', 'media_decode', false, null, '重新创建任务。');
+    }
+    if (input.audio.verifiedBytes && createHash('sha256').update(audioBody).digest('hex') !== input.audio.sha256) {
+      return this.failure(input, callId, startedAt, 'ASR_AUDIO_HASH_MISMATCH', '任务中的 MP3 字节与固定 hash 不一致。', 'media_decode', false, null, '重新创建任务。');
     }
     try {
       await input.beforeProviderDispatch?.('volcengine_subtitle_submit');

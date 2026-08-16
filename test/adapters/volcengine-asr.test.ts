@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -147,6 +148,28 @@ function adapter(fetch: typeof globalThis.fetch): VolcengineAsrAdapter {
 }
 
 describe('V01-D003 Volcengine turbo ASR adapter', () => {
+  it('dispatches the runtime-verified bytes even if the task path changes during credential resolution', async () => {
+    const fixture = await taskInput();
+    fixture.input.audio.verifiedBytes = Buffer.from(fixture.audioBytes);
+    fixture.input.audio.sha256 = createHash('sha256').update(fixture.audioBytes).digest('hex');
+    const changed = Buffer.from('changed-after-runtime-verification');
+    let sent: Buffer | null = null;
+    const result = await new VolcengineAsrAdapter({
+      resolveCredential: async () => {
+        await writeFile(fixture.input.audio.sourcePath, changed);
+        return { mode: 'api_key', uid: 'fixture-user', value: 'fixture-key' };
+      },
+      fetch: async (_url, init) => {
+        const body = JSON.parse(String(init?.body)) as { audio: { data: string } };
+        sent = Buffer.from(body.audio.data, 'base64');
+        return successResponse();
+      },
+    }).run(fixture.input);
+    expect(result.kind).toBe('artifact');
+    expect(sent).toEqual(fixture.audioBytes);
+    expect(sent).not.toEqual(changed);
+  });
+
   it('submits local MP3 bytes with audio.data and returns a valid D001 transcript.raw', async () => {
     const { input, snapshot, taskDirectory, audioBytes } = await taskInput();
     let requestUrl: string | undefined;
