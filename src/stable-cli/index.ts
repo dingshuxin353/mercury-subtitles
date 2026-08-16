@@ -14,6 +14,7 @@ import { inspectTranscriptInput, serializeTranscriptSrt, type TranscriptInputFor
 import { assertExchangeContract, type ExchangeRequestV1 } from '../contracts/index.js';
 import { submitBackgroundTask } from '../background/runtime.js';
 import { sha256File } from '../tasks.js';
+import { runDictionaryCommand } from './dictionary.js';
 
 export interface StableCliContext {
   workspaceRoot: string;
@@ -93,6 +94,7 @@ async function submitProviderRequest(workspaceRoot: string, request: ExchangeReq
 export async function tryRunStableCli(args: string[], context: StableCliContext): Promise<number | null> {
   const command = args[0] === 'protocol' && args[1] ? `protocol.${args[1]}`
     : args[0] === 'input' && args[1] === 'inspect' ? 'input.inspect'
+    : args[0] === 'dictionary' && args[1] ? `dictionary.${args[1]}`
     : args[0] === 'config' && args[1] === 'status' ? 'config.status'
       : args[0] === 'config' && args[1] === 'migrate' ? 'config.migrate'
         : args[0] === 'task' && args[1] && (args.includes('--json') || args.includes('--jsonl')) ? `task.${args[1]}`
@@ -114,6 +116,9 @@ export async function tryRunStableCli(args: string[], context: StableCliContext)
         machine_contract: 'mercury.cli/v1', input_formats: ['srt', 'vtt', 'transcript_json'], query_commands_are_read_only: true,
       };
       else throw new MercuryError('CLI_COMMAND_INVALID', `不支持的协议命令：${args[1]}`, { exitCode: 2 });
+    } else if (args[0] === 'dictionary') {
+      if (!args.includes('--json')) throw new MercuryError('CLI_ARGUMENT_INVALID', '稳定词典命令必须使用 --json。', { exitCode: 2 });
+      data = await runDictionaryCommand(context.workspaceRoot, args.slice(1));
     } else if (args[0] === 'input') {
       const inspectArgs = args.slice(2);
       exactJson(inspectArgs, ['--file', '--format', '--role']);

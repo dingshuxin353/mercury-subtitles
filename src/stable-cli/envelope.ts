@@ -25,7 +25,7 @@ function category(code: string): ExchangeErrorV1['category'] {
   if (/^(?:INPUT|TRANSCRIPT|SRT|VTT|REQUEST_INVALID|CLI_)/u.test(code)) return 'input';
   if (/^(?:MODEL|CONFIG|MIGRATION)/u.test(code)) return 'config';
   if (/^(?:CONTRACT|MACHINE_CONTRACT)/u.test(code)) return 'compatibility';
-  if (/^(?:TASK_STATE|REQUEST_ID_CONFLICT|DICTIONARY_CONFLICT)/u.test(code)) return 'conflict';
+  if (/^(?:TASK_STATE|REQUEST_ID_CONFLICT|DICTIONARY_(?:CONFLICT|REVISION_CONFLICT|ENTRY_CONFLICT|SCOPE_MISMATCH))/u.test(code)) return 'conflict';
   if (/^(?:TASK_PATH|WORKSPACE_PATH|SECURITY)/u.test(code)) return 'security';
   if (/^(?:PROVIDER|VOLCENGINE|GEMINI)/u.test(code)) return 'provider';
   return 'runtime';

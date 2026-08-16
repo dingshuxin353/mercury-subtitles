@@ -136,4 +136,20 @@ describe('stable CLI v1 protocol and configuration', () => {
     expect(JSON.parse(unsupported.stdout[0]!)).toMatchObject({ contract: 'mercury.cli/v1', ok: false, error: { code: 'CONTRACT_UNSUPPORTED' } });
     expect(await sha256File(path.join(directory, 'task.json'))).toBe(before);
   });
+
+  it('returns strict dictionary envelopes and keeps dictionary list side-effect free', async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), 'mercury-stable-dictionary-'));
+    const listed = capture(home);
+    expect(await runCli(['dictionary', 'list', '--json'], listed.io)).toBe(0);
+    expect(JSON.parse(listed.stdout[0]!)).toMatchObject({ contract: 'mercury.cli/v1', command: 'dictionary.list', ok: true, data: { dictionaries: [] } });
+    await expect(lstat(path.join(home, 'mercury-workspace'))).rejects.toMatchObject({ code: 'ENOENT' });
+
+    const createdOutput = capture(home);
+    expect(await runCli(['dictionary', 'create', '--name', '项目名词', '--scope', 'project', '--project', 'demo', '--json'], createdOutput.io)).toBe(0);
+    const created = JSON.parse(createdOutput.stdout[0]!);
+    expect(created).toMatchObject({ contract: 'mercury.cli/v1', command: 'dictionary.create', ok: true, data: { scope: 'project', project_key: 'demo' } });
+    const changedOutput = capture(home);
+    expect(await runCli(['dictionary', 'entry', 'add', created.data.dictionary_id, '--revision', created.data.revision, '--entry-id', 'entry-product', '--canonical', 'Mercury', '--variant', '水星', '--kind', 'product', '--json'], changedOutput.io)).toBe(0);
+    expect(JSON.parse(changedOutput.stdout[0]!).data.dictionary.entries).toEqual([expect.objectContaining({ canonical: 'Mercury', variants: ['水星'] })]);
+  });
 });

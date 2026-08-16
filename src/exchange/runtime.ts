@@ -18,6 +18,7 @@ import { appendStableJsonLine, canonicalJson, readStableJson, writeStableJsonAto
 import { ensureWorkspace } from '../workspace.js';
 import { ensureRuntimeLayout, jsonFingerprint, readJob, readRequest, requestIdHash, reserveRequest, withRequestLease, withTaskTransitionLock, writeJob, writeRequest } from '../background/storage.js';
 import { JOB_CONTRACT_VERSION, REQUEST_CONTRACT_VERSION, type BackgroundJobV1, type BackgroundRequestV1 } from '../background/types.js';
+import { resolveDictionarySnapshot, type ResolvedDictionarySnapshot } from '../dictionary.js';
 
 type ProviderCall = TaskRecordV5['execution']['provider_calls']['chat'];
 const TASK_ID = /^tsk-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}$/u;
@@ -182,7 +183,7 @@ async function createTaskDirectory(workspace: string, request: ExchangeRequestV1
     await writeStableJsonAtomic(path.join(staging, 'work/transcript.normalized.json'), inspected.transcript);
     const snapshot: ModelSnapshotV3 = { contract: 'mercury.model-snapshot/v3', snapshot_id: `${taskId}-models`, task_id: taskId, captured_at: createdAt, models: { asr: null, chat }, evidence_mode: decision.mode, non_strong_reason: decision.reason };
     await writeStableJsonAtomic(path.join(staging, 'work/model-snapshot.json'), snapshot);
-    const dictionarySnapshot = { contract: 'mercury.dictionary-snapshot/v1', task_id: taskId, created_at: createdAt, resolved: [], entries: [], conflicts: [], extensions: {} };
+    const dictionarySnapshot = await resolveDictionarySnapshot(workspace, request, taskId, inspected.transcript.text);
     await writeStableJsonAtomic(path.join(staging, 'work/dictionary-snapshot.json'), dictionarySnapshot);
     const stem = safeAudioStem(path.basename(request.inputs.media?.path ?? request.inputs.transcript.path).replace(/\.(?:srt|vtt|json)$/iu, '')) || 'subtitle';
     const transcribedRelative = `output/${stem}.transcribed.srt`;
@@ -199,7 +200,7 @@ async function createTaskDirectory(workspace: string, request: ExchangeRequestV1
         reference: null,
       },
       models: { asr: null, chat: request.models.chat, snapshot_path: 'work/model-snapshot.json', snapshot_sha256: await sha256File(path.join(staging, 'work/model-snapshot.json')) },
-      dictionary_snapshot: { path: 'work/dictionary-snapshot.json', sha256: await sha256File(path.join(staging, 'work/dictionary-snapshot.json')), resolved: [] },
+      dictionary_snapshot: { path: 'work/dictionary-snapshot.json', sha256: await sha256File(path.join(staging, 'work/dictionary-snapshot.json')), resolved: dictionarySnapshot.resolved },
       execution: { queued_at: createdAt, started_at: null, ended_at: null, worker_id: null, heartbeat_at: null, attempt_id: null, attempt_count: 0, safe_checkpoint: 'queued', provider_calls: { asr: initialCall(), chat: initialCall() }, cancel_requested_at: null },
       artifacts: {
         transcript: { path: 'work/transcript.normalized.json', sha256: await sha256File(path.join(staging, 'work/transcript.normalized.json')), validation: 'passed' },
@@ -300,7 +301,8 @@ function exchangeError(code: string, message: string, providerOutcome: 'not_disp
 }
 
 async function writeReport(directory: string, task: TaskRecordV5, snapshot: ModelSnapshotV3, calibration: CalibrationResultV3 | null): Promise<void> {
-  const text = ['# Mercury 字幕校准工作报告', '', `- 任务 ID：\`${task.identity.task_id}\``, '- 转写来源：外部提供（ASR 调用数：0）', `- 外部格式：${task.inputs.transcript_source?.format ?? '—'}`, `- 原件 SHA-256：${task.inputs.transcript_source?.sha256 ?? '—'}`, `- 规范化 SHA-256：${task.artifacts.transcript?.sha256 ?? '—'}`, `- Chat：${snapshot.models.chat.name} / ${snapshot.models.chat.provider_model}`, `- 校验证据：${task.input_config.evidence_mode === 'audio_multimodal' ? '完整转录 + 音频' : '完整转录'}`, `- Chat 调用：${task.execution.provider_calls.chat.count}`, `- 完整覆盖：${calibration ? `${calibration.strategy.input_unit_count}/${calibration.strategy.returned_unit_count} ${calibration.strategy.coverage_complete ? '通过' : '失败'}` : '未形成'}`, `- 词典快照：${task.dictionary_snapshot.sha256}`, `- 警告：${task.warnings.join('；') || '无'}`, `- 错误：${task.error ? `${task.error.code}：${task.error.message}` : '无'}`, ''].join('\n');
+  const dictionary = await readStableJson(managed(directory, task.dictionary_snapshot.path), 'DICTIONARY_RECORD_INVALID') as ResolvedDictionarySnapshot;
+  const text = ['# Mercury 字幕校准工作报告', '', `- 任务 ID：\`${task.identity.task_id}\``, '- 转写来源：外部提供（ASR 调用数：0）', `- 外部格式：${task.inputs.transcript_source?.format ?? '—'}`, `- 原件 SHA-256：${task.inputs.transcript_source?.sha256 ?? '—'}`, `- 规范化 SHA-256：${task.artifacts.transcript?.sha256 ?? '—'}`, `- Chat：${snapshot.models.chat.name} / ${snapshot.models.chat.provider_model}`, `- 校验证据：${task.input_config.evidence_mode === 'audio_multimodal' ? '完整转录 + 音频' : '完整转录'}`, `- Chat 调用：${task.execution.provider_calls.chat.count}`, `- 完整覆盖：${calibration ? `${calibration.strategy.input_unit_count}/${calibration.strategy.returned_unit_count} ${calibration.strategy.coverage_complete ? '通过' : '失败'}` : '未形成'}`, `- 词典快照：${task.dictionary_snapshot.sha256}`, `- 词典 revision：${dictionary.resolved.map((entry) => `${entry.dictionary_id}@${entry.revision}`).join('，') || '无'}`, `- 相关词典条目：${dictionary.matched_entry_ids.join('，') || '无'}`, `- ASR hints：${dictionary.asr_hints.status}（${dictionary.asr_hints.entry_ids.length} 项）`, `- 警告：${task.warnings.join('；') || '无'}`, `- 错误：${task.error ? `${task.error.code}：${task.error.message}` : '无'}`, ''].join('\n');
   await writeFile0600(path.join(directory, 'output/calibration-report.md'), text);
   task.artifacts.report = { path: 'output/calibration-report.md', sha256: await sha256File(path.join(directory, 'output/calibration-report.md')), validation: 'passed' };
 }
@@ -318,6 +320,8 @@ export async function executeV5Task(directory: string, dependencies: ChatCalibra
   if (task.status !== 'running') throw new MercuryError('TASK_EXECUTION_STATE_INVALID', `v5 任务状态不能执行：${task.status}`);
   const snapshot = await readStableJson(managed(directory, task.models.snapshot_path), 'MODEL_SNAPSHOT_INVALID') as ModelSnapshotV3;
   const transcript = assertExchangeContract('transcript', await readStableJson(managed(directory, task.artifacts.transcript!.path), 'TRANSCRIPT_IMPORT_INVALID'));
+  const dictionarySnapshot = await readStableJson(managed(directory, task.dictionary_snapshot.path), 'DICTIONARY_RECORD_INVALID') as ResolvedDictionarySnapshot;
+  if (dictionarySnapshot.contract !== 'mercury.dictionary-snapshot/v1' || dictionarySnapshot.task_id !== task.identity.task_id) throw new MercuryError('DICTIONARY_RECORD_INVALID', '任务词典快照 identity 无效。');
   const legacy = legacyTranscript(task, transcript, snapshot);
   let calibration: CalibrationResultV3 | null = null;
   const existing = task.execution.provider_calls.chat.evidence_ref;
@@ -337,6 +341,10 @@ export async function executeV5Task(directory: string, dependencies: ChatCalibra
         taskId: task.identity.task_id, modelSnapshotRef: snapshot.snapshot_id, model: snapshot.models.chat, transcript: legacy, alignment: initial.alignment,
         referenceSrt: { pathRef: 'input/reference.srt', text: normalizedSrt }, mode: task.input_config.calibration_mode, evidenceMode: task.input_config.evidence_mode,
         nonStrongReason: (snapshot.non_strong_reason as any) ?? null,
+        dictionaryContext: {
+          snapshot_refs: dictionarySnapshot.resolved.map(({ dictionary_id, revision, content_hash }) => ({ dictionary_id, revision, content_hash })),
+          entries: dictionarySnapshot.entries.filter((entry) => dictionarySnapshot.chat_context_entry_ids.includes(entry.entry_id)).map((entry) => ({ entry_id: entry.entry_id, kind: entry.kind, canonical: entry.canonical, variants: entry.variants, language: entry.language, case_sensitive: entry.case_sensitive, number_sensitive: entry.number_sensitive, notes: entry.notes })),
+        },
         audio: task.input_config.evidence_mode === 'audio_multimodal' && media ? { sourcePath: managed(directory, media.workspace_path), pathRef: media.workspace_path, sha256: media.sha256, bytes: media.bytes, durationMs: await readMp3DurationMs(managed(directory, media.workspace_path)), mimeType: 'audio/mpeg' } : null,
         beforeProviderDispatch: async () => {
           task = await readV5Task(directory);
@@ -422,7 +430,10 @@ export async function projectV5Result(directory: string, taskInput?: TaskRecordV
     contract: 'mercury.result/v1', task_id: task.identity.task_id, status: task.status, attempt_id: task.execution.attempt_id, produced_at: task.updated_at,
     inputs: [task.inputs.media ? { kind: 'media', sha256: task.inputs.media.sha256, source: 'provided' } : null, { kind: 'transcript', sha256: task.inputs.transcript_source!.sha256, source: 'provided' }].filter(Boolean),
     transcription: { mode: 'provided', asr_call_count: 0, transcript_path: managed(directory, task.artifacts.transcript!.path), transcript_sha256: task.artifacts.transcript!.sha256 },
-    dictionaries: { snapshots: task.dictionary_snapshot.resolved, conflict_count: 0, match_count: 0 }, artifacts: view.artifacts,
+    dictionaries: await (async () => {
+      const snapshot = await readStableJson(managed(directory, task.dictionary_snapshot.path), 'DICTIONARY_RECORD_INVALID') as ResolvedDictionarySnapshot;
+      return { snapshots: task.dictionary_snapshot.resolved, conflict_count: snapshot.conflicts.length, match_count: snapshot.matched_entry_ids.length };
+    })(), artifacts: view.artifacts,
     review: { status: task.review.status, pending_count: task.review.pending_count, approved: ['finalized', 'not_required'].includes(task.review.status) },
     calls: [{ provider: 'asr', capability: 'transcription', count: 0, outcome: 'not_dispatched' }, { provider: task.models.chat, capability: 'calibration', count: task.execution.provider_calls.chat.count, outcome: task.execution.provider_calls.chat.outcome }],
     warnings: task.warnings, error: task.error, next_action: view.next_action, extensions: {},
