@@ -165,6 +165,7 @@ describe('Exchange Protocol v1 contracts', () => {
         media: null,
         transcript_source: { original_path: '/tmp/input.srt', workspace_path: 'input/transcript-source.srt', sha256: hash, bytes: 10, mime_type: 'application/x-subrip', format: 'srt', role: 'transcript_source' },
         reference: null,
+        reference_normalized: null,
       },
       models: { asr: null, chat: 'chat-default', snapshot_path: 'work/model-snapshot.json', snapshot_sha256: hash },
       dictionary_snapshot: { path: 'work/dictionary-snapshot.json', sha256: hash, resolved: [] },
@@ -172,8 +173,8 @@ describe('Exchange Protocol v1 contracts', () => {
         queued_at: now, started_at: null, ended_at: null, worker_id: null, heartbeat_at: null, attempt_id: null, attempt_count: 0,
         safe_checkpoint: 'queued', cancel_requested_at: null,
         provider_calls: {
-          asr: { state: 'not_started', count: 0, outcome: 'not_dispatched', evidence_ref: null },
-          chat: { state: 'not_started', count: 0, outcome: 'not_dispatched', evidence_ref: null },
+          asr: { state: 'not_started', count: 0, outcome: 'not_dispatched', evidence_ref: null, evidence_sha256: null },
+          chat: { state: 'not_started', count: 0, outcome: 'not_dispatched', evidence_ref: null, evidence_sha256: null },
         },
       },
       artifacts: { transcript: null, transcribed: null, calibrated: null, approved: null, report: null },
@@ -184,8 +185,19 @@ describe('Exchange Protocol v1 contracts', () => {
     delete missing.inputs;
     expect(validateV5TaskRecord(missing).valid).toBe(false);
     const repeatedAsr = structuredClone(record);
-    repeatedAsr.execution.provider_calls.asr = { state: 'terminal', count: 1, outcome: 'known_terminal', evidence_ref: null };
+    repeatedAsr.execution.provider_calls.asr = { state: 'terminal', count: 1, outcome: 'known_terminal', evidence_ref: null, evidence_sha256: null };
     expect(validateV5TaskRecord(repeatedAsr).valid).toBe(false);
+    const unpinnedResponse = structuredClone(record);
+    unpinnedResponse.execution.provider_calls.chat = { state: 'response_persisted', count: 1, outcome: 'response_persisted', evidence_ref: 'work/calibration-response.json', evidence_sha256: null };
+    expect(validateV5TaskRecord(unpinnedResponse).valid).toBe(false);
+    const unnormalizedReference = structuredClone(record);
+    unnormalizedReference.input_config.transcription_mode = 'provider';
+    unnormalizedReference.models.asr = 'asr-default';
+    unnormalizedReference.inputs.media = { original_path: '/tmp/audio.mp3', workspace_path: 'input/audio.mp3', sha256: hash, bytes: 10, mime_type: 'audio/mpeg' };
+    unnormalizedReference.inputs.transcript_source = null;
+    unnormalizedReference.inputs.reference = { original_path: '/tmp/reference.srt', workspace_path: 'input/reference-source.srt', sha256: hash, bytes: 10, mime_type: 'application/x-subrip', format: 'srt', role: 'reference' };
+    unnormalizedReference.inputs.reference_normalized = null;
+    expect(validateV5TaskRecord(unnormalizedReference).valid).toBe(false);
     const impossible = structuredClone(record);
     impossible.status = 'completed';
     impossible.execution.ended_at = now;

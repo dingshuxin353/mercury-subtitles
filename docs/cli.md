@@ -65,7 +65,7 @@ mercury worker start --json
 mercury task cancel <task-id> --json
 ```
 
-取消只在安全边界生效。已经发出的 Provider 请求不会假装未发生；未知结果会进入中断状态，不自动重放。
+取消只在安全边界生效。尚未产生纯转写时，结果会明确说明“尚未产生字幕文件”；已经发出的 Provider 请求不会假装未发生，未知结果会进入中断状态且不自动重放。
 
 ## 审阅和批准
 

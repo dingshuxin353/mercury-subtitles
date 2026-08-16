@@ -6,13 +6,15 @@ import { describe, expect, it, vi } from 'vitest';
 import { ensureWorkspace } from '../src/workspace.js';
 import { loadModelRegistryV2 } from '../src/models-v2.js';
 import { runWorker } from '../src/background/worker.js';
-import { appendV5Event, persistV5Task, readV5Events, readV5Task, submitExchangeRequest } from '../src/exchange/runtime.js';
+import { appendV5Event, cancelV5Task, persistV5Task, readV5Events, readV5Task, submitExchangeRequest } from '../src/exchange/runtime.js';
 import { findTaskReadOnly, stableTaskResult, stableTaskView } from '../src/stable-cli/tasks.js';
 import { createDictionary, makeDictionaryEntry, mutateDictionary } from '../src/dictionary.js';
 import { runCli } from '../src/cli.js';
 import type { AsrAdapter, AsrHintsCapableAdapter } from '../src/contracts/index.js';
 import { VolcengineAsrAdapter } from '../src/adapters/volcengine-asr.js';
 import { VolcengineSubtitleAsrAdapter } from '../src/adapters/volcengine-subtitle-asr.js';
+import { canonicalJson } from '../src/exchange/storage.js';
+import { readJob } from '../src/background/storage.js';
 
 function sha(value: Buffer | string) { return createHash('sha256').update(value).digest('hex'); }
 
@@ -78,7 +80,13 @@ function fixtureHintsAsr(calls: string[], captured: Array<NonNullable<Parameters
     asrHintsCapability: { status: 'supported', maxEntries: 10, acceptedFields: ['canonical', 'variants'] },
     async run(input) {
       captured.push(structuredClone(input.asrHints));
-      return base.run(input);
+      const originalDispatch = input.beforeProviderDispatch;
+      return base.run({
+        ...input,
+        beforeProviderDispatch: async (operation) => originalDispatch?.(operation, {
+          asrHints: { status: 'used', entryIds: input.asrHints.entries.map((entry) => entry.entryId), inputHash: sha(canonicalJson(input.asrHints.entries)) },
+        }),
+      });
     },
   };
 }
@@ -133,6 +141,121 @@ describe('Exchange v1 external transcript task', () => {
     expect(new VolcengineSubtitleAsrAdapter({ readCredential: async () => 'fixture' }).asrHintsCapability.status).toBe('not_supported');
   });
 
+  it('cancels a queued provider task with no transcript as a zero-call terminal result', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'queued-cancel.mp3');
+    const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
+    const registry = await loadModelRegistryV2(input.workspace);
+    const submitted = await submitExchangeRequest(input.workspace, {
+      ...input.request, request_id: 'request-provider-queued-cancel',
+      inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: null },
+      transcription_mode: 'provider', models: { asr: registry.defaults.asr, chat: registry.defaults.chat },
+    });
+    const cancelled = await cancelV5Task(input.workspace, submitted.task);
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    expect(cancelled.pending).toBe(false);
+    expect(cancelled.task).toMatchObject({ status: 'cancelled', artifacts: { transcript: null, transcribed: null, calibrated: null, approved: null } });
+    expect(cancelled.task.execution.provider_calls).toMatchObject({ asr: { state: 'not_started', count: 0 }, chat: { state: 'not_started', count: 0 } });
+    expect(await readJob(input.workspace, submitted.task.identity.task_id)).toMatchObject({ state: 'terminal' });
+    expect((await readV5Events(directory)).filter((event) => event.type === 'task_cancelled')).toHaveLength(1);
+    const result = await stableTaskResult(input.workspace, await findTaskReadOnly(input.workspace, submitted.task.identity.task_id));
+    expect(result).toMatchObject({ status: 'cancelled', next_action: '任务已取消；尚未产生字幕文件。' });
+  });
+
+  it('cancels a running provider task at the pre-ASR boundary without dispatching ASR or Chat', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'running-cancel.mp3');
+    const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
+    const registry = await loadModelRegistryV2(input.workspace);
+    const submitted = await submitExchangeRequest(input.workspace, {
+      ...input.request, request_id: 'request-provider-running-cancel',
+      inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: null },
+      transcription_mode: 'provider', models: { asr: registry.defaults.asr, chat: registry.defaults.chat },
+    });
+    let entered!: () => void; let release!: () => void;
+    const atAdapter = new Promise<void>((resolve) => { entered = resolve; });
+    const continueAdapter = new Promise<void>((resolve) => { release = resolve; });
+    const calls: string[] = [];
+    const blocked: AsrAdapter = {
+      adapterId: 'fixture_pre_dispatch_cancel',
+      async run(adapterInput) {
+        entered();
+        await continueAdapter;
+        await adapterInput.beforeProviderDispatch?.('volcengine_asr_recognize');
+        calls.push('asr');
+        return fixtureAsr([]).run(adapterInput);
+      },
+    };
+    const worker = runWorker(input.workspace, { asrAdapter: blocked, fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    await atAdapter;
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const pending = await cancelV5Task(input.workspace, await readV5Task(directory));
+    expect(pending.pending).toBe(true);
+    release();
+    await worker;
+    const task = await readV5Task(directory);
+    expect(task.status).toBe('cancelled');
+    expect(task.execution.provider_calls).toMatchObject({ asr: { state: 'not_started', count: 0 }, chat: { state: 'not_started', count: 0 } });
+    expect(task.artifacts.transcribed).toBeNull();
+    expect(calls).toEqual([]);
+    expect(await readJob(input.workspace, task.identity.task_id)).toMatchObject({ state: 'terminal' });
+    expect((await stableTaskView(input.workspace, await findTaskReadOnly(input.workspace, task.identity.task_id))).next_action).toBe('任务已取消；尚未产生字幕文件。');
+  });
+
+  it('keeps supported ASR hints pending when the adapter fails before the dispatch boundary', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'hints-before-dispatch.mp3');
+    const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
+    const dictionary = await createDictionary(input.workspace, { name: 'Hints Pending', scope: 'global' });
+    await mutateDictionary(input.workspace, dictionary.dictionary_id, dictionary.revision, (current) => current.entries.push(makeDictionaryEntry({ entry_id: 'entry-hints-pending', canonical: 'Mercury', variants: ['水星'], kind: 'product' })));
+    const registry = await loadModelRegistryV2(input.workspace);
+    const submitted = await submitExchangeRequest(input.workspace, {
+      ...input.request, request_id: 'request-hints-before-dispatch',
+      inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: null },
+      transcription_mode: 'provider', models: { asr: registry.defaults.asr, chat: registry.defaults.chat }, dictionaries: { project_key: null, selected: [dictionary.dictionary_id], task_overrides: [] },
+    });
+    const adapter: AsrHintsCapableAdapter = {
+      adapterId: 'fixture_hints_pre_dispatch_failure', asrHintsCapability: { status: 'supported', maxEntries: 10, acceptedFields: ['canonical', 'variants'] },
+      async run() { throw new Error('credential/input construction failed before dispatch'); },
+    };
+    await runWorker(input.workspace, { asrAdapter: adapter, fetch: fixtureFetch([]), readCredential: async () => 'fixture-secret' });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const task = await readV5Task(directory);
+    const snapshot = JSON.parse(await readFile(path.join(directory, task.dictionary_snapshot.path), 'utf8'));
+    expect(task).toMatchObject({ status: 'failed', execution: { provider_calls: { asr: { state: 'not_started', count: 0, outcome: 'not_dispatched' } } } });
+    expect(snapshot.asr_hints).toMatchObject({ status: 'pending', adapter_id: adapter.adapterId, input_count: 0, input_hash: null });
+  });
+
+  it.each(['known_terminal', 'outcome_unknown'] as const)('commits ASR hints as used only at a real dispatch boundary for %s outcomes', async (certainty) => {
+    const input = await prepared();
+    const audio = path.join(input.home, `hints-${certainty}.mp3`);
+    const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
+    const dictionary = await createDictionary(input.workspace, { name: `Hints ${certainty}`, scope: 'global' });
+    await mutateDictionary(input.workspace, dictionary.dictionary_id, dictionary.revision, (current) => current.entries.push(makeDictionaryEntry({ entry_id: `entry-hints-${certainty.replace('_', '-')}`, canonical: 'Mercury', variants: ['水星'], kind: 'product' })));
+    const registry = await loadModelRegistryV2(input.workspace);
+    const submitted = await submitExchangeRequest(input.workspace, {
+      ...input.request, request_id: `request-hints-${certainty}`,
+      inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: null },
+      transcription_mode: 'provider', models: { asr: registry.defaults.asr, chat: registry.defaults.chat }, dictionaries: { project_key: null, selected: [dictionary.dictionary_id], task_overrides: [] },
+    });
+    const adapter: AsrHintsCapableAdapter = {
+      adapterId: `fixture_hints_${certainty}`, asrHintsCapability: { status: 'supported', maxEntries: 10, acceptedFields: ['canonical', 'variants'] },
+      async run(adapterInput) {
+        await adapterInput.beforeProviderDispatch?.('volcengine_asr_recognize', { asrHints: { status: 'used', entryIds: adapterInput.asrHints.entries.map((entry) => entry.entryId), inputHash: sha(canonicalJson(adapterInput.asrHints.entries)) } });
+        const at = new Date().toISOString();
+        const error = { error_id: `error-${certainty}`, code: 'FIXTURE_PROVIDER_FAILURE', message: 'Provider returned fixture failure.', stage: certainty === 'outcome_unknown' ? 'connectivity' as const : 'model_call' as const, retryable: false };
+        return { kind: 'failure' as const, failure: { failure_id: `failure-${certainty}`, task_id: adapterInput.taskId, role: 'asr' as const, model_snapshot_ref: adapterInput.modelSnapshotRef, occurred_at: at, provider_outcome_certainty: certainty, errors: [error], warnings: [], call: certainty === 'known_terminal' ? { call_id: `call-${certainty}`, model_snapshot_entry_ref: adapterInput.model.snapshot_entry_id, started_at: at, ended_at: at, provider_request_id: 'fixture-provider-id', outcome: 'failed' as const, error_ref: error.error_id } : null, staging: [] } };
+      },
+    };
+    await runWorker(input.workspace, { asrAdapter: adapter, fetch: fixtureFetch([]), readCredential: async () => 'fixture-secret' });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const task = await readV5Task(directory);
+    const snapshot = JSON.parse(await readFile(path.join(directory, task.dictionary_snapshot.path), 'utf8'));
+    expect(task.status).toBe(certainty === 'known_terminal' ? 'failed' : 'interrupted');
+    expect(task.execution.provider_calls.asr).toMatchObject({ state: certainty === 'known_terminal' ? 'terminal' : 'in_flight', count: 1, outcome: certainty });
+    expect(snapshot.asr_hints).toMatchObject({ status: 'used', adapter_id: adapter.adapterId, input_count: 1 });
+  });
+
   it('recovers locally after a provider ASR response is persisted without dispatching ASR twice', async () => {
     const input = await prepared();
     const audio = path.join(input.home, 'provider-recovery.mp3');
@@ -155,6 +278,74 @@ describe('Exchange v1 external transcript task', () => {
     expect(task.status, JSON.stringify(task.error)).toBe('completed');
     expect(calls).toEqual(['asr', 'chat']);
     expect(task.execution.provider_calls.asr).toMatchObject({ state: 'terminal', count: 1, outcome: 'response_persisted' });
+  });
+
+  it.each([
+    ['content', (raw: any) => { raw.full_text = 'TAMPERED TEXT'; raw.segments[0].text = 'TAMPERED TEXT'; }, false],
+    ['task', (raw: any) => { raw.task_id = 'tsk-20260816-000000-deadbeef'; }, true],
+    ['model', (raw: any) => { raw.model_snapshot_ref = 'tsk-20260816-000000-deadbeef-models'; }, true],
+    ['call', (raw: any) => { raw.call.model_snapshot_entry_ref = 'snapshot-entry-wrong'; }, true],
+    ['audio', (raw: any) => { raw.audio.sha256 = '0'.repeat(64); }, true],
+  ] as const)('rejects %s-tampered persisted ASR evidence without Provider replay', async (_case, mutate, alignPinnedHash) => {
+    const input = await prepared();
+    const audio = path.join(input.home, `asr-evidence-${_case}.mp3`);
+    const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
+    const registry = await loadModelRegistryV2(input.workspace);
+    const submitted = await submitExchangeRequest(input.workspace, {
+      ...input.request, request_id: `request-asr-evidence-${_case}`,
+      inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: null },
+      transcription_mode: 'provider', models: { asr: registry.defaults.asr, chat: registry.defaults.chat },
+    });
+    const calls: string[] = []; let crashed = false;
+    await expect(runWorker(input.workspace, { asrAdapter: fixtureAsr(calls), fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' }, {
+      v5Fault: async (point, task) => { if (!crashed && point === 'after_response_persisted' && task.execution.provider_calls.asr.state === 'response_persisted') { crashed = true; throw new Error(`crash:asr-evidence-${_case}`); } },
+    })).rejects.toThrow(`crash:asr-evidence-${_case}`);
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const task = await readV5Task(directory);
+    const evidencePath = path.join(directory, task.execution.provider_calls.asr.evidence_ref!);
+    const raw = JSON.parse(await readFile(evidencePath, 'utf8'));
+    mutate(raw);
+    await writeFile(evidencePath, canonicalJson(raw), { mode: 0o600 });
+    if (alignPinnedHash) {
+      const alteredTask = JSON.parse(await readFile(path.join(directory, 'task.json'), 'utf8'));
+      alteredTask.execution.provider_calls.asr.evidence_sha256 = sha(canonicalJson(raw));
+      await writeFile(path.join(directory, 'task.json'), canonicalJson(alteredTask), { mode: 0o600 });
+    }
+    await runWorker(input.workspace, { asrAdapter: fixtureAsr(calls), fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    const failed = await readV5Task(directory);
+    expect(failed.status).toBe('failed');
+    expect(failed.error?.code).toBe('ASR_ARTIFACT_INVALID');
+    expect(calls).toEqual(['asr']);
+    expect(await readJob(input.workspace, failed.identity.task_id)).toMatchObject({ state: 'terminal' });
+  });
+
+  it.each(['content', 'task', 'model', 'call'] as const)('rejects %s-tampered persisted Chat evidence without Provider replay', async (_case) => {
+    const input = await prepared();
+    input.request.request_id = `request-chat-evidence-${_case}`;
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const calls: string[] = []; let crashed = false;
+    await expect(runWorker(input.workspace, { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' }, {
+      v5Fault: async (point, task) => { if (!crashed && point === 'after_response_persisted' && task.execution.provider_calls.chat.state === 'response_persisted') { crashed = true; throw new Error(`crash:chat-evidence-${_case}`); } },
+    })).rejects.toThrow(`crash:chat-evidence-${_case}`);
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const task = await readV5Task(directory);
+    const evidencePath = path.join(directory, task.execution.provider_calls.chat.evidence_ref!);
+    const raw = JSON.parse(await readFile(evidencePath, 'utf8'));
+    if (_case === 'content') raw.corrected_units[0].corrected_text = 'TAMPERED CHAT TEXT';
+    if (_case === 'task') raw.task_id = 'tsk-20260816-000000-deadbeef';
+    if (_case === 'model') raw.model_snapshot_ref = 'tsk-20260816-000000-deadbeef-models';
+    if (_case === 'call') raw.call.model_snapshot_entry_ref = 'snapshot-entry-wrong';
+    await writeFile(evidencePath, canonicalJson(raw), { mode: 0o600 });
+    if (_case !== 'content') {
+      const alteredTask = JSON.parse(await readFile(path.join(directory, 'task.json'), 'utf8'));
+      alteredTask.execution.provider_calls.chat.evidence_sha256 = sha(canonicalJson(raw));
+      await writeFile(path.join(directory, 'task.json'), canonicalJson(alteredTask), { mode: 0o600 });
+    }
+    await runWorker(input.workspace, { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    const failed = await readV5Task(directory);
+    expect(failed.status).toBe('failed');
+    expect(failed.error?.code).toBe('CALIBRATION_RESULT_INVALID');
+    expect(calls).toEqual(['chat']);
   });
 
   it('keeps a thrown post-dispatch ASR outcome interrupted and never automatically replays it', async () => {
@@ -203,7 +394,7 @@ describe('Exchange v1 external transcript task', () => {
       expect((await stat(path.join(directory, relative))).mode & 0o777).toBe(0o600);
     }
     expect(await readFile(path.join(directory, 'input/transcript-source.srt'), 'utf8')).toBe(await readFile(input.source, 'utf8'));
-    expect(first.task.execution.provider_calls.asr).toEqual({ state: 'not_started', count: 0, outcome: 'not_dispatched', evidence_ref: null });
+    expect(first.task.execution.provider_calls.asr).toEqual({ state: 'not_started', count: 0, outcome: 'not_dispatched', evidence_ref: null, evidence_sha256: null });
 
     await mutateDictionary(input.workspace, dictionary.dictionary_id, dictionaryV2.revision, (current) => { current.entries[0]!.canonical = 'Changed Later'; });
     const calls: string[] = []; const captured: Array<Record<string, any>> = [];
@@ -248,6 +439,61 @@ describe('Exchange v1 external transcript task', () => {
     expect(await readFile(requestPath, 'utf8')).toBe(before);
   });
 
+  it('rejects a tampered normalized provider reference before ASR or Chat dispatch', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'reference-tamper.mp3');
+    const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
+    const reference = path.join(input.home, 'reference-tamper.srt');
+    const referenceText = '1\n00:00:00,000 --> 00:00:00,040\nORIGINAL REFERENCE\n';
+    await writeFile(reference, referenceText);
+    const registry = await loadModelRegistryV2(input.workspace);
+    const submitted = await submitExchangeRequest(input.workspace, {
+      ...input.request, request_id: 'request-reference-normalized-tamper',
+      inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: { path: reference, sha256: sha(referenceText), format: 'srt', role: 'reference' } },
+      transcription_mode: 'provider', models: { asr: registry.defaults.asr, chat: registry.defaults.chat },
+    });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    expect(submitted.task.inputs.reference_normalized).toMatchObject({ path: 'input/reference.srt', validation: 'passed' });
+    await writeFile(path.join(directory, submitted.task.inputs.reference_normalized!.path), '1\n00:00:00,000 --> 00:00:00,040\nTAMPERED REFERENCE\n', { mode: 0o600 });
+    const calls: string[] = [];
+    await runWorker(input.workspace, { asrAdapter: fixtureAsr(calls), fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    const task = await readV5Task(directory);
+    expect(task.status).toBe('failed');
+    expect(task.error?.code).toBe('REFERENCE_INPUT_INVALID');
+    expect(task.execution.provider_calls).toMatchObject({ asr: { count: 0 }, chat: { count: 0 } });
+    expect(calls).toEqual([]);
+  });
+
+  it.each([
+    ['after_hints_snapshot_written', 1],
+    ['after_dictionary_matches_snapshot_written', 1],
+  ] as const)('recovers the provider dictionary %s commit window with one ASR dispatch', async (point, expectedAsrCalls) => {
+    const input = await prepared();
+    const audio = path.join(input.home, `dictionary-window-${point}.mp3`);
+    const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
+    const dictionary = await createDictionary(input.workspace, { name: `Dictionary ${point}`, scope: 'global' });
+    await mutateDictionary(input.workspace, dictionary.dictionary_id, dictionary.revision, (current) => current.entries.push(makeDictionaryEntry({ entry_id: `entry-${point.replaceAll('_', '-')}`, canonical: 'Mercury', variants: ['水星'], kind: 'product' })));
+    const registry = await loadModelRegistryV2(input.workspace);
+    const submitted = await submitExchangeRequest(input.workspace, {
+      ...input.request, request_id: `request-dictionary-window-${point}`,
+      inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: null },
+      transcription_mode: 'provider', models: { asr: registry.defaults.asr, chat: registry.defaults.chat }, dictionaries: { project_key: null, selected: [dictionary.dictionary_id], task_overrides: [] },
+    });
+    const calls: string[] = []; const hints: Array<NonNullable<Parameters<AsrAdapter['run']>[0]['asrHints']>> = []; let injected = false;
+    await expect(runWorker(input.workspace, { asrAdapter: fixtureHintsAsr(calls, hints), fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' }, {
+      v5Fault: async (current) => { if (!injected && current === point) { injected = true; throw new Error(`crash:${point}`); } },
+    })).rejects.toThrow(`crash:${point}`);
+    await runWorker(input.workspace, { asrAdapter: fixtureHintsAsr(calls, hints), fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const task = await readV5Task(directory);
+    expect(task.status, JSON.stringify(task.error)).toBe('completed');
+    expect(calls.filter((entry) => entry === 'asr')).toHaveLength(expectedAsrCalls);
+    expect(calls.filter((entry) => entry === 'chat')).toHaveLength(1);
+    expect(sha(await readFile(path.join(directory, task.dictionary_snapshot.path)))).toBe(task.dictionary_snapshot.sha256);
+    const result = await stableTaskResult(input.workspace, await findTaskReadOnly(input.workspace, task.identity.task_id));
+    expect(result.dictionaries.snapshots).toEqual(task.dictionary_snapshot.resolved);
+  });
+
   it('retains transcribed output and never publishes calibrated output when Chat fails deterministically', async () => {
     const input = await prepared();
     input.request.request_id = 'request-external-failure';
@@ -290,12 +536,12 @@ describe('Exchange v1 external transcript task', () => {
     await persistV5Task(directory, running);
     const stale = structuredClone(await readV5Task(directory));
     const dispatched = structuredClone(stale);
-    dispatched.execution.provider_calls.chat = { state: 'in_flight', count: 1, outcome: 'outcome_unknown', evidence_ref: null };
+    dispatched.execution.provider_calls.chat = { state: 'in_flight', count: 1, outcome: 'outcome_unknown', evidence_ref: null, evidence_sha256: null };
     await persistV5Task(directory, dispatched);
     stale.execution.heartbeat_at = '2026-08-16T15:00:02.000Z'; stale.updated_at = stale.execution.heartbeat_at;
     await persistV5Task(directory, stale);
     await appendV5Event(directory, structuredClone(stale), 'heartbeat_fixture', '旧事件快照不覆盖 dispatch。');
-    expect((await readV5Task(directory)).execution.provider_calls.chat).toEqual({ state: 'in_flight', count: 1, outcome: 'outcome_unknown', evidence_ref: null });
+    expect((await readV5Task(directory)).execution.provider_calls.chat).toEqual({ state: 'in_flight', count: 1, outcome: 'outcome_unknown', evidence_ref: null, evidence_sha256: null });
   });
 
   it('rejects a stale writer that tries to replace one terminal state with another', async () => {

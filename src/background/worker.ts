@@ -30,6 +30,7 @@ import {
   readV5Task,
   SimulatedV5Crash,
   type V5FaultPoint,
+  writeV5Result,
 } from '../exchange/runtime.js';
 import type { TaskRecordV5 } from '../contracts/generated/task-record-v5.js';
 import { finalizeV5Review, initializeV5Review } from '../review-v5.js';
@@ -654,6 +655,7 @@ export async function runWorker(
           await appendV5Event(directory, finalTask, finalTask.status === 'completed' ? 'task_completed' : finalTask.status === 'cancelled' ? 'task_cancelled' : finalTask.status === 'interrupted' ? 'task_interrupted' : 'task_failed', finalTask.status === 'completed' ? '后台任务处理完成。' : '后台任务已结束，请查看状态和下一步。');
           if (finalTask.status === 'completed') await appendV5Event(directory, finalTask, 'review_ready', finalTask.review.status === 'finalized' ? '校验结果无需逐项决定，人工批准稿已生成。' : 'AI 校验已完成，可以开始人工审阅。');
           finalTask = await readV5Task(directory);
+          await writeV5Result(directory, finalTask);
           await v5CrashFault(options.v5Fault, 'before_finish', finalTask);
           await finishV5Job(workspaceRoot, finalTask);
           worker.state = 'idle';

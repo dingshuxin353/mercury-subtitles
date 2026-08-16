@@ -33,6 +33,8 @@ Mercury 不保证某个账号、区域、模型名称或配额一定可用。请
 
 V0.3 任务会冻结实际使用的全局词典、项目词典和 task override revision/hash。Chat 只收到与当前正文相关的最小条目上下文。
 
-ASR Adapter 通过公开的 `AsrHintsCapableAdapter` SPI 明确声明是否支持逐任务 hints。支持的 Adapter 会收到规范化的 canonical/variants 输入，任务证据记录实际 entry ID 与输入 hash；不支持时记录 `not_supported`，不会伪报使用。当前内置的火山音视频字幕与火山极速版均如实声明 `not_supported`，本版本不会猜测或自动创建 Provider 热词表。
+ASR Adapter 通过公开的 `AsrHintsCapableAdapter` SPI 明确声明是否支持逐任务 hints。支持的 Adapter 会收到规范化的 canonical/variants 输入；在真正把条目写入即将发送的请求并进入 dispatch 边界前，证据保持 `pending`，只有 Adapter 回传匹配的条目与输入 hash 后才记录 `used`。调用前失败绝不伪报使用。不支持时记录 `not_supported`。当前内置的火山音视频字幕与火山极速版均如实声明 `not_supported`，本版本不会猜测或自动创建 Provider 热词表。
+
+Provider 响应在本地恢复前会同时校验固定内容 hash 与 task/model/call/input identity；规范化 reference 和任务词典快照也使用不可变路径/hash。证据缺失或被篡改时任务会安全停止，不会采纳正文或自动重放 Provider。
 
 Mercury 当前没有托管中转服务器；网络请求直接去你配置的服务。服务提供商如何保存或处理数据，请阅读相应账号和服务条款。

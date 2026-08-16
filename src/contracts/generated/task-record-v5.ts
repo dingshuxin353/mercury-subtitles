@@ -26,6 +26,7 @@ export interface TaskRecordV5 {
     media: null | Input;
     transcript_source: null | TranscriptInput;
     reference: null | TranscriptInput;
+    reference_normalized: null | InternalArtifact;
   };
   models: {
     asr: string | null;
@@ -106,6 +107,15 @@ export interface TranscriptInput {
   format: 'srt' | 'vtt' | 'transcript_json';
   role: 'transcript_source' | 'reference';
 }
+/**
+ * This interface was referenced by `TaskRecordV5`'s JSON-Schema
+ * via the `definition` "internalArtifact".
+ */
+export interface InternalArtifact {
+  path: string;
+  sha256: string;
+  validation: 'passed' | 'pending';
+}
 export interface DictionaryReference {
   dictionary_id: string;
   revision: string;
@@ -121,15 +131,7 @@ export interface ProviderCall {
   count: number;
   outcome: 'not_dispatched' | 'known_terminal' | 'response_persisted' | 'outcome_unknown' | 'not_applicable';
   evidence_ref: null | string;
-}
-/**
- * This interface was referenced by `TaskRecordV5`'s JSON-Schema
- * via the `definition` "internalArtifact".
- */
-export interface InternalArtifact {
-  path: string;
-  sha256: string;
-  validation: 'passed' | 'pending';
+  evidence_sha256: null | string;
 }
 export interface ExchangeErrorV1 {
   contract: 'mercury.error/v1';

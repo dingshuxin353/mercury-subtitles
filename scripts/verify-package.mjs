@@ -265,7 +265,7 @@ try {
   await writeFile(
     path.join(temporaryRoot, 'verify-types.ts'),
     [
-      "import type { AsrHintsCapableAdapter, AsrHintsEvidence, AsrHintsInput, CalibrationResultV2, ExchangeRequestV1, ExchangeTaskV1, ModelConfigRegistryV2, ModelSnapshotV2, TaskRecordV5 } from 'mercury-subtitles';",
+      "import type { AsrHintsCapableAdapter, AsrHintsDispatchEvidence, AsrHintsEvidence, AsrHintsInput, CalibrationResultV2, ExchangeRequestV1, ExchangeTaskV1, ModelConfigRegistryV2, ModelSnapshotV2, TaskRecordV5 } from 'mercury-subtitles';",
       "import type { SubtitleCoreResult } from 'mercury-subtitles/subtitle-core';",
       "import type { SrtValidationResult } from 'mercury-subtitles/output-report';",
       "import type { BuiltinModelPlugin } from 'mercury-subtitles/model-center';",
@@ -278,11 +278,12 @@ try {
       'declare const hintedAsr: AsrHintsCapableAdapter;',
       'declare const hintsInput: AsrHintsInput;',
       'declare const hintsEvidence: AsrHintsEvidence;',
+      'declare const dispatchEvidence: AsrHintsDispatchEvidence;',
       'declare const subtitle: SubtitleCoreResult;',
       'declare const srt: SrtValidationResult;',
       'declare const plugin: BuiltinModelPlugin;',
       "if (hintedAsr.asrHintsCapability.status === 'supported') void hintedAsr.asrHintsCapability.acceptedFields;",
-      'void [config, snapshot, calibration, exchangeRequest, exchangeTask, taskV5, hintedAsr, hintsInput, hintsEvidence, subtitle, srt, plugin];',
+      'void [config, snapshot, calibration, exchangeRequest, exchangeTask, taskV5, hintedAsr, hintsInput, hintsEvidence, dispatchEvidence, subtitle, srt, plugin];',
     ].join('\n'),
   );
   await writeFile(

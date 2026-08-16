@@ -34,6 +34,7 @@ function semanticIssues(value: TaskRecordV5): V5ValidationIssue[] {
     if (value.inputs.transcript_source) add('/inputs/transcript_source', 'provider 模式不能同时使用外部转写事实源');
   }
   if (value.inputs.reference && value.inputs.reference.role !== 'reference') add('/inputs/reference/role', 'reference 输入必须声明 reference 角色');
+  if ((value.inputs.reference === null) !== (value.inputs.reference_normalized === null)) add('/inputs/reference_normalized', 'reference 原件与规范化证据必须同时存在或同时为空');
   if (value.input_config.evidence_mode === 'audio_multimodal' && !value.inputs.media) add('/input_config/evidence_mode', '强校验必须具有媒体输入');
 
   const terminal = ['needs_input', 'completed', 'failed', 'cancelled', 'interrupted'].includes(value.status);
@@ -46,10 +47,12 @@ function semanticIssues(value: TaskRecordV5): V5ValidationIssue[] {
   if (value.review.status === 'finalized' && value.artifacts.approved === null) add('/review/status', 'finalized 必须具有 approved 产物');
 
   for (const [role, call] of Object.entries(value.execution.provider_calls)) {
-    if (call.state === 'not_started' && (call.count !== 0 || call.outcome !== 'not_dispatched' || call.evidence_ref !== null)) add(`/execution/provider_calls/${role}`, 'not_started 必须是零调用且无证据');
-    if (call.state === 'in_flight' && (call.count < 1 || call.outcome !== 'outcome_unknown')) add(`/execution/provider_calls/${role}`, 'in_flight 必须保留 outcome_unknown 调用事实');
-    if (call.state === 'response_persisted' && (call.count < 1 || call.outcome !== 'response_persisted' || call.evidence_ref === null)) add(`/execution/provider_calls/${role}`, 'response_persisted 必须具有持久化证据');
+    if (call.state === 'not_started' && (call.count !== 0 || call.outcome !== 'not_dispatched' || call.evidence_ref !== null || call.evidence_sha256 !== null)) add(`/execution/provider_calls/${role}`, 'not_started 必须是零调用且无证据');
+    if (call.state === 'in_flight' && (call.count < 1 || call.outcome !== 'outcome_unknown' || call.evidence_ref !== null || call.evidence_sha256 !== null)) add(`/execution/provider_calls/${role}`, 'in_flight 必须保留 outcome_unknown 调用事实且不能伪造响应证据');
+    if (call.state === 'response_persisted' && (call.count < 1 || call.outcome !== 'response_persisted' || call.evidence_ref === null || call.evidence_sha256 === null)) add(`/execution/provider_calls/${role}`, 'response_persisted 必须具有路径与内容 hash 证据');
     if (call.state === 'terminal' && call.count > 0 && !['known_terminal', 'response_persisted'].includes(call.outcome)) add(`/execution/provider_calls/${role}`, 'terminal 调用必须有确定结果');
+    if (call.state === 'terminal' && call.outcome === 'response_persisted' && (call.evidence_ref === null || call.evidence_sha256 === null)) add(`/execution/provider_calls/${role}`, 'response_persisted 终态必须保留路径与内容 hash 证据');
+    if ((call.evidence_ref === null) !== (call.evidence_sha256 === null)) add(`/execution/provider_calls/${role}`, 'evidence_ref 与 evidence_sha256 必须同时存在或同时为空');
   }
   return issues;
 }

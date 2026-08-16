@@ -34,11 +34,12 @@
     },
     "inputs": {
       "type": "object", "additionalProperties": false,
-      "required": ["media", "transcript_source", "reference"],
+      "required": ["media", "transcript_source", "reference", "reference_normalized"],
       "properties": {
         "media": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/input" }] },
         "transcript_source": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/transcriptInput" }] },
-        "reference": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/transcriptInput" }] }
+        "reference": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/transcriptInput" }] },
+        "reference_normalized": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/internalArtifact" }] }
       }
     },
     "models": {
@@ -129,12 +130,13 @@
     },
     "providerCall": {
       "type": "object", "additionalProperties": false,
-      "required": ["state", "count", "outcome", "evidence_ref"],
+      "required": ["state", "count", "outcome", "evidence_ref", "evidence_sha256"],
       "properties": {
         "state": { "enum": ["not_started", "in_flight", "response_persisted", "terminal"] },
         "count": { "type": "integer", "minimum": 0, "maximum": 1000 },
         "outcome": { "enum": ["not_dispatched", "known_terminal", "response_persisted", "outcome_unknown", "not_applicable"] },
-        "evidence_ref": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/taskRelativePath" }] }
+        "evidence_ref": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/taskRelativePath" }] },
+        "evidence_sha256": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/sha256" }] }
       }
     },
     "internalArtifact": {

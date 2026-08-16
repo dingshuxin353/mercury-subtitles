@@ -26,6 +26,16 @@ export interface AsrHintsEvidence {
   reason: string | null;
 }
 
+/**
+ * Adapter 在已经把 hints 写入即将发送的真实 Provider 请求后，才可在
+ * beforeProviderDispatch 边界提交此证据。仅收到 AsrHintsInput 不代表 used。
+ */
+export interface AsrHintsDispatchEvidence {
+  status: 'used';
+  entryIds: string[];
+  inputHash: string;
+}
+
 export interface AsrAdapter {
   readonly adapterId: string;
   run(input: AsrAdapterInput): Promise<AdapterExecutionResult<TranscriptRaw>>;

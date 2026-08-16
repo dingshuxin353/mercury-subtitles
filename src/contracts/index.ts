@@ -109,7 +109,7 @@ export type { V3ValidationResult } from './v3.js';
 export { assertV4Contract, validateV4Contract } from './v4.js';
 export type { V4ContractName, V4ContractTypeMap, V4ValidationResult } from './v4.js';
 export type { AdapterExecutionResult } from './adapters/result.js';
-export type { AsrAdapter, AsrHintEntry, AsrHintsCapableAdapter, AsrHintsEvidence, AsrHintsInput } from './adapters/asr.js';
+export type { AsrAdapter, AsrHintEntry, AsrHintsCapableAdapter, AsrHintsDispatchEvidence, AsrHintsEvidence, AsrHintsInput } from './adapters/asr.js';
 export type { CalibrationAdapter } from './adapters/chat-calibration.js';
 export type { AudioVerificationAdapter } from './adapters/audio-verification.js';
 export type {
