@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -812,6 +812,63 @@ describe('Exchange v1 external transcript task', () => {
     expect(calls).toEqual(callsBeforeAudit);
     const diagnostics = JSON.parse(await readFile(path.join(input.workspace, 'runtime/worker-diagnostics.json'), 'utf8'));
     expect(diagnostics.issues).toEqual(expect.arrayContaining([expect.objectContaining({ file: `${afterAudit.identity.task_id}.json`, code: 'DICTIONARY_RECORD_INVALID' })]));
+  });
+
+  it.each([0o644, 0o666, 0o444])('restores a hash-correct terminal report from mode %o to exact 0600 without another Provider call', async (unsafeMode) => {
+    const input = await prepared();
+    input.request.request_id = `request-report-mode-${unsafeMode.toString(8)}`;
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const calls: string[] = [];
+    const dependencies = { chatRuntime: knownFailureChat(calls), readCredential: async () => 'fixture-secret' };
+    await runWorker(input.workspace, dependencies);
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const before = await readV5Task(directory);
+    const reportBefore = structuredClone(before.artifacts.report!);
+    const reportPath = path.join(directory, reportBefore.path);
+    await chmod(reportPath, unsafeMode);
+    expect((await stat(reportPath)).mode & 0o777).toBe(unsafeMode);
+    const callsBeforeAudit = [...calls];
+    await runWorker(input.workspace, dependencies);
+    const recovered = await readV5Task(directory);
+    expect(calls).toEqual(callsBeforeAudit);
+    expect((await stat(reportPath)).mode & 0o777).toBe(0o600);
+    expect(recovered.artifacts.report).toEqual(reportBefore);
+    expect(sha(await readFile(reportPath))).toBe(reportBefore.sha256);
+    expect(JSON.parse(await readFile(path.join(directory, 'result.json'), 'utf8'))).toMatchObject({
+      status: 'failed',
+      artifacts: expect.arrayContaining([expect.objectContaining({ identity: 'calibration_report', exists: true, validation: 'passed', sha256: reportBefore.sha256 })]),
+    });
+    const beforeIdempotentAudit = await directoryManifest(directory);
+    await runWorker(input.workspace, dependencies);
+    expect(calls).toEqual(callsBeforeAudit);
+    expect(await directoryManifest(directory)).toEqual(beforeIdempotentAudit);
+  });
+
+  it('replaces an unsafe terminal-report symlink without modifying its external target or calling Provider', async () => {
+    const input = await prepared();
+    input.request.request_id = 'request-report-symlink-recovery';
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const calls: string[] = [];
+    const dependencies = { chatRuntime: knownFailureChat(calls), readCredential: async () => 'fixture-secret' };
+    await runWorker(input.workspace, dependencies);
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const task = await readV5Task(directory);
+    const reportPath = path.join(directory, task.artifacts.report!.path);
+    const outside = path.join(input.home, 'outside-report.md');
+    const original = await readFile(reportPath);
+    await writeFile(outside, original, { mode: 0o600 });
+    const outsideBefore = sha(await readFile(outside));
+    await rm(reportPath);
+    await symlink(outside, reportPath);
+    const callsBeforeAudit = [...calls];
+    await runWorker(input.workspace, dependencies);
+    const entry = await lstat(reportPath);
+    expect(entry.isFile()).toBe(true);
+    expect(entry.isSymbolicLink()).toBe(false);
+    expect(entry.mode & 0o777).toBe(0o600);
+    expect(sha(await readFile(reportPath))).toBe(task.artifacts.report!.sha256);
+    expect(sha(await readFile(outside))).toBe(outsideBefore);
+    expect(calls).toEqual(callsBeforeAudit);
   });
 
   it('keeps a thrown post-dispatch ASR outcome interrupted and never automatically replays it', async () => {

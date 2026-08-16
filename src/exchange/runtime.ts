@@ -630,7 +630,10 @@ async function hasVerifiedReport(directory: string, task: TaskRecordV5): Promise
   if (!report || report.path !== 'output/calibration-report.md' || report.validation !== 'passed') return false;
   const target = managed(directory, report.path);
   const entry = await lstat(target).catch(() => null);
-  return Boolean(entry?.isFile() && !entry.isSymbolicLink() && await sha256File(target) === report.sha256);
+  return Boolean(entry?.isFile()
+    && !entry.isSymbolicLink()
+    && (entry.mode & 0o777) === 0o600
+    && await sha256File(target) === report.sha256);
 }
 
 export async function ensureV5TerminalReport(directory: string, taskInput?: TaskRecordV5): Promise<TaskRecordV5> {
