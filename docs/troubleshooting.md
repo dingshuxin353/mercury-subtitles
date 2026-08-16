@@ -43,12 +43,19 @@ ASR 成功、Chat 失败时会保留 `transcribed.srt`。查看任务详情和 `
 
 ## Skill 没有被 Agent 发现
 
-确认状态：
+先用标准 Skills CLI 安装或检查：
+
+```bash
+npx skills add dingshuxin353/mercury-subtitles
+npx skills list
+```
+
+然后让 Mercury 只读检查标准项目安装、标准全局安装和旧版安装：
 
 ```bash
 mercury skill status --json
 ```
 
-安装后通常需要打开一个新 Agent 会话。已有同名 Skill 时 Mercury 不会覆盖，请先检查路径和来源再处理。
+安装后通常需要打开一个新 Agent 会话。若状态显示多份安装、目录不兼容或不安全，Mercury 不会覆盖或删除，请先检查返回的 `installations` 和路径再处理。
 
 如果仍无法解决，请使用 [安装帮助模板](https://github.com/dingshuxin353/mercury-subtitles/issues/new?template=installation-help.yml)，只提交脱敏信息。

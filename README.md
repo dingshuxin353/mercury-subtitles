@@ -105,10 +105,21 @@ mercury worker start --json
 
 ## 方式二：让 Agent 通过 Skill 使用
 
-先安装 Mercury CLI 并完成模型配置，然后安装随 npm 包提供的 Skill：
+先安装 Mercury CLI 并完成模型配置，然后从公开仓库安装 Skill：
 
 ```bash
-mercury skill install --json
+npx skills add dingshuxin353/mercury-subtitles
+```
+
+安装器会让你选择 Agent 和安装范围。想直接安装到当前用户的 Codex，可以使用：
+
+```bash
+npx skills add dingshuxin353/mercury-subtitles --global --agent codex --skill mercury-subtitles --yes
+```
+
+安装后可以让 Mercury 只读检查是否发现了兼容 Skill：
+
+```bash
 mercury skill status --json
 ```
 
@@ -122,7 +133,7 @@ mercury skill status --json
 
 Skill 只使用 Mercury 的机器命令。它不会向你索要 Key，不会自行上传音频，不会绕过 Mercury 直接调用 ASR 或 Chat 服务，也不会凭空拼出结果路径。
 
-[Skill 完整说明 →](https://github.com/dingshuxin353/mercury-subtitles/blob/main/docs/skill.md)
+[Skill 完整说明 →](https://github.com/dingshuxin353/mercury-subtitles/blob/main/docs/agent-skill.md)
 
 ## 人工批准校验结果
 
@@ -190,19 +201,26 @@ npm install --global mercury-subtitles@next
 <details>
 <summary><strong>如何升级或卸载</strong></summary>
 
-升级 Public Alpha：
+升级 CLI / App：
 
 ```bash
 npm install --global mercury-subtitles@next
 ```
 
-卸载程序：
+升级或重新配置 Skill：
+
+```bash
+npx skills update mercury-subtitles
+npx skills list
+```
+
+卸载 CLI / App：
 
 ```bash
 npm uninstall --global mercury-subtitles
 ```
 
-卸载不会自动删除 `~/mercury-workspace/` 或已安装的 Skill，避免误删任务和人工审阅结果。确认不再需要后再自行备份、移走对应目录。
+卸载 CLI 不会自动删除 `~/mercury-workspace/` 或由 Skills CLI 管理的 Skill，避免误删任务和人工审阅结果。Skill 的移除请使用 `npx skills remove mercury-subtitles`；确认不再需要后再处理工作区。
 </details>
 
 [更多故障排查 →](https://github.com/dingshuxin353/mercury-subtitles/blob/main/docs/troubleshooting.md)
@@ -232,7 +250,7 @@ npm run verify
 
 ## 版本与反馈
 
-- 当前版本：`0.2.0-alpha.2`，npm dist-tag 为 `next`，不会占用 `latest`。
+- 当前版本：`0.2.0-alpha.3`，推荐通过 npm dist-tag `next` 安装 Public Alpha。
 - 版本变化：[CHANGELOG.md](./CHANGELOG.md)
 - 下载与校验：[GitHub Releases](https://github.com/dingshuxin353/mercury-subtitles/releases)
 - 安装或配置求助：[创建安装帮助](https://github.com/dingshuxin353/mercury-subtitles/issues/new?template=installation-help.yml)

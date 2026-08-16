@@ -69,6 +69,7 @@ export interface CliIo {
   stdout: (message: string) => void;
   stderr: (message: string) => void;
   homeDirectory?: string;
+  currentDirectory?: string;
   prompt?: (question: string) => Promise<string>;
   secretPrompt?: (question: string) => Promise<string>;
 }
@@ -102,8 +103,9 @@ Mercury 0.2 Alpha
   mercury worker status [--json]
   mercury worker start [--json]
   mercury review status|list|decide|accept-all|finalize <task-id> ... --json
+  npx skills add dingshuxin353/mercury-subtitles
   mercury skill status [--json]
-  mercury skill install [--target <skills-directory>] [--json]
+  mercury skill install [--target <skills-directory>] [--json]  # 旧版兼容
 `;
 
 const SETUP_HELP = `用法：
@@ -1834,10 +1836,33 @@ export async function runCli(
       assertAllowedArguments(commandArgs, new Set(['--target']), new Set(['--json']));
       const target = optionValue(commandArgs, '--target');
       const data = operation === 'install'
-        ? await installSkill(io.homeDirectory ?? homedir(), target)
-        : await skillStatus(io.homeDirectory ?? homedir(), target);
+        ? await installSkill(
+            io.homeDirectory ?? homedir(),
+            target,
+            io.currentDirectory ?? process.cwd(),
+          )
+        : await skillStatus(
+            io.homeDirectory ?? homedir(),
+            target,
+            io.currentDirectory ?? process.cwd(),
+          );
       if (commandArgs.includes('--json')) writeMachine(io, machineSuccess(`skill.${operation}`, data));
-      else io.stdout(operation === 'install' ? `Mercury 字幕 Skill 已安装：${data.install_path}\n` : `Mercury 字幕 Skill：${data.installed ? data.compatible ? '已安装且兼容' : '已安装但需更新' : '尚未安装'}\n位置：${data.install_path}\n`);
+      else if (operation === 'install') {
+        const installAction = 'install_action' in data
+          ? data.install_action
+          : 'already_installed';
+        io.stdout(
+          `${installAction === 'already_installed' ? '已检测到兼容的 Mercury 字幕 Skill' : '已通过旧版兼容方式安装 Mercury 字幕 Skill'}：${data.install_path}\n` +
+          `今后推荐使用标准 Skills CLI 管理：${data.recommended_install_command}\n`,
+        );
+      } else {
+        io.stdout(
+          `Mercury 字幕 Skill：${data.installed ? data.compatible ? '已安装且兼容' : '已安装但需处理冲突或更新' : '尚未安装'}\n` +
+          `位置：${data.installed ? data.install_path : data.recommended_install_path}\n` +
+          `${data.duplicate_installations ? `检测到 ${data.installations.length} 份安装，请人工检查后保留需要的一份。\n` : ''}` +
+          `推荐安装/更新：${data.recommended_install_command}\n`,
+        );
+      }
       return 0;
     }
 
