@@ -30,6 +30,22 @@ describe('external transcript input', () => {
     expect(await readFile(vtt.target)).toEqual(beforeVtt);
   });
 
+  it('strips only supported SRT presentation tags and validates VTT cue settings', async () => {
+    const styled = await fixture('styled.srt', '1\n00:00:00,000 --> 00:00:01,000\n<i><font color="red">Mercury</font></i>\n');
+    const inspected = await inspectTranscriptInput({ filePath: styled.target, format: 'srt', role: 'transcript_source' });
+    expect(inspected.transcript.text).toBe('Mercury');
+    expect(inspected.warnings).toEqual([expect.stringContaining('展示标记')]);
+    const styleOnly = await fixture('style-only.srt', '1\n00:00:00,000 --> 00:00:01,000\n<i></i>\n');
+    await expect(inspectTranscriptInput({ filePath: styleOnly.target, format: 'srt', role: 'transcript_source' }))
+      .rejects.toMatchObject({ code: 'TRANSCRIPT_IMPORT_INVALID' });
+    const settings = await fixture('settings.vtt', 'WEBVTT\n\n00:00.000 --> 00:01.000 line:10% align:start\nMercury\n');
+    expect((await inspectTranscriptInput({ filePath: settings.target, format: 'vtt', role: 'transcript_source' })).warnings)
+      .toEqual([expect.stringContaining('settings')]);
+    const unsupported = await fixture('unsupported-settings.vtt', 'WEBVTT\n\n00:00.000 --> 00:01.000 x-script:run\nMercury\n');
+    await expect(inspectTranscriptInput({ filePath: unsupported.target, format: 'vtt', role: 'transcript_source' }))
+      .rejects.toMatchObject({ code: 'TRANSCRIPT_IMPORT_INVALID' });
+  });
+
   it('drops isolated invalid words but rejects invalid segments and inconsistent top text', async () => {
     const base = {
       contract: 'mercury.transcript/v1', transcript_id: `trn-${'a'.repeat(16)}`,
@@ -38,17 +54,19 @@ describe('external transcript input', () => {
       segments: [
         { segment_id: `seg-${'1'.repeat(8)}`, index: 0, start_ms: 0, end_ms: 1000, text: '第一行', words: [
           { text: '第一', start_ms: 0, end_ms: 500, confidence: 0.9 },
+          { text: '倒序', start_ms: 400, end_ms: 450, confidence: 0.8 },
+          { text: '合法后词', start_ms: 500, end_ms: 800, confidence: 0.8 },
           { text: '坏', start_ms: 900, end_ms: 1100, confidence: 1 },
         ] },
         { segment_id: `seg-${'2'.repeat(8)}`, index: 1, start_ms: 1000, end_ms: 2000, text: '第二行', words: [] },
       ],
-      source: { kind: 'provided', format: 'transcript_json', original_path: null, original_sha256: '0'.repeat(64), normalized_sha256: '0'.repeat(64) },
+      source: { kind: 'provided', format: 'transcript_json', system: 'fixture', external_id: 'fixture-1', generated_at: '2026-08-16T00:00:00.000Z', content_sha256: 'f'.repeat(64), original_path: null, original_sha256: '0'.repeat(64), normalized_sha256: '0'.repeat(64) },
       warnings: [], extensions: {},
     };
     const valid = await fixture('valid.json', `${JSON.stringify(base)}\n`);
     const inspected = await inspectTranscriptInput({ filePath: valid.target, format: 'transcript_json', role: 'transcript_source' });
-    expect(inspected.transcript.segments[0].words).toHaveLength(1);
-    expect(inspected.warnings.at(-1)).toContain('1 个非法');
+    expect(inspected.transcript.segments[0].words.map((word) => word.text)).toEqual(['第一', '合法后词']);
+    expect(inspected.warnings.at(-1)).toContain('2 个非法');
     const badText = await fixture('bad-text.json', JSON.stringify({ ...base, text: '伪造顶层' }));
     await expect(inspectTranscriptInput({ filePath: badText.target, format: 'transcript_json', role: 'transcript_source' }))
       .rejects.toMatchObject({ code: 'TRANSCRIPT_IMPORT_INVALID' });

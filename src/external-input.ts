@@ -85,6 +85,7 @@ function validateCues(cues: ParsedCue[]): void {
 }
 
 function parseSrt(source: string): { cues: ParsedCue[]; warnings: string[] } {
+  const warnings: string[] = [];
   const blocks = source.trim().split(/\n[ \t]*\n+/u).filter((entry) => entry.trim());
   const cues = blocks.map((block, index) => {
     const lines = block.split('\n');
@@ -93,14 +94,21 @@ function parseSrt(source: string): { cues: ParsedCue[]; warnings: string[] } {
     const timing = lines.shift() ?? '';
     const match = /^(\S+)\s+-->\s+(\S+)\s*$/u.exec(timing);
     if (!match) throw new MercuryError('TRANSCRIPT_IMPORT_INVALID', `第 ${index + 1} 个 SRT cue 缺少合法时间行。`, { exitCode: 2 });
+    const rawText = lines.join('\n');
+    const text = rawText
+      .replace(/<\/?(?:i|b|u)>/giu, '')
+      .replace(/<font(?:\s+[^>]*)?>/giu, '')
+      .replace(/<\/font>/giu, '');
+    if (text !== rawText) warnings.push(`SRT cue ${index + 1} 的展示标记已安全移除；原件保持不变。`);
+    if (/<[^>]*>/u.test(text)) throw new MercuryError('TRANSCRIPT_IMPORT_INVALID', `第 ${index + 1} 个 SRT cue 包含不支持的标记。`, { exitCode: 2 });
     return {
       start_ms: timestamp(match[1]!, false), end_ms: timestamp(match[2]!, false),
-      text: safeText(lines.join('\n'), `第 ${index + 1} 个 SRT cue`),
+      text: safeText(text, `第 ${index + 1} 个 SRT cue`),
       provenance: { cue_identifier: identifier },
     };
   });
   validateCues(cues);
-  return { cues, warnings: [] };
+  return { cues, warnings };
 }
 
 function stripVttMarkup(value: string, warnings: string[], cue: number): string {
@@ -142,12 +150,18 @@ function parseVtt(source: string): { cues: ParsedCue[]; warnings: string[] } {
     const timing = lines[index++]?.trim() ?? '';
     const match = /^(\S+)\s+-->\s+(\S+)(?:\s+(.*))?$/u.exec(timing);
     if (!match) throw new MercuryError('TRANSCRIPT_IMPORT_INVALID', `第 ${cues.length + 1} 个 VTT cue 缺少合法时间行。`, { exitCode: 2 });
+    const settings = match[3]?.trim() || null;
+    if (settings) {
+      const supported = /^(?:(?:line:(?:-?\d+(?:\.\d+)?%?|auto)(?:,(?:start|center|end))?|position:\d+(?:\.\d+)?%(?:,(?:line-left|center|line-right))?|size:\d+(?:\.\d+)?%|align:(?:start|center|end|left|right)|vertical:(?:rl|lr))\s*)+$/u;
+      if (!supported.test(settings)) throw new MercuryError('TRANSCRIPT_IMPORT_INVALID', `第 ${cues.length + 1} 个 VTT cue 包含不支持的 settings。`, { exitCode: 2 });
+      warnings.push(`VTT cue ${cues.length + 1} 的展示 settings 已记录但不影响规范化时间轴。`);
+    }
     const payload: string[] = [];
     while (index < lines.length && lines[index]!.trim()) payload.push(lines[index++]!);
     cues.push({
       start_ms: timestamp(match[1]!, true), end_ms: timestamp(match[2]!, true),
       text: safeText(stripVttMarkup(payload.join('\n'), warnings, cues.length + 1), `第 ${cues.length + 1} 个 VTT cue`),
-      provenance: { cue_identifier: identifier, settings: match[3]?.trim() || null },
+      provenance: { cue_identifier: identifier, settings },
     });
   }
   validateCues(cues);
@@ -173,7 +187,7 @@ function fromCues(input: {
     created_at: input.createdAt,
     language: 'zh-CN', duration_ms: segments.at(-1)!.end_ms,
     text: segments.map((entry) => entry.text).join('\n'), segments,
-    source: { kind: 'provided' as const, format: input.format, original_path: input.absolute, original_sha256: input.originalHash, normalized_sha256: ZERO_HASH },
+    source: { kind: 'provided' as const, format: input.format, system: `external_${input.format}`, external_id: null, generated_at: input.createdAt, content_sha256: input.originalHash, original_path: input.absolute, original_sha256: input.originalHash, normalized_sha256: ZERO_HASH },
     warnings: input.warnings, extensions: {},
   };
   transcript.source.normalized_sha256 = normalizedHash(transcript as unknown as ExchangeTranscriptV1);
@@ -186,6 +200,12 @@ function sanitizeTranscriptJson(raw: unknown, absolute: string, originalHash: st
   if (candidate.contract !== 'mercury.transcript/v1') throw new MercuryError('TRANSCRIPT_IMPORT_INVALID', 'JSON 不是 mercury.transcript/v1。', { exitCode: 2 });
   if (!Array.isArray(candidate.segments)) throw new MercuryError('TRANSCRIPT_IMPORT_INVALID', 'transcript JSON 缺少 segments。', { exitCode: 2 });
   const warnings = Array.isArray(candidate.warnings) && candidate.warnings.every((entry: unknown) => typeof entry === 'string') ? [...candidate.warnings] : [];
+  const source = candidate.source;
+  if (!source || typeof source !== 'object' || typeof source.system !== 'string' || !source.system.trim()
+    || (source.external_id !== null && typeof source.external_id !== 'string') || typeof source.generated_at !== 'string'
+    || Number.isNaN(Date.parse(source.generated_at)) || typeof source.content_sha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(source.content_sha256)) {
+    throw new MercuryError('TRANSCRIPT_IMPORT_INVALID', 'transcript JSON source 必须包含系统名、可选外部 ID、生成时间和内容 hash。', { exitCode: 2 });
+  }
   let dropped = 0;
   let previousEnd = -1;
   candidate.segments = candidate.segments.map((segment: any, index: number) => {
@@ -194,25 +214,23 @@ function sanitizeTranscriptJson(raw: unknown, absolute: string, originalHash: st
       throw new MercuryError('TRANSCRIPT_IMPORT_INVALID', `transcript JSON 第 ${index + 1} 个 segment 无效。`, { exitCode: 2 });
     }
     previousEnd = segment.end_ms;
+    let lastWordEnd = segment.start_ms;
     const words = Array.isArray(segment.words) ? segment.words.filter((word: any) => {
       const valid = word && typeof word === 'object' && typeof word.text === 'string' && /\S/u.test(word.text)
         && Number.isSafeInteger(word.start_ms) && Number.isSafeInteger(word.end_ms)
         && word.start_ms >= segment.start_ms && word.end_ms <= segment.end_ms && word.end_ms > word.start_ms
+        && word.start_ms >= lastWordEnd
         && (word.confidence === null || (typeof word.confidence === 'number' && word.confidence >= 0 && word.confidence <= 1));
       if (!valid) dropped += 1;
+      else lastWordEnd = word.end_ms;
       return valid;
     }) : [];
-    const ordered = words.filter((word: any, wordIndex: number) => {
-      const valid = wordIndex === 0 || word.start_ms >= words[wordIndex - 1]!.end_ms;
-      if (!valid) dropped += 1;
-      return valid;
-    });
-    return { ...segment, text: safeText(segment.text, `第 ${index + 1} 个 segment`), words: ordered };
+    return { ...segment, text: safeText(segment.text, `第 ${index + 1} 个 segment`), words };
   });
   const exactText = candidate.segments.map((segment: any) => segment.text).join('\n');
   if (candidate.text !== exactText) throw new MercuryError('TRANSCRIPT_IMPORT_INVALID', 'transcript JSON 顶层 text 与 segments 逐行正文不一致。', { exitCode: 2 });
   if (dropped > 0) warnings.push(`已忽略 ${dropped} 个非法或越界 word；合法 segment 仍是权威时间证据。`);
-  candidate.source = { kind: 'provided', format: 'transcript_json', original_path: absolute, original_sha256: originalHash, normalized_sha256: ZERO_HASH };
+  candidate.source = { kind: 'provided', format: 'transcript_json', system: source.system.trim(), external_id: source.external_id, generated_at: source.generated_at, content_sha256: source.content_sha256, original_path: absolute, original_sha256: originalHash, normalized_sha256: ZERO_HASH };
   candidate.warnings = warnings;
   candidate.extensions ??= {};
   candidate.source.normalized_sha256 = normalizedHash(candidate as ExchangeTranscriptV1);

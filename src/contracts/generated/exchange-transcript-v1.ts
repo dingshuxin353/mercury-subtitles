@@ -17,6 +17,10 @@ export interface ExchangeTranscriptV1 {
   source: {
     kind: 'provider' | 'provided';
     format: 'provider_json' | 'srt' | 'vtt' | 'transcript_json';
+    system: string;
+    external_id: string | null;
+    generated_at: string;
+    content_sha256: string;
     original_path: null | string;
     original_sha256: string;
     normalized_sha256: string;

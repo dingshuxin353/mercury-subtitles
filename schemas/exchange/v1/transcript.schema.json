@@ -18,10 +18,14 @@
     },
     "source": {
       "type": "object", "additionalProperties": false,
-      "required": ["kind", "format", "original_path", "original_sha256", "normalized_sha256"],
+      "required": ["kind", "format", "system", "external_id", "generated_at", "content_sha256", "original_path", "original_sha256", "normalized_sha256"],
       "properties": {
         "kind": { "enum": ["provider", "provided"] },
         "format": { "enum": ["provider_json", "srt", "vtt", "transcript_json"] },
+        "system": { "type": "string", "minLength": 1, "maxLength": 100, "pattern": "\\S" },
+        "external_id": { "type": ["string", "null"], "minLength": 1, "maxLength": 200 },
+        "generated_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "content_sha256": { "$ref": "common.schema.json#/$defs/sha256" },
         "original_path": { "anyOf": [{ "type": "null" }, { "$ref": "common.schema.json#/$defs/absolutePath" }] },
         "original_sha256": { "$ref": "common.schema.json#/$defs/sha256" },
         "normalized_sha256": { "$ref": "common.schema.json#/$defs/sha256" }

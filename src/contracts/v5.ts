@@ -36,7 +36,7 @@ function semanticIssues(value: TaskRecordV5): V5ValidationIssue[] {
 
   const terminal = ['needs_input', 'completed', 'failed', 'cancelled', 'interrupted'].includes(value.status);
   if (terminal !== (value.execution.ended_at !== null)) add('/execution/ended_at', '必须与终态一致');
-  if (value.status === 'queued' && (value.execution.started_at !== null || value.execution.worker_id !== null || value.execution.attempt_count !== 0)) add('/status', 'queued 任务不能声明已启动 Worker/attempt');
+  if (value.status === 'queued' && (value.execution.started_at !== null || value.execution.worker_id !== null || value.execution.heartbeat_at !== null || value.execution.attempt_id !== null)) add('/status', 'queued 任务不能声明当前 Worker/attempt；历史 attempt_count 可以保留');
   if (value.status === 'running' && (value.execution.started_at === null || value.execution.worker_id === null || value.execution.heartbeat_at === null || value.execution.attempt_id === null || value.execution.attempt_count < 1)) add('/status', 'running 必须具有 Worker、心跳和 attempt');
   if (value.status === 'completed' && (value.execution.safe_checkpoint !== 'outputs_validated' || value.artifacts.calibrated === null || value.error !== null)) add('/status', 'completed 必须有已校验字幕、outputs_validated 且无错误');
   if (['failed', 'interrupted'].includes(value.status) && value.error === null) add('/error', `${value.status} 必须有稳定错误`);

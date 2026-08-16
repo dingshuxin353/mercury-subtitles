@@ -62,7 +62,7 @@ function transcript(): ExchangeTranscriptV1 {
       { segment_id: 'seg-00000001', index: 0, start_ms: 0, end_ms: 900, text: '你好', words: [] },
       { segment_id: 'seg-00000002', index: 1, start_ms: 1000, end_ms: 1800, text: '世界', words: [] },
     ],
-    source: { kind: 'provided', format: 'srt', original_path: '/tmp/input.srt', original_sha256: hash, normalized_sha256: hash },
+    source: { kind: 'provided', format: 'srt', system: 'fixture', external_id: null, generated_at: now, content_sha256: hash, original_path: '/tmp/input.srt', original_sha256: hash, normalized_sha256: hash },
     warnings: [],
     extensions: {},
   };

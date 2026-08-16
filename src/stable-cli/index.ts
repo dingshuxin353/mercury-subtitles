@@ -172,17 +172,27 @@ export async function tryRunStableCli(args: string[], context: StableCliContext)
         const requestPath = value(commandArgs, '--request');
         if (!requestPath) throw new MercuryError('CLI_OPTION_VALUE_MISSING', 'task submit 必须提供 --request <绝对 request.json>。', { exitCode: 2 });
         if (!path.isAbsolute(requestPath)) throw new MercuryError('CLI_ARGUMENT_INVALID', '--request 必须使用绝对路径。', { exitCode: 2 });
-        const request = assertExchangeContract('request', await readStableJson(requestPath, 'REQUEST_INVALID'));
+        const rawRequest = await readStableJson(requestPath, 'REQUEST_INVALID');
+        if (rawRequest && typeof rawRequest === 'object') {
+          const transcript = (rawRequest as { inputs?: { transcript?: unknown } }).inputs?.transcript;
+          if (transcript && typeof transcript === 'object' && !('role' in transcript)) {
+            throw new MercuryError('TRANSCRIPT_ROLE_REQUIRED', '机器请求必须显式声明 transcript_source 或 reference；Mercury 不会猜测用途。', { exitCode: 2 });
+          }
+        }
+        const request = assertExchangeContract('request', rawRequest);
         const submitted = request.transcription_mode === 'provided'
           ? await submitExchangeRequest(context.workspaceRoot, request)
           : await submitProviderRequest(context.workspaceRoot, request);
         let worker: { started: boolean; pid: number | null; problem: string | null };
-        try {
-          const started = await startDetachedWorker(context.workspaceRoot);
-          worker = { started: true, pid: started.pid, problem: null };
-        } catch (error) {
-          worker = { started: false, pid: null, problem: error instanceof MercuryError ? error.message : 'Worker 启动失败；任务仍安全保留在队列。' };
-        }
+        const status = 'identity' in submitted.task ? submitted.task.status : submitted.task.execution.status;
+        if (status === 'queued') {
+          try {
+            const started = await startDetachedWorker(context.workspaceRoot);
+            worker = { started: true, pid: started.pid, problem: null };
+          } catch (error) {
+            worker = { started: false, pid: null, problem: error instanceof MercuryError ? error.message : 'Worker 启动失败；任务仍安全保留在队列。' };
+          }
+        } else worker = { started: false, pid: null, problem: null };
         const stableTask = 'identity' in submitted.task
           ? await projectV5Task(path.join(context.workspaceRoot, 'tasks', submitted.task.identity.task_directory), submitted.task)
           : await stableTaskView(context.workspaceRoot, submitted.task);

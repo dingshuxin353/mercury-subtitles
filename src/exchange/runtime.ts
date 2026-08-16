@@ -19,6 +19,7 @@ import { ensureWorkspace } from '../workspace.js';
 import { ensureRuntimeLayout, jsonFingerprint, readJob, readRequest, requestIdHash, reserveRequest, withRequestLease, withTaskTransitionLock, writeJob, writeRequest } from '../background/storage.js';
 import { JOB_CONTRACT_VERSION, REQUEST_CONTRACT_VERSION, type BackgroundJobV1, type BackgroundRequestV1 } from '../background/types.js';
 import { resolveDictionarySnapshot, type ResolvedDictionarySnapshot } from '../dictionary.js';
+import { withOwnedLock } from '../background/owned-lock.js';
 
 type ProviderCall = TaskRecordV5['execution']['provider_calls']['chat'];
 const TASK_ID = /^tsk-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}$/u;
@@ -66,9 +67,29 @@ export async function readV5Task(directory: string): Promise<TaskRecordV5> {
 }
 
 export async function persistV5Task(directory: string, task: TaskRecordV5): Promise<void> {
-  const checked = assertV5TaskRecord(task);
-  if (checked.identity.task_directory !== path.basename(path.resolve(directory))) throw new MercuryError('TASK_RECORD_INVALID', 'v5 task identity 与目录不一致。');
-  await writeStableJsonAtomic(path.join(directory, 'task.json'), checked);
+  await withOwnedLock(path.join(directory, 'task-record.lock'), async () => {
+    let checked = assertV5TaskRecord(task);
+    if (checked.identity.task_directory !== path.basename(path.resolve(directory))) throw new MercuryError('TASK_RECORD_INVALID', 'v5 task identity 与目录不一致。');
+    const taskFileExists = await lstat(path.join(directory, 'task.json')).then(() => true).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    });
+    const current = taskFileExists ? await readV5Task(directory) : null;
+    if (current) {
+      if (current.identity.task_id !== checked.identity.task_id || current.identity.request_fingerprint !== checked.identity.request_fingerprint) {
+        throw new MercuryError('TASK_RECORD_INVALID', 'v5 task 写入 identity 冲突。');
+      }
+      if (TERMINAL.has(current.status) && !TERMINAL.has(checked.status)) checked = current;
+      else {
+        checked.identity.revision = Math.max(checked.identity.revision, current.identity.revision);
+        checked.execution.cancel_requested_at ??= current.execution.cancel_requested_at;
+        if ((current.execution.heartbeat_at ?? '') > (checked.execution.heartbeat_at ?? '')) checked.execution.heartbeat_at = current.execution.heartbeat_at;
+        if (current.updated_at > checked.updated_at) checked.updated_at = current.updated_at;
+      }
+    }
+    await writeStableJsonAtomic(path.join(directory, 'task.json'), assertV5TaskRecord(checked));
+    Object.assign(task, structuredClone(checked));
+  }, { errorCode: 'TASK_RECORD_LOCKED', errorMessage: '任务记录正在由另一个 Mercury 进程更新。' });
 }
 
 export async function isV5TaskDirectory(directory: string): Promise<boolean> {
@@ -95,19 +116,25 @@ async function stableEvents(directory: string): Promise<ExchangeEventV1[]> {
 }
 
 export async function appendV5Event(directory: string, task: TaskRecordV5, type: string, message: string, data: Record<string, unknown> = {}): Promise<ExchangeEventV1> {
-  const events = await stableEvents(directory);
-  const sequence = (events.at(-1)?.sequence ?? 0) + 1;
-  const event = assertExchangeContract('event', {
-    contract: 'mercury.event/v1', event_id: `evt-${randomBytes(8).toString('hex')}`, task_id: task.identity.task_id,
-    sequence, occurred_at: new Date().toISOString(), type, severity: type.includes('failed') || type.includes('interrupted') ? 'error' : 'info',
-    task_revision: task.identity.revision + 1, attempt_id: task.execution.attempt_id, stage: task.stage, progress: null,
-    message: message.replace(/[\r\n\u0000-\u001f]/gu, ' ').slice(0, 500), data, extensions: {},
-  });
-  await appendStableJsonLine(path.join(directory, 'events.jsonl'), event);
-  task.identity.revision += 1;
-  task.updated_at = event.occurred_at;
-  await persistV5Task(directory, task);
-  return event;
+  return withOwnedLock(path.join(directory, 'events.lock'), async () => {
+    const current = await readV5Task(directory);
+    if (current.identity.task_id !== task.identity.task_id) throw new MercuryError('TASK_RECORD_INVALID', '事件 task identity 与目录不一致。');
+    const events = await stableEvents(directory);
+    const sequence = (events.at(-1)?.sequence ?? 0) + 1;
+    const revision = Math.max(current.identity.revision, events.at(-1)?.task_revision ?? 0) + 1;
+    const event = assertExchangeContract('event', {
+      contract: 'mercury.event/v1', event_id: `evt-${randomBytes(8).toString('hex')}`, task_id: task.identity.task_id,
+      sequence, occurred_at: new Date().toISOString(), type, severity: type.includes('failed') || type.includes('interrupted') ? 'error' : 'info',
+      task_revision: revision, attempt_id: task.execution.attempt_id, stage: task.stage, progress: null,
+      message: message.replace(/[\r\n\u0000-\u001f]/gu, ' ').slice(0, 500), data, extensions: {},
+    });
+    await appendStableJsonLine(path.join(directory, 'events.jsonl'), event);
+    task.identity.revision = revision;
+    task.execution.cancel_requested_at ??= current.execution.cancel_requested_at;
+    task.updated_at = event.occurred_at;
+    await persistV5Task(directory, task);
+    return event;
+  }, { errorCode: 'EVENT_LOG_LOCKED', errorMessage: '任务事件正在由另一个 Mercury 进程追加。' });
 }
 
 function srtFromTranscript(transcript: ExchangeTranscriptV1): string {
@@ -239,22 +266,26 @@ export async function submitExchangeRequest(workspaceInput: string, raw: unknown
       return { task, replayed: true };
     }
     await writeRequest(workspace, { ...reserved.record, owner: reservation.owner, updated_at: new Date().toISOString() });
-    let task: TaskRecordV5;
-    try { task = await readV5Task(taskRoot(workspace, directoryName)); }
-    catch (error) {
-      if (error instanceof MercuryError && !['TASK_RECORD_INVALID', 'TASK_PATH_UNSAFE'].includes(error.code)) throw error;
-      task = await createTaskDirectory(workspace, request, taskId, directoryName);
-    }
+    const expectedDirectory = taskRoot(workspace, directoryName);
+    const existingDirectory = await lstat(expectedDirectory).then(() => true).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    });
+    const task = existingDirectory
+      ? await readV5Task(expectedDirectory)
+      : await createTaskDirectory(workspace, request, taskId, directoryName);
     const directory = taskRoot(workspace, directoryName);
     if ((await stableEvents(directory)).length === 0) await appendV5Event(directory, task, 'task_queued', '任务已持久化并加入本地后台队列。', { transcription_mode: 'provided', asr_call_count: 0 });
     const job: BackgroundJobV1 = { contract_version: JOB_CONTRACT_VERSION, task_id: taskId, task_directory: directoryName, state: 'queued', created_at: request.created_at, updated_at: new Date().toISOString(), claim_token: null, worker_id: null };
-    try {
-      const existing = await readJob(workspace, taskId);
-      if (existing.task_directory !== directoryName) throw new MercuryError('JOB_RECORD_INVALID', '后台 job 与 v5 task identity 不一致。');
-    } catch (error) {
-      if (!(error instanceof MercuryError) || error.code !== 'JOB_RECORD_INVALID') throw error;
-      await writeJob(workspace, job);
-    }
+    const jobPath = path.join(workspace, 'runtime', 'jobs', `${taskId}.json`);
+    const existingJob = await lstat(jobPath).then(() => true).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    });
+    if (existingJob) {
+      const current = await readJob(workspace, taskId);
+      if (current.task_directory !== directoryName) throw new MercuryError('JOB_RECORD_INVALID', '后台 job 与 v5 task identity 不一致。');
+    } else await writeJob(workspace, job);
     await writeRequest(workspace, { ...reservation, state: 'committed', owner: null, updated_at: new Date().toISOString() });
     return { task: await readV5Task(directory), replayed: false };
   });
@@ -296,8 +327,8 @@ function toLegacy(value: CalibrationResultV3): CalibrationResult {
   } as unknown as CalibrationResult;
 }
 
-function exchangeError(code: string, message: string, providerOutcome: 'not_dispatched' | 'known_terminal' | 'response_persisted' | 'outcome_unknown' | 'not_applicable', detail: string | null = null): TaskRecordV5['error'] {
-  return { contract: 'mercury.error/v1', code, category: providerOutcome === 'not_applicable' ? 'runtime' : 'provider', message: message.replace(/\s*(?:Provider detail|provider detail)=.*$/iu, '').trim(), retryability: providerOutcome === 'outcome_unknown' ? 'unsafe' : 'after_user_action', provider_outcome: providerOutcome, remediation: [providerOutcome === 'outcome_unknown' ? '不要自动重试；请查看技术证据后由用户决定。' : '检查模型配置后使用新的 request ID 创建任务。'], technical: detail ? { provider_code: null, log_id: null, detail: detail.slice(0, 2000) } : null, extensions: {} };
+function exchangeError(code: string, message: string, providerOutcome: 'not_dispatched' | 'known_terminal' | 'response_persisted' | 'outcome_unknown' | 'not_applicable', detail: string | null = null, category: 'input' | 'config' | 'provider' | 'runtime' | 'compatibility' | 'security' | 'conflict' = 'provider'): TaskRecordV5['error'] {
+  return { contract: 'mercury.error/v1', code, category, message: message.replace(/\s*(?:Provider detail|provider detail)=.*$/iu, '').trim(), retryability: providerOutcome === 'outcome_unknown' ? 'unsafe' : category === 'runtime' ? 'not_applicable' : 'after_user_action', provider_outcome: providerOutcome, remediation: [providerOutcome === 'outcome_unknown' ? '不要自动重试；请查看技术证据后由用户决定。' : category === 'runtime' ? '保留当前任务证据并检查本地文件；不要重复调用 Provider。' : '检查模型配置后使用新的 request ID 创建任务。'], technical: detail ? { provider_code: null, log_id: null, detail: detail.slice(0, 2000) } : null, extensions: {} };
 }
 
 async function writeReport(directory: string, task: TaskRecordV5, snapshot: ModelSnapshotV3, calibration: CalibrationResultV3 | null): Promise<void> {
@@ -318,6 +349,9 @@ async function writeFile0600(target: string, content: string): Promise<void> {
 export async function executeV5Task(directory: string, dependencies: ChatCalibrationV2Dependencies = {}): Promise<TaskRecordV5> {
   let task = await readV5Task(directory);
   if (task.status !== 'running') throw new MercuryError('TASK_EXECUTION_STATE_INVALID', `v5 任务状态不能执行：${task.status}`);
+  if (await sha256File(managed(directory, task.models.snapshot_path)) !== task.models.snapshot_sha256) throw new MercuryError('MODEL_SNAPSHOT_INVALID', '模型快照 hash 与任务记录不一致。');
+  if (await sha256File(managed(directory, task.dictionary_snapshot.path)) !== task.dictionary_snapshot.sha256) throw new MercuryError('DICTIONARY_RECORD_INVALID', '词典快照 hash 与任务记录不一致。');
+  if (!task.artifacts.transcript || await sha256File(managed(directory, task.artifacts.transcript.path)) !== task.artifacts.transcript.sha256) throw new MercuryError('TRANSCRIPT_IMPORT_INVALID', '规范化转录缺失或 hash 不一致。');
   const snapshot = await readStableJson(managed(directory, task.models.snapshot_path), 'MODEL_SNAPSHOT_INVALID') as ModelSnapshotV3;
   const transcript = assertExchangeContract('transcript', await readStableJson(managed(directory, task.artifacts.transcript!.path), 'TRANSCRIPT_IMPORT_INVALID'));
   const dictionarySnapshot = await readStableJson(managed(directory, task.dictionary_snapshot.path), 'DICTIONARY_RECORD_INVALID') as ResolvedDictionarySnapshot;
@@ -331,6 +365,7 @@ export async function executeV5Task(directory: string, dependencies: ChatCalibra
     if (initial.status !== 'completed' || initial.alignment === null) throw new MercuryError(initial.issues[0]?.code ?? 'ALIGNMENT_FAILED', initial.issues[0]?.message ?? '外部转录无法形成合法校验单元。');
     await writeStableJsonAtomic(path.join(directory, 'work/alignment.json'), initial.alignment);
     task.stage = 'calibrating'; task.execution.safe_checkpoint = 'chat_not_started'; task.updated_at = new Date().toISOString(); await persistV5Task(directory, task);
+    task = await readV5Task(directory);
     if (task.execution.cancel_requested_at) return cancelV5AtBoundary(directory, task);
     if (existing && ['response_persisted', 'terminal'].includes(task.execution.provider_calls.chat.state)) {
       calibration = JSON.parse(await readFile(managed(directory, existing), 'utf8')) as CalibrationResultV3;
@@ -361,14 +396,24 @@ export async function executeV5Task(directory: string, dependencies: ChatCalibra
         task.execution.provider_calls.chat = { state: certainty === 'outcome_unknown' ? 'in_flight' : 'terminal', count: task.execution.provider_calls.chat.count, outcome: certainty, evidence_ref: null };
         task.status = certainty === 'outcome_unknown' ? 'interrupted' : 'failed'; task.stage = null; task.execution.ended_at = new Date().toISOString();
         task.error = exchangeError(certainty === 'outcome_unknown' ? 'TASK_INTERRUPTED_PROVIDER_UNKNOWN' : result.failure.errors[0]!.code, result.failure.errors[0]!.message, certainty, result.failure.errors[0]!.message);
-        await writeReport(directory, task, snapshot, null); await persistV5Task(directory, task); return task;
+        await writeReport(directory, task, snapshot, null); await persistV5Task(directory, task); await writeV5Result(directory, task); return task;
       }
       calibration = result.artifact;
       await writeStableJsonAtomic(path.join(directory, 'work/calibration-result.json'), calibration);
       task = await readV5Task(directory);
       task.execution.provider_calls.chat = { state: 'response_persisted', count: 1, outcome: 'response_persisted', evidence_ref: 'work/calibration-result.json' };
       task.execution.safe_checkpoint = 'chat_response_persisted'; await persistV5Task(directory, task);
+      if (calibration.status === 'failed') {
+        const certainty = calibration.provider_outcome_certainty ?? 'known_terminal';
+        task.execution.provider_calls.chat = { state: certainty === 'outcome_unknown' ? 'in_flight' : 'terminal', count: 1, outcome: certainty === 'outcome_unknown' ? 'outcome_unknown' : 'response_persisted', evidence_ref: 'work/calibration-result.json' };
+        task.status = certainty === 'outcome_unknown' ? 'interrupted' : 'failed';
+        task.stage = null; task.execution.ended_at = new Date().toISOString();
+        const issue = calibration.errors[0]! as { code: string; message: string };
+        task.error = exchangeError(certainty === 'outcome_unknown' ? 'TASK_INTERRUPTED_PROVIDER_UNKNOWN' : issue.code, issue.message, certainty === 'outcome_unknown' ? 'outcome_unknown' : 'response_persisted', issue.message);
+        await writeReport(directory, task, snapshot, calibration); await persistV5Task(directory, task); await writeV5Result(directory, task); return task;
+      }
     }
+    task = await readV5Task(directory);
     if (task.execution.cancel_requested_at) return cancelV5AtBoundary(directory, task);
     if (!calibration || calibration.status !== 'completed') throw new MercuryError('CALIBRATION_RESULT_INVALID', 'Chat 未形成完整可用的校验正文。');
     const subtitle = runSubtitleCore({ transcript: legacy, calibrationResult: toLegacy(calibration), referenceSrtText: normalizedSrt, requestedMode: task.input_config.calibration_mode });
@@ -392,7 +437,7 @@ export async function executeV5Task(directory: string, dependencies: ChatCalibra
     if (task.execution.provider_calls.chat.state === 'in_flight') {
       task.status = 'interrupted'; task.error = exchangeError('TASK_INTERRUPTED_PROVIDER_UNKNOWN', 'Chat 请求已发送，但结果无法确认。', 'outcome_unknown', error instanceof Error ? error.message : String(error));
     } else {
-      task.status = 'failed'; task.error = exchangeError(error instanceof MercuryError ? error.code : 'TASK_PIPELINE_FAILED', error instanceof Error ? error.message : '本地处理失败。', task.execution.provider_calls.chat.outcome);
+      task.status = 'failed'; task.error = exchangeError(error instanceof MercuryError ? error.code : 'TASK_PIPELINE_FAILED', error instanceof Error ? error.message : '本地处理失败。', task.execution.provider_calls.chat.outcome, error instanceof Error ? error.message : null, 'runtime');
     }
     task.stage = null; task.execution.ended_at = new Date().toISOString(); await writeReport(directory, task, snapshot, calibration); await persistV5Task(directory, task); await writeV5Result(directory, task); return task;
   }
@@ -404,19 +449,34 @@ async function cancelV5AtBoundary(directory: string, task: TaskRecordV5): Promis
   await persistV5Task(directory, task); await writeV5Result(directory, task); return task;
 }
 
-function artifact(root: string, identity: ExchangeTaskV1['artifacts'][number]['identity'], value: TaskRecordV5['artifacts']['transcript']): ExchangeTaskV1['artifacts'][number] {
-  return { identity, exists: value !== null, path: value ? managed(root, value.path) : null, sha256: value?.sha256 ?? null, validation: value?.validation ?? 'unavailable' };
+async function artifact(root: string, identity: ExchangeTaskV1['artifacts'][number]['identity'], value: TaskRecordV5['artifacts']['transcript']): Promise<ExchangeTaskV1['artifacts'][number]> {
+  if (!value) return { identity, exists: false, path: null, sha256: null, validation: 'unavailable' };
+  const target = managed(root, value.path);
+  try {
+    const entry = await lstat(target);
+    if (!entry.isFile() || entry.isSymbolicLink()) return { identity, exists: false, path: null, sha256: null, validation: 'unavailable' };
+    const actual = await sha256File(target);
+    return { identity, exists: true, path: target, sha256: actual, validation: actual === value.sha256 ? value.validation : 'unavailable' };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { identity, exists: false, path: null, sha256: null, validation: 'unavailable' };
+    throw error;
+  }
 }
 
 export async function projectV5Task(directory: string, input?: TaskRecordV5): Promise<ExchangeTaskV1> {
   const task = input ?? await readV5Task(directory);
+  const artifacts = await Promise.all([
+    artifact(directory, 'transcript', task.artifacts.transcript), artifact(directory, 'transcribed_srt', task.artifacts.transcribed),
+    artifact(directory, 'calibrated_srt', task.artifacts.calibrated), artifact(directory, 'approved_srt', task.artifacts.approved),
+    artifact(directory, 'calibration_report', task.artifacts.report),
+  ]);
   return assertExchangeContract('task', {
     contract: 'mercury.task/v1', task_id: task.identity.task_id, request_id: task.identity.request_id, revision: task.identity.revision, created_at: task.created_at, updated_at: task.updated_at,
     status: task.status, stage: task.stage, progress: null,
     worker: { status: task.status === 'running' ? 'active' : 'inactive', heartbeat_at: task.execution.heartbeat_at },
     pause: { allowed: false, reason: '0.3.0-alpha.1 尚未提供暂停。' }, cancel: { allowed: ['queued', 'running'].includes(task.status), reason: ['queued', 'running'].includes(task.status) ? null : '当前状态不能取消。' }, retry: { allowed: false, reason: '0.3.0-alpha.1 尚未提供安全重试。' },
     attempt: { attempt_id: task.execution.attempt_id, count: task.execution.attempt_count },
-    artifacts: [artifact(directory, 'transcript', task.artifacts.transcript), artifact(directory, 'transcribed_srt', task.artifacts.transcribed), artifact(directory, 'calibrated_srt', task.artifacts.calibrated), artifact(directory, 'approved_srt', task.artifacts.approved), artifact(directory, 'calibration_report', task.artifacts.report)],
+    artifacts,
     review: task.review, error: task.error,
     next_action: task.status === 'queued' ? '任务已入队；查询不会启动 Worker。若 Worker 未运行，请显式执行 worker start。' : task.status === 'running' ? '任务正在后台处理，请稍后查询。' : task.status === 'completed' ? '校验后字幕已生成，可以开始人工审阅。' : task.status === 'interrupted' ? 'Provider 结果不确定；不要自动重试。' : task.status === 'cancelled' ? '任务已取消；纯转写字幕仍可使用。' : '按错误提示检查输入或模型配置。',
     source_schema_version: '5.0.0', capabilities: { pause: { supported: false, reason: 'Alpha.2 capability' }, resume: { supported: false, reason: 'Alpha.2 capability' }, retry: { supported: false, reason: 'Alpha.2 capability' }, review: { supported: true, reason: null }, dictionary_snapshot: { supported: true, reason: null }, provided_transcript: { supported: true, reason: null } }, extensions: {},
@@ -426,6 +486,10 @@ export async function projectV5Task(directory: string, input?: TaskRecordV5): Pr
 export async function projectV5Result(directory: string, taskInput?: TaskRecordV5): Promise<ExchangeResultV1> {
   const task = taskInput ?? await readV5Task(directory);
   const view = await projectV5Task(directory, task);
+  if (await sha256File(managed(directory, task.models.snapshot_path)) !== task.models.snapshot_sha256) throw new MercuryError('MODEL_SNAPSHOT_INVALID', '模型快照 hash 与任务记录不一致。');
+  if (await sha256File(managed(directory, task.dictionary_snapshot.path)) !== task.dictionary_snapshot.sha256) throw new MercuryError('DICTIONARY_RECORD_INVALID', '词典快照 hash 与任务记录不一致。');
+  const modelSnapshot = await readStableJson(managed(directory, task.models.snapshot_path), 'MODEL_SNAPSHOT_INVALID') as ModelSnapshotV3;
+  if (modelSnapshot.contract !== 'mercury.model-snapshot/v3' || modelSnapshot.task_id !== task.identity.task_id || modelSnapshot.models.chat.model_id !== task.models.chat) throw new MercuryError('MODEL_SNAPSHOT_INVALID', '模型快照 identity 与任务记录不一致。');
   return assertExchangeContract('result', {
     contract: 'mercury.result/v1', task_id: task.identity.task_id, status: task.status, attempt_id: task.execution.attempt_id, produced_at: task.updated_at,
     inputs: [task.inputs.media ? { kind: 'media', sha256: task.inputs.media.sha256, source: 'provided' } : null, { kind: 'transcript', sha256: task.inputs.transcript_source!.sha256, source: 'provided' }].filter(Boolean),
@@ -435,7 +499,7 @@ export async function projectV5Result(directory: string, taskInput?: TaskRecordV
       return { snapshots: task.dictionary_snapshot.resolved, conflict_count: snapshot.conflicts.length, match_count: snapshot.matched_entry_ids.length };
     })(), artifacts: view.artifacts,
     review: { status: task.review.status, pending_count: task.review.pending_count, approved: ['finalized', 'not_required'].includes(task.review.status) },
-    calls: [{ provider: 'asr', capability: 'transcription', count: 0, outcome: 'not_dispatched' }, { provider: task.models.chat, capability: 'calibration', count: task.execution.provider_calls.chat.count, outcome: task.execution.provider_calls.chat.outcome }],
+    calls: [{ provider: 'asr', capability: 'transcription', count: 0, outcome: 'not_dispatched' }, { provider: modelSnapshot.models.chat.plugin_id, capability: 'calibration', count: task.execution.provider_calls.chat.count, outcome: task.execution.provider_calls.chat.outcome }],
     warnings: task.warnings, error: task.error, next_action: view.next_action, extensions: {},
   });
 }
@@ -456,7 +520,20 @@ export async function claimV5Job(workspace: string, job: BackgroundJobV1, worker
 
 export async function finishV5Job(workspace: string, task: TaskRecordV5): Promise<void> {
   const directory = taskRoot(workspace, task.identity.task_directory);
-  await withTaskTransitionLock(directory, async () => { const current = await readV5Task(directory); if (!TERMINAL.has(current.status)) throw new MercuryError('JOB_TASK_STATE_CONFLICT', 'v5 任务尚未终结。'); const job = await readJob(workspace, current.identity.task_id); job.state = 'terminal'; job.updated_at = new Date().toISOString(); await writeJob(workspace, job); });
+  await withTaskTransitionLock(directory, async () => {
+    const current = await readV5Task(directory);
+    if (!TERMINAL.has(current.status)) throw new MercuryError('JOB_TASK_STATE_CONFLICT', 'v5 任务尚未终结。');
+    const job = await readJob(workspace, current.identity.task_id);
+    if (job.state !== 'terminal') {
+      job.state = 'terminal'; job.updated_at = new Date().toISOString(); await writeJob(workspace, job);
+      await appendStableJsonLine(path.join(directory, 'attempts.jsonl'), {
+        contract: 'mercury.attempt-result/v1', task_id: current.identity.task_id, attempt_id: current.execution.attempt_id,
+        number: current.execution.attempt_count, ended_at: current.execution.ended_at, status: current.status,
+        asr_call_count: current.execution.provider_calls.asr.count, chat_call_count: current.execution.provider_calls.chat.count,
+        safe_checkpoint: current.execution.safe_checkpoint,
+      });
+    }
+  });
 }
 
 export async function cancelV5Task(workspace: string, task: TaskRecordV5): Promise<{ task: TaskRecordV5; pending: boolean }> {
@@ -475,11 +552,14 @@ export async function auditV5Job(workspace: string, listed: BackgroundJobV1): Pr
   const directory = taskRoot(workspace, listed.task_directory);
   await withTaskTransitionLock(directory, async () => {
     const task = await readV5Task(directory); const job = await readJob(workspace, listed.task_id);
+    const eventRevision = (await stableEvents(directory)).at(-1)?.task_revision ?? 0;
+    if (eventRevision > task.identity.revision) { task.identity.revision = eventRevision; task.updated_at = new Date().toISOString(); await persistV5Task(directory, task); }
     if (TERMINAL.has(task.status)) { if (job.state !== 'terminal') { job.state = 'terminal'; job.updated_at = new Date().toISOString(); await writeJob(workspace, job); } return; }
     if (task.status === 'queued' && job.state === 'queued') return;
+    const calls = Object.values(task.execution.provider_calls);
     const call = task.execution.provider_calls.chat;
-    if (call.state === 'in_flight') {
-      task.status = 'interrupted'; task.stage = null; task.execution.ended_at = new Date().toISOString(); task.error = exchangeError('TASK_INTERRUPTED_PROVIDER_UNKNOWN', 'Worker 中断时 Chat 结果无法确认。', 'outcome_unknown'); job.state = 'terminal';
+    if (calls.some((entry) => entry.state === 'in_flight')) {
+      task.status = 'interrupted'; task.stage = null; task.execution.ended_at = new Date().toISOString(); task.error = exchangeError('TASK_INTERRUPTED_PROVIDER_UNKNOWN', 'Worker 中断时 Provider 结果无法确认。', 'outcome_unknown'); job.state = 'terminal';
     } else {
       task.status = 'queued'; task.stage = null; task.execution.started_at = null; task.execution.worker_id = null; task.execution.heartbeat_at = null; task.execution.attempt_id = null; task.execution.safe_checkpoint = call.state === 'response_persisted' ? 'chat_response_persisted' : 'queued'; job.state = 'queued'; job.worker_id = null; job.claim_token = null;
     }
@@ -498,7 +578,7 @@ export async function containV5Failure(workspace: string, listed: BackgroundJobV
     const task = await readV5Task(directory); const job = await readJob(workspace, listed.task_id);
     if (TERMINAL.has(task.status)) { job.state = 'terminal'; job.updated_at = new Date().toISOString(); await writeJob(workspace, job); return 'terminal'; }
     const call = task.execution.provider_calls.chat;
-    if (call.state === 'in_flight') { task.status = 'interrupted'; task.error = exchangeError('TASK_INTERRUPTED_PROVIDER_UNKNOWN', '后台执行异常时 Chat 结果无法确认。', 'outcome_unknown'); job.state = 'terminal'; }
+    if (Object.values(task.execution.provider_calls).some((entry) => entry.state === 'in_flight')) { task.status = 'interrupted'; task.error = exchangeError('TASK_INTERRUPTED_PROVIDER_UNKNOWN', '后台执行异常时 Provider 结果无法确认。', 'outcome_unknown'); job.state = 'terminal'; }
     else if (call.state === 'response_persisted') { task.status = 'queued'; task.stage = null; task.execution.started_at = null; task.execution.worker_id = null; task.execution.heartbeat_at = null; task.execution.attempt_id = null; job.state = 'queued'; job.worker_id = null; job.claim_token = null; }
     else { task.status = 'failed'; task.error = exchangeError(error instanceof MercuryError ? error.code : 'WORKER_JOB_FAILED_BEFORE_PROVIDER', '后台任务在 Provider 调用前遇到内部错误；未自动重试。', 'not_dispatched'); job.state = 'terminal'; }
     task.stage = null; if (task.status !== 'queued') task.execution.ended_at = new Date().toISOString(); task.updated_at = new Date().toISOString(); job.updated_at = task.updated_at; await persistV5Task(directory, task); await writeJob(workspace, job); await writeV5Result(directory, task); return task.status === 'queued' ? 'requeued' : 'terminal';

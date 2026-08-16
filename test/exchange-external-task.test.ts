@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { ensureWorkspace } from '../src/workspace.js';
 import { loadModelRegistryV2 } from '../src/models-v2.js';
 import { runWorker } from '../src/background/worker.js';
-import { readV5Task, submitExchangeRequest } from '../src/exchange/runtime.js';
+import { appendV5Event, readV5Events, readV5Task, submitExchangeRequest } from '../src/exchange/runtime.js';
 import { findTaskReadOnly, stableTaskResult, stableTaskView } from '../src/stable-cli/tasks.js';
 import { createDictionary, makeDictionaryEntry, mutateDictionary } from '../src/dictionary.js';
 
@@ -81,6 +81,15 @@ describe('Exchange v1 external transcript task', () => {
     expect(result.dictionaries).toMatchObject({ match_count: 1, conflict_count: 0, snapshots: [expect.objectContaining({ revision: dictionaryV2.revision })] });
     expect(result.artifacts.find((entry) => entry.identity === 'transcribed_srt')).toMatchObject({ exists: true, validation: 'passed' });
     expect(result.artifacts.find((entry) => entry.identity === 'calibrated_srt')).toMatchObject({ exists: true, validation: 'passed' });
+    const attempts = (await readFile(path.join(directory, 'attempts.jsonl'), 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    expect(attempts).toEqual([
+      expect.objectContaining({ contract: 'mercury.attempt/v1', asr_call_count: 0 }),
+      expect.objectContaining({ contract: 'mercury.attempt-result/v1', status: 'completed', asr_call_count: 0, chat_call_count: 1 }),
+    ]);
+
+    await writeFile(path.join(directory, completed.artifacts.calibrated!.path), 'tampered\n');
+    const tampered = await stableTaskView(input.workspace, await findTaskReadOnly(input.workspace, completed.identity.task_id));
+    expect(tampered.artifacts.find((entry) => entry.identity === 'calibrated_srt')).toMatchObject({ exists: true, validation: 'unavailable' });
   });
 
   it('retains transcribed output and never publishes calibrated output when Chat fails deterministically', async () => {
@@ -94,6 +103,21 @@ describe('Exchange v1 external transcript task', () => {
     expect(task.artifacts.calibrated).toBeNull();
     expect(task.execution.provider_calls.asr.count).toBe(0);
     expect(task.execution.provider_calls.chat.count).toBe(1);
+    const result = JSON.parse(await readFile(path.join(input.workspace, 'tasks', submitted.task.identity.task_directory, 'result.json'), 'utf8'));
+    expect(result.status).toBe('failed');
+    expect(result.artifacts.find((entry: { identity: string }) => entry.identity === 'transcribed_srt')).toMatchObject({ exists: true, validation: 'passed' });
+  });
+
+  it('serializes concurrent event appends with continuous sequence and task revision', async () => {
+    const input = await prepared();
+    input.request.request_id = 'request-event-concurrency';
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    await Promise.all(Array.from({ length: 20 }, (_, index) => appendV5Event(directory, structuredClone(submitted.task), 'fixture_event', `fixture ${index}`)));
+    const events = await readV5Events(directory);
+    expect(events.map((event) => event.sequence)).toEqual(Array.from({ length: 21 }, (_, index) => index + 1));
+    expect(new Set(events.map((event) => event.task_revision)).size).toBe(21);
+    expect((await readV5Task(directory)).identity.revision).toBe(events.at(-1)!.task_revision);
   });
 
   it('rejects request hash mismatch before creating a task or dispatching a provider', async () => {
