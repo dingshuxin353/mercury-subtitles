@@ -30,6 +30,7 @@ import {
   readV5Task,
 } from '../exchange/runtime.js';
 import type { TaskRecordV5 } from '../contracts/generated/task-record-v5.js';
+import { finalizeV5Review, initializeV5Review } from '../review-v5.js';
 
 const HEARTBEAT_INTERVAL_MS = 2_000;
 export const WORKER_STALE_AFTER_MS = 15_000;
@@ -116,6 +117,11 @@ export async function auditInterruptedTasks(workspaceRoot: string): Promise<Set<
       const directory = taskDirectoryForJob(workspaceRoot, listedJob);
       if (await isV5TaskDirectory(directory)) {
         await auditV5Job(workspaceRoot, listedJob);
+        const audited = await readV5Task(directory);
+        if (audited.status === 'completed') {
+          const review = await initializeV5Review(directory);
+          if (review.status === 'not_required') await finalizeV5Review(directory);
+        }
         continue;
       }
       await withTaskTransitionLock(directory, async () => {
@@ -624,7 +630,13 @@ export async function runWorker(
           let finalTask = await executeV5Task(directory, dependencies);
           await heartbeatChain;
           if (heartbeatError) throw heartbeatError;
+          if (finalTask.status === 'completed') {
+            const review = await initializeV5Review(directory);
+            if (review.status === 'not_required') await finalizeV5Review(directory);
+            finalTask = await readV5Task(directory);
+          }
           await appendV5Event(directory, finalTask, finalTask.status === 'completed' ? 'task_completed' : finalTask.status === 'cancelled' ? 'task_cancelled' : finalTask.status === 'interrupted' ? 'task_interrupted' : 'task_failed', finalTask.status === 'completed' ? '后台任务处理完成。' : '后台任务已结束，请查看状态和下一步。');
+          if (finalTask.status === 'completed') await appendV5Event(directory, finalTask, 'review_ready', finalTask.review.status === 'finalized' ? '校验结果无需逐项决定，人工批准稿已生成。' : 'AI 校验已完成，可以开始人工审阅。');
           finalTask = await readV5Task(directory);
           await finishV5Job(workspaceRoot, finalTask);
           worker.state = 'idle';

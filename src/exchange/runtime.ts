@@ -418,6 +418,18 @@ export async function executeV5Task(directory: string, dependencies: ChatCalibra
     if (!calibration || calibration.status !== 'completed') throw new MercuryError('CALIBRATION_RESULT_INVALID', 'Chat 未形成完整可用的校验正文。');
     const subtitle = runSubtitleCore({ transcript: legacy, calibrationResult: toLegacy(calibration), referenceSrtText: normalizedSrt, requestedMode: task.input_config.calibration_mode });
     if (subtitle.status !== 'completed') throw new MercuryError(subtitle.issues[0]?.code ?? 'SUBTITLE_CORE_FAILED', subtitle.issues[0]?.message ?? '字幕规则应用失败。');
+    for (const modification of subtitle.artifact.modifications.filter((entry) => entry.applied)) {
+      const reference = modification.evidence.calibration_suggestion_ref;
+      if (!reference) continue;
+      const suggestion = calibration.suggestions.find((entry) => entry.suggestion_id === reference);
+      if (suggestion) {
+        suggestion.disposition = 'applied';
+        suggestion.disposition_reason = 'accepted_by_rules';
+        suggestion.modification_refs = [modification.modification_id];
+      }
+    }
+    await writeStableJsonAtomic(path.join(directory, 'work/calibration-result.json'), calibration);
+    await writeStableJsonAtomic(path.join(directory, 'work/transcript.calibrated.json'), subtitle.artifact);
     const stem = path.basename(task.artifacts.transcribed!.path).replace(/\.transcribed\.srt$/u, '');
     const calibratedRelative = `output/${stem}.calibrated.srt`;
     await writeFile0600(path.join(directory, calibratedRelative), serializeCalibratedSrt(subtitle.artifact));
@@ -465,9 +477,20 @@ async function artifact(root: string, identity: ExchangeTaskV1['artifacts'][numb
 
 export async function projectV5Task(directory: string, input?: TaskRecordV5): Promise<ExchangeTaskV1> {
   const task = input ?? await readV5Task(directory);
+  let review = task.review;
+  let approved = task.artifacts.approved;
+  const reviewExists = await lstat(path.join(directory, 'review.json')).then((entry) => entry.isFile() && !entry.isSymbolicLink()).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  });
+  if (reviewExists) {
+    const verified = await (await import('../review-v5.js')).readVerifiedV5Review(directory);
+    review = { status: verified.status === 'approved' ? 'finalized' : verified.status === 'not_required' ? 'not_required' : verified.counts.pending === verified.counts.total ? 'pending' : 'in_progress', pending_count: verified.counts.pending };
+    approved = verified.approved_artifact ? { path: verified.approved_artifact.path, sha256: verified.approved_artifact.sha256, validation: 'passed' } : null;
+  }
   const artifacts = await Promise.all([
     artifact(directory, 'transcript', task.artifacts.transcript), artifact(directory, 'transcribed_srt', task.artifacts.transcribed),
-    artifact(directory, 'calibrated_srt', task.artifacts.calibrated), artifact(directory, 'approved_srt', task.artifacts.approved),
+    artifact(directory, 'calibrated_srt', task.artifacts.calibrated), artifact(directory, 'approved_srt', approved),
     artifact(directory, 'calibration_report', task.artifacts.report),
   ]);
   return assertExchangeContract('task', {
@@ -477,8 +500,8 @@ export async function projectV5Task(directory: string, input?: TaskRecordV5): Pr
     pause: { allowed: false, reason: '0.3.0-alpha.1 尚未提供暂停。' }, cancel: { allowed: ['queued', 'running'].includes(task.status), reason: ['queued', 'running'].includes(task.status) ? null : '当前状态不能取消。' }, retry: { allowed: false, reason: '0.3.0-alpha.1 尚未提供安全重试。' },
     attempt: { attempt_id: task.execution.attempt_id, count: task.execution.attempt_count },
     artifacts,
-    review: task.review, error: task.error,
-    next_action: task.status === 'queued' ? '任务已入队；查询不会启动 Worker。若 Worker 未运行，请显式执行 worker start。' : task.status === 'running' ? '任务正在后台处理，请稍后查询。' : task.status === 'completed' ? '校验后字幕已生成，可以开始人工审阅。' : task.status === 'interrupted' ? 'Provider 结果不确定；不要自动重试。' : task.status === 'cancelled' ? '任务已取消；纯转写字幕仍可使用。' : '按错误提示检查输入或模型配置。',
+    review, error: task.error,
+    next_action: task.status === 'queued' ? '任务已入队；查询不会启动 Worker。若 Worker 未运行，请显式执行 worker start。' : task.status === 'running' ? '任务正在后台处理，请稍后查询。' : task.status === 'completed' && ['finalized', 'not_required'].includes(review.status) ? '人工批准稿已生成，可以直接打开批准后字幕。' : task.status === 'completed' ? `校验后字幕已生成，还有 ${review.pending_count ?? 0} 项修改待人工审阅。` : task.status === 'interrupted' ? 'Provider 结果不确定；不要自动重试。' : task.status === 'cancelled' ? '任务已取消；纯转写字幕仍可使用。' : '按错误提示检查输入或模型配置。',
     source_schema_version: '5.0.0', capabilities: { pause: { supported: false, reason: 'Alpha.2 capability' }, resume: { supported: false, reason: 'Alpha.2 capability' }, retry: { supported: false, reason: 'Alpha.2 capability' }, review: { supported: true, reason: null }, dictionary_snapshot: { supported: true, reason: null }, provided_transcript: { supported: true, reason: null } }, extensions: {},
   });
 }
@@ -498,7 +521,7 @@ export async function projectV5Result(directory: string, taskInput?: TaskRecordV
       const snapshot = await readStableJson(managed(directory, task.dictionary_snapshot.path), 'DICTIONARY_RECORD_INVALID') as ResolvedDictionarySnapshot;
       return { snapshots: task.dictionary_snapshot.resolved, conflict_count: snapshot.conflicts.length, match_count: snapshot.matched_entry_ids.length };
     })(), artifacts: view.artifacts,
-    review: { status: task.review.status, pending_count: task.review.pending_count, approved: ['finalized', 'not_required'].includes(task.review.status) },
+    review: { status: view.review.status, pending_count: view.review.pending_count, approved: ['finalized', 'not_required'].includes(view.review.status) },
     calls: [{ provider: 'asr', capability: 'transcription', count: 0, outcome: 'not_dispatched' }, { provider: modelSnapshot.models.chat.plugin_id, capability: 'calibration', count: task.execution.provider_calls.chat.count, outcome: task.execution.provider_calls.chat.outcome }],
     warnings: task.warnings, error: task.error, next_action: view.next_action, extensions: {},
   });

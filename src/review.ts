@@ -23,7 +23,7 @@ function taskPath(root: string, relative: string): string {
   return target;
 }
 
-function flat(value: string): string {
+export function flatReviewText(value: string): string {
   const lines = value.replace(/\r\n?/gu, '\n').split('\n').map((line) => line.trim()).filter(Boolean);
   return lines.reduce((combined, line) => {
     if (!combined) return line;
@@ -32,7 +32,7 @@ function flat(value: string): string {
   }, '').trim();
 }
 
-function counts(changes: ReviewRecordV1['changes']): ReviewRecordV1['counts'] {
+export function reviewCounts(changes: ReviewRecordV1['changes']): ReviewRecordV1['counts'] {
   return {
     total: changes.length,
     pending: changes.filter((item) => item.decision === 'pending').length,
@@ -42,7 +42,7 @@ function counts(changes: ReviewRecordV1['changes']): ReviewRecordV1['counts'] {
   };
 }
 
-function statusFor(record: ReviewRecordV1): ReviewRecordV1['status'] {
+export function reviewStatusFor(record: ReviewRecordV1): ReviewRecordV1['status'] {
   if (record.changes.length === 0) return 'not_required';
   if (record.counts.pending === record.counts.total) return 'pending';
   if (record.counts.pending > 0) return 'in_progress';
@@ -73,7 +73,7 @@ export async function readReview(taskDirectory: string): Promise<ReviewRecordV1>
   }
 }
 
-async function writeReview(taskDirectory: string, record: ReviewRecordV1): Promise<void> {
+export async function writeReviewRecord(taskDirectory: string, record: ReviewRecordV1): Promise<void> {
   assertV4Contract('review', record);
   const target = taskPath(taskDirectory, 'review.json');
   await writeJsonAtomic(target, record);
@@ -109,21 +109,21 @@ function occurrences(source: string, needle: string): number[] {
   return result;
 }
 
-function authoritativeChanges(
-  task: TaskRecordV2,
+export function authoritativeReviewChanges(
+  taskId: string,
   calibration: CalibrationResultV3,
   calibrated: CalibratedTranscript,
 ): ReviewRecordV1['changes'] {
   const segmentIndex = new Map(calibrated.segments.map((segment) => [segment.subtitle_segment_id, segment.index]));
   const modificationById = new Map(calibrated.modifications.map((item) => [item.modification_id, item]));
   const suggestionByText = new Map(
-    calibration.suggestions.map((item) => [`${item.start_ms}:${item.end_ms}:${flat(item.original_text)}:${flat(item.suggested_text ?? '')}`, item]),
+    calibration.suggestions.map((item) => [`${item.start_ms}:${item.end_ms}:${flatReviewText(item.original_text)}:${flatReviewText(item.suggested_text ?? '')}`, item]),
   );
   const occupied = new Map<string, Array<{ start: number; end: number }>>();
   const changes: ReviewRecordV1['changes'] = [];
   for (const unit of calibration.corrected_units.filter((item) => item.changed)) {
-    const originalText = flat(unit.original_text);
-    const proposedText = flat(unit.corrected_text);
+    const originalText = flatReviewText(unit.original_text);
+    const proposedText = flatReviewText(unit.corrected_text);
     const suggestion = suggestionByText.get(`${unit.start_ms}:${unit.end_ms}:${originalText}:${proposedText}`);
     if (!suggestion || suggestion.disposition !== 'applied' || suggestion.modification_refs.length === 0) {
       throw new MercuryError('REVIEW_MAPPING_INVALID', `校验单元 ${unit.unit_id} 缺少已验证的应用映射。`);
@@ -138,7 +138,7 @@ function authoritativeChanges(
     }
     const targetIndexes = (indexes as [number, ...number[]]).sort((a, b) => a - b) as [number, ...number[]];
     const key = targetIndexes.join(',');
-    const targetText = flat(targetIndexes.map((index) => calibrated.segments[index]!.text).join(''));
+    const targetText = flatReviewText(targetIndexes.map((index) => calibrated.segments[index]!.text).join(''));
     const used = occupied.get(key) ?? [];
     const start = occurrences(targetText, proposedText).find((candidate) =>
       !used.some((range) => candidate < range.end && candidate + proposedText.length > range.start),
@@ -149,7 +149,7 @@ function authoritativeChanges(
     used.push({ start, end: start + proposedText.length });
     occupied.set(key, used);
     const digest = createHash('sha256')
-      .update(`${task.task_id}:${unit.unit_id}:${targetIndexes.join(',')}:${start}:${originalText}:${proposedText}`)
+      .update(`${taskId}:${unit.unit_id}:${targetIndexes.join(',')}:${start}:${originalText}:${proposedText}`)
       .digest('hex')
       .slice(0, 16);
     changes.push({
@@ -205,10 +205,10 @@ export async function initializeReview(taskDirectory: string, now = () => new Da
       || calibratedArtifact.segments.some((segment, index) =>
         segment.start_ms !== calibrated.segments[index]!.start_ms
         || segment.end_ms !== calibrated.segments[index]!.end_ms
-        || flat(segment.text) !== flat(calibrated.segments[index]!.text),
+        || flatReviewText(segment.text) !== flatReviewText(calibrated.segments[index]!.text),
       )
     ) throw new MercuryError('REVIEW_SOURCE_INVALID', '校验后 transcript 与 calibrated.srt 不一致。');
-    const changes = authoritativeChanges(task, calibrationValidation.value, calibratedArtifact);
+    const changes = authoritativeReviewChanges(task.task_id, calibrationValidation.value, calibratedArtifact);
     const at = now().toISOString();
     const record: ReviewRecordV1 = {
       contract_version: 'mercury-review-experimental-v1',
@@ -223,12 +223,12 @@ export async function initializeReview(taskDirectory: string, now = () => new Da
         transcribed_srt: { path: transcribedRelative, sha256: await sha256File(transcribedPath) },
         calibrated_srt: { path: calibratedRelative, sha256: await sha256File(calibratedPath) },
       },
-      counts: counts(changes),
+      counts: reviewCounts(changes),
       changes,
       batches: [],
       approved_artifact: null,
     };
-    await writeReview(root, record);
+    await writeReviewRecord(root, record);
     task.artifacts.review = { path: 'review.json', status: record.status, pending_count: record.counts.pending };
     await persistTaskRecordV2(root, task);
     return record;
@@ -345,11 +345,11 @@ export async function decideReviewChange(
     change.decided_at = at;
     change.actor = input.actor;
     change.history.push({ decision: input.decision, final_text: finalText, decided_at: at, actor: input.actor });
-    review.counts = counts(review.changes);
+    review.counts = reviewCounts(review.changes);
     review.approved_artifact = null;
     review.updated_at = at;
-    review.status = statusFor(review);
-    await writeReview(root, review);
+    review.status = reviewStatusFor(review);
+    await writeReviewRecord(root, review);
     task.artifacts.review = { path: 'review.json', status: review.status, pending_count: review.counts.pending };
     if (task.artifacts.subtitles) task.artifacts.subtitles.approved = null;
     const approvedRelative = `output/${safeAudioStem(task.inputs.audio.original_name)}.approved.srt`;
@@ -377,10 +377,10 @@ export async function acceptAllReviewChanges(
       change.history.push({ decision: 'accepted', final_text: change.proposed_text, decided_at: at, actor: input.actor });
     }
     review.batches.push({ batch_id: `batch-${randomBytes(8).toString('hex')}`, operation: 'accept_all', count: input.confirmCount, occurred_at: at, actor: input.actor });
-    review.counts = counts(review.changes);
+    review.counts = reviewCounts(review.changes);
     review.updated_at = at;
-    review.status = statusFor(review);
-    await writeReview(root, review);
+    review.status = reviewStatusFor(review);
+    await writeReviewRecord(root, review);
     task.artifacts.review = { path: 'review.json', status: review.status, pending_count: review.counts.pending };
     await persistTaskRecordV2(root, task);
     return review;
@@ -417,11 +417,11 @@ function remapBoundary(
   return boundary + delta;
 }
 
-function applyReviewDecisions(
+export function applyReviewDecisions(
   segments: CalibratedSubtitleSegment[],
   changes: ReviewRecordV1['changes'],
 ): CalibratedSubtitleSegment[] {
-  const result = segments.map((segment) => ({ ...segment, text: flat(segment.text) }));
+  const result = segments.map((segment) => ({ ...segment, text: flatReviewText(segment.text) }));
   const groups: Array<{
     indexes: Set<number>;
     changes: ReviewRecordV1['changes'];
@@ -452,7 +452,7 @@ function applyReviewDecisions(
     if (indexes.some((index) => !Number.isSafeInteger(index) || !result[index])) {
       throw new MercuryError('REVIEW_MAPPING_INVALID', '审阅修改引用了不存在的输出片段。');
     }
-    const pieces = indexes.map((index) => flat(result[index]!.text));
+    const pieces = indexes.map((index) => flatReviewText(result[index]!.text));
     const original = pieces.join('');
     const componentPosition = new Map(indexes.map((index, position) => [index, position]));
     const componentOffsets: number[] = [];
@@ -553,7 +553,7 @@ export async function finalizeReview(taskDirectory: string, now = () => new Date
         index,
         start_ms: segment.start_ms,
         end_ms: segment.end_ms,
-        text: flat(segment.text),
+        text: flatReviewText(segment.text),
         confidence: 'high' as const,
         asr_segment_refs: [],
         reference_segment_refs: [],
@@ -600,7 +600,7 @@ export async function finalizeReview(taskDirectory: string, now = () => new Date
     review.approved_artifact = { path: relative, sha256: await sha256File(target), segment_count: expected.length, generated_at: at, validation: 'passed' };
     review.updated_at = at;
     review.status = review.changes.length ? 'approved' : 'not_required';
-    await writeReview(root, review);
+    await writeReviewRecord(root, review);
     task.artifacts.outputs = [...new Set([...task.artifacts.outputs, relative])];
     task.artifacts.review = { path: 'review.json', status: review.status, pending_count: 0 };
     if (task.artifacts.subtitles) task.artifacts.subtitles.approved = { path: relative, purpose: 'approved_result', sha256: review.approved_artifact.sha256, segment_count: expected.length, validation: 'passed' };

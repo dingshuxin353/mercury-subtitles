@@ -9,6 +9,7 @@ import { runWorker } from '../src/background/worker.js';
 import { appendV5Event, readV5Events, readV5Task, submitExchangeRequest } from '../src/exchange/runtime.js';
 import { findTaskReadOnly, stableTaskResult, stableTaskView } from '../src/stable-cli/tasks.js';
 import { createDictionary, makeDictionaryEntry, mutateDictionary } from '../src/dictionary.js';
+import { runCli } from '../src/cli.js';
 
 function sha(value: Buffer | string) { return createHash('sha256').update(value).digest('hex'); }
 
@@ -31,14 +32,14 @@ async function prepared() {
   return { home, workspace, source, request };
 }
 
-function fixtureFetch(calls: string[], captured: Array<Record<string, any>> = []) {
+function fixtureFetch(calls: string[], captured: Array<Record<string, any>> = [], correct?: (text: string, index: number) => string) {
   return vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
     calls.push('chat');
     const request = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
     captured.push(request as unknown as Record<string, any>);
     const prompt = request.messages.find((message) => message.role === 'user')!.content;
     const payload = JSON.parse(prompt.slice(prompt.lastIndexOf('\n') + 1)) as { calibration_units: Array<{ unit_id: string; original_text: string }> };
-    const content = JSON.stringify({ corrected_units: payload.calibration_units.map((unit) => ({ unit_id: unit.unit_id, corrected_text: unit.original_text, rationale: null })) });
+    const content = JSON.stringify({ corrected_units: payload.calibration_units.map((unit, index) => ({ unit_id: unit.unit_id, corrected_text: correct?.(unit.original_text, index) ?? unit.original_text, rationale: correct && index === 0 ? 'fixture correction' : null })) });
     return new Response(`data: ${JSON.stringify({ id: 'fixture-chat', choices: [{ delta: { content }, finish_reason: null }] })}\n\ndata: ${JSON.stringify({ id: 'fixture-chat', choices: [{ delta: {}, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
   });
 }
@@ -87,9 +88,9 @@ describe('Exchange v1 external transcript task', () => {
       expect.objectContaining({ contract: 'mercury.attempt-result/v1', status: 'completed', asr_call_count: 0, chat_call_count: 1 }),
     ]);
 
-    await writeFile(path.join(directory, completed.artifacts.calibrated!.path), 'tampered\n');
+    await writeFile(path.join(directory, completed.artifacts.report!.path), 'tampered\n');
     const tampered = await stableTaskView(input.workspace, await findTaskReadOnly(input.workspace, completed.identity.task_id));
-    expect(tampered.artifacts.find((entry) => entry.identity === 'calibrated_srt')).toMatchObject({ exists: true, validation: 'unavailable' });
+    expect(tampered.artifacts.find((entry) => entry.identity === 'calibration_report')).toMatchObject({ exists: true, validation: 'unavailable' });
   });
 
   it('retains transcribed output and never publishes calibrated output when Chat fails deterministically', async () => {
@@ -120,6 +121,30 @@ describe('Exchange v1 external transcript task', () => {
     expect((await readV5Task(directory)).identity.revision).toBe(events.at(-1)!.task_revision);
   });
 
+  it('keeps v5 tasks on the existing review flow and finalizes an approved SRT without changing time', async () => {
+    const input = await prepared();
+    input.request.request_id = 'request-v5-review';
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    await runWorker(input.workspace, { fetch: fixtureFetch([], [], (text, index) => index === 0 ? text.replace('您好', '你好') : text), readCredential: async () => 'fixture-secret' });
+    const taskId = submitted.task.identity.task_id;
+    const statusOut: string[] = [];
+    const io = { homeDirectory: input.home, stdout: (value: string) => statusOut.push(value), stderr: () => undefined };
+    expect(await runCli(['review', 'status', taskId, '--json'], io), statusOut.join('')).toBe(0);
+    const status = JSON.parse(statusOut.at(-1)!);
+    expect(status.data).toMatchObject({ task_id: taskId, status: 'pending', counts: { pending: 1 } });
+    const listOut: string[] = [];
+    expect(await runCli(['review', 'list', taskId, '--limit', '10', '--json'], { ...io, stdout: (value) => listOut.push(value) })).toBe(0);
+    const change = JSON.parse(listOut[0]!).data.changes[0];
+    const before = parseSrt(await readFile(path.join(input.workspace, 'tasks', submitted.task.identity.task_directory, submitted.task.artifacts.transcribed!.path), 'utf8'));
+    expect(await runCli(['review', 'decide', taskId, '--change', change.change_id, '--accept', '--json'], { ...io, stdout: () => undefined })).toBe(0);
+    const finalized: string[] = [];
+    expect(await runCli(['review', 'finalize', taskId, '--json'], { ...io, stdout: (value) => finalized.push(value) })).toBe(0);
+    const approvedPath = JSON.parse(finalized[0]!).data.approved_artifact.absolute_path;
+    const after = parseSrt(await readFile(approvedPath, 'utf8'));
+    expect(after.map(({ start, end }) => ({ start, end }))).toEqual(before.map(({ start, end }) => ({ start, end })));
+    expect((await readV5Task(path.dirname(path.dirname(approvedPath)))).review.status).toBe('finalized');
+  });
+
   it('rejects request hash mismatch before creating a task or dispatching a provider', async () => {
     const input = await prepared();
     input.request.inputs.transcript.sha256 = '0'.repeat(64);
@@ -128,3 +153,7 @@ describe('Exchange v1 external transcript task', () => {
     expect(tasks).toHaveLength(0);
   });
 });
+
+function parseSrt(source: string): Array<{ start: string; end: string }> {
+  return [...source.matchAll(/^(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})$/gmu)].map((match) => ({ start: match[1]!, end: match[2]! }));
+}

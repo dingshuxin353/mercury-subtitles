@@ -85,6 +85,20 @@ describe('stable CLI v1 protocol and configuration', () => {
     expect(JSON.parse(output.stdout[0]!)).toMatchObject({ contract: 'mercury.cli/v1', command: 'protocol.version', ok: false, data: null, error: { contract: 'mercury.error/v1', code: 'CLI_ARGUMENT_INVALID' } });
   });
 
+  it('rejects a transcript request without an explicit role before creating workspace state', async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), 'mercury-stable-role-'));
+    const requestPath = path.join(home, 'request.json');
+    await writeFile(requestPath, `${JSON.stringify({
+      contract: 'mercury.exchange.request/v1', request_id: 'request-role-missing', created_at: '2026-08-16T12:00:00.000Z', operation: 'subtitle_calibration',
+      inputs: { media: null, transcript: { path: '/tmp/input.srt', sha256: 'a'.repeat(64), format: 'srt' } }, transcription_mode: 'provided',
+      calibration: { mode: 'text-only', source_language: 'zh-CN' }, models: { asr: null, chat: 'chat-default' }, dictionaries: { project_key: null, selected: [], task_overrides: [] }, output: { formats: ['srt'], workspace_policy: 'managed' }, extensions: {},
+    })}\n`);
+    const output = capture(home);
+    expect(await runCli(['task', 'submit', '--request', requestPath, '--json'], output.io)).toBe(2);
+    expect(JSON.parse(output.stdout[0]!)).toMatchObject({ contract: 'mercury.cli/v1', ok: false, error: { code: 'TRANSCRIPT_ROLE_REQUIRED' } });
+    await expect(lstat(path.join(home, 'mercury-workspace'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('places stable commands before deprecated commands in help', async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), 'mercury-stable-help-'));
     const output = capture(home);
