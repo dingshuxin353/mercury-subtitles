@@ -30,6 +30,7 @@ import {
   readV5Task,
   SimulatedV5Crash,
   type V5FaultPoint,
+  type ExchangeRuntimeDependencies,
   writeV5Result,
 } from '../exchange/runtime.js';
 import type { TaskRecordV5 } from '../contracts/generated/task-record-v5.js';
@@ -535,7 +536,7 @@ async function heartbeatWorkerAndTask(
 
 export async function runWorker(
   workspaceRoot: string,
-  dependencies: CoreIntegrationV2Dependencies = {},
+  dependencies: CoreIntegrationV2Dependencies & ExchangeRuntimeDependencies = {},
   options: {
     idleExitMs?: number;
     now?: () => Date;

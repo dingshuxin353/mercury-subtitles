@@ -11,7 +11,7 @@ export interface ExchangeRequestV1 {
     media: null | {
       path: string;
       sha256: string;
-      mime_type: string;
+      mime_type: 'audio/mpeg';
     };
     transcript: null | {
       path: string;

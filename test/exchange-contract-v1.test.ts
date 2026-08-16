@@ -167,6 +167,10 @@ describe('Exchange Protocol v1 contracts', () => {
         reference: null,
         reference_normalized: null,
       },
+      calibration_sources: {
+        transcript: { path: 'work/transcript.raw.json', sha256: hash, validation: 'passed' },
+        reference: { path: 'input/reference.srt', sha256: hash, validation: 'passed' },
+      },
       models: { asr: null, chat: 'chat-default', snapshot_path: 'work/model-snapshot.json', snapshot_sha256: hash },
       dictionary_snapshot: { path: 'work/dictionary-snapshot.json', sha256: hash, resolved: [] },
       execution: {

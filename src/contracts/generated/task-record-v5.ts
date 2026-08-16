@@ -28,6 +28,10 @@ export interface TaskRecordV5 {
     reference: null | TranscriptInput;
     reference_normalized: null | InternalArtifact;
   };
+  calibration_sources: {
+    transcript: null | InternalArtifact;
+    reference: null | InternalArtifact;
+  };
   models: {
     asr: string | null;
     chat: string;
@@ -92,7 +96,7 @@ export interface Input {
   workspace_path: string;
   sha256: string;
   bytes: number;
-  mime_type: string;
+  mime_type: 'audio/mpeg';
 }
 /**
  * This interface was referenced by `TaskRecordV5`'s JSON-Schema

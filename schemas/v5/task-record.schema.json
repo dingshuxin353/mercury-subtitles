@@ -4,7 +4,7 @@
   "title": "TaskRecordV5",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "identity", "created_at", "updated_at", "status", "stage", "input_config", "inputs", "models", "dictionary_snapshot", "execution", "artifacts", "review", "warnings", "error"],
+  "required": ["schema_version", "identity", "created_at", "updated_at", "status", "stage", "input_config", "inputs", "calibration_sources", "models", "dictionary_snapshot", "execution", "artifacts", "review", "warnings", "error"],
   "properties": {
     "schema_version": { "const": "5.0.0" },
     "identity": {
@@ -40,6 +40,14 @@
         "transcript_source": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/transcriptInput" }] },
         "reference": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/transcriptInput" }] },
         "reference_normalized": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/internalArtifact" }] }
+      }
+    },
+    "calibration_sources": {
+      "type": "object", "additionalProperties": false,
+      "required": ["transcript", "reference"],
+      "properties": {
+        "transcript": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/internalArtifact" }] },
+        "reference": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/internalArtifact" }] }
       }
     },
     "models": {
@@ -112,7 +120,7 @@
         "workspace_path": { "$ref": "../exchange/v1/common.schema.json#/$defs/taskRelativePath" },
         "sha256": { "$ref": "../exchange/v1/common.schema.json#/$defs/sha256" },
         "bytes": { "type": "integer", "minimum": 1 },
-        "mime_type": { "type": "string", "minLength": 3, "maxLength": 100 }
+        "mime_type": { "const": "audio/mpeg" }
       }
     },
     "transcriptInput": {

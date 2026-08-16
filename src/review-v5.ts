@@ -20,7 +20,7 @@ import {
 import { parseReferenceSrt, type CalibratedSubtitleSegment, type CalibratedTranscript } from './subtitle-core/index.js';
 import { sha256File } from './tasks.js';
 import { withOwnedLock } from './background/owned-lock.js';
-import { persistV5Task, readV5Task, writeV5Result } from './exchange/runtime.js';
+import { persistV5Task, readV5Task, verifyV5CalibrationSources, writeV5Result } from './exchange/runtime.js';
 
 function managed(root: string, relative: string): string {
   const target = path.resolve(root, relative);
@@ -75,6 +75,7 @@ export async function initializeV5Review(taskDirectory: string, now = () => new 
   return withLock(root, async () => {
     const task = await readV5Task(root);
     if (task.status !== 'completed' || !task.artifacts.transcribed || !task.artifacts.calibrated) throw new MercuryError('REVIEW_NOT_READY', '只有已完成且具有两份字幕的任务可以进入人工审阅。');
+    await verifyV5CalibrationSources(root, task);
     try { return await readReview(root); } catch (error) { if (!(error instanceof MercuryError) || error.code !== 'REVIEW_NOT_READY') throw error; }
     const transcribedPath = managed(root, task.artifacts.transcribed.path);
     const calibratedPath = managed(root, task.artifacts.calibrated.path);
@@ -106,6 +107,7 @@ export async function initializeV5Review(taskDirectory: string, now = () => new 
 
 export async function readVerifiedV5Review(root: string): Promise<ReviewRecordV1> {
   const task = await readV5Task(root);
+  await verifyV5CalibrationSources(root, task);
   const review = await readReview(root);
   if (review.task_id !== task.identity.task_id) throw new MercuryError('REVIEW_RECORD_INVALID', '审阅记录 identity 与任务不一致。');
   const sources = [

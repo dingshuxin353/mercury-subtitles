@@ -43,6 +43,8 @@ export interface ChatCalibrationV2Input {
   nonStrongReason: NonStrongReason | null;
   audio: null | {
     sourcePath: string;
+    /** A caller may pin already-verified bytes so request construction never re-opens the path. */
+    verifiedBytes?: Buffer;
     pathRef: string;
     sha256: string;
     bytes: number;
@@ -1154,7 +1156,7 @@ export class GeminiChatCalibrationRuntimeV2
         if (input.audio) {
           parts.push({
             type: 'audio',
-            data: (await readFile(input.audio.sourcePath)).toString('base64'),
+            data: (input.audio.verifiedBytes ?? await readFile(input.audio.sourcePath)).toString('base64'),
             mime_type: 'audio/mpeg',
           });
         }
@@ -1174,7 +1176,7 @@ export class GeminiChatCalibrationRuntimeV2
         if (input.audio) {
           parts.push({
             inlineData: {
-              data: (await readFile(input.audio.sourcePath)).toString('base64'),
+              data: (input.audio.verifiedBytes ?? await readFile(input.audio.sourcePath)).toString('base64'),
               mimeType: 'audio/mpeg',
             },
           });

@@ -98,6 +98,9 @@ function semanticIssues(name: ExchangeContractName, value: any): ExchangeValidat
   const issues: ExchangeValidationIssue[] = [];
   if (name === 'request') {
     const transcriptSource = value.inputs.transcript?.role === 'transcript_source';
+    if (value.inputs.media !== null && value.inputs.media.mime_type !== 'audio/mpeg') {
+      issues.push(issue('/inputs/media/mime_type', '0.3.0-alpha.1 只支持 MP3（audio/mpeg）媒体'));
+    }
     if (value.transcription_mode === 'provided') {
       if (!transcriptSource) issues.push(issue('/inputs/transcript/role', 'provided 模式必须显式使用 transcript_source'));
       if (value.models.asr !== null) issues.push(issue('/models/asr', 'provided 模式不得选择 ASR'));

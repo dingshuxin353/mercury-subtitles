@@ -15,6 +15,7 @@ import { VolcengineAsrAdapter } from '../src/adapters/volcengine-asr.js';
 import { VolcengineSubtitleAsrAdapter } from '../src/adapters/volcengine-subtitle-asr.js';
 import { canonicalJson } from '../src/exchange/storage.js';
 import { readJob } from '../src/background/storage.js';
+import { createChatCalibrationRuntimeV2 } from '../src/adapters/chat-calibration-v2.js';
 
 function sha(value: Buffer | string) { return createHash('sha256').update(value).digest('hex'); }
 
@@ -91,6 +92,29 @@ function fixtureHintsAsr(calls: string[], captured: Array<NonNullable<Parameters
   };
 }
 
+async function forceStrongEvidence(directory: string, useGemini = false) {
+  const task = await readV5Task(directory);
+  const snapshotPath = path.join(directory, task.models.snapshot_path);
+  const snapshot = JSON.parse(await readFile(snapshotPath, 'utf8'));
+  snapshot.evidence_mode = 'audio_multimodal';
+  snapshot.non_strong_reason = null;
+  if (useGemini) {
+    snapshot.models.chat.plugin_id = 'gemini';
+    snapshot.models.chat.connection_type = 'vertex_ai';
+    snapshot.models.chat.endpoint = null;
+    snapshot.models.chat.credential_ref = 'adc:fixture';
+    snapshot.models.chat.provider_config = { project: 'fixture-project', location: 'us-central1' };
+    snapshot.models.chat.declared_capabilities.input_modalities = ['text', 'audio'];
+    snapshot.models.chat.verified_capabilities.input_modalities = ['text', 'audio'];
+    snapshot.models.chat.cloud_data_confirmation.data_categories = ['audio', 'transcript', 'reference_srt', 'context'];
+  }
+  const source = canonicalJson(snapshot);
+  await writeFile(snapshotPath, source, { mode: 0o600 });
+  task.models.snapshot_sha256 = sha(source);
+  task.input_config.evidence_mode = 'audio_multimodal';
+  await persistV5Task(directory, task);
+}
+
 describe('Exchange v1 external transcript task', () => {
   it('runs provider plus reference through the same v5 request, dictionary, result, and review semantics', async () => {
     const input = await prepared();
@@ -120,6 +144,10 @@ describe('Exchange v1 external transcript task', () => {
     const task = await readV5Task(directory);
     expect(task.status, JSON.stringify(task.error)).toBe('completed');
     expect(task.input_config.transcription_mode).toBe('provider');
+    expect(task.calibration_sources).toMatchObject({
+      transcript: { path: 'work/transcript.raw.json', validation: 'passed' },
+      reference: { path: 'input/reference.srt', validation: 'passed' },
+    });
     expect(task.execution.provider_calls.asr).toMatchObject({ state: 'terminal', count: 1, outcome: 'response_persisted' });
     expect(task.execution.provider_calls.chat).toMatchObject({ state: 'terminal', count: 1, outcome: 'response_persisted' });
     expect(calls).toEqual(['asr', 'chat']);
@@ -278,6 +306,122 @@ describe('Exchange v1 external transcript task', () => {
     expect(task.status, JSON.stringify(task.error)).toBe('completed');
     expect(calls).toEqual(['asr', 'chat']);
     expect(task.execution.provider_calls.asr).toMatchObject({ state: 'terminal', count: 1, outcome: 'response_persisted' });
+    expect(task.calibration_sources).toMatchObject({ transcript: { path: 'work/transcript.raw.json', validation: 'passed' }, reference: null });
+  });
+
+  it('rejects non-MP3 media at stable request preflight without creating a task or Provider call', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'declared-wav.mp3');
+    const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
+    const registry = await loadModelRegistryV2(input.workspace);
+    await expect(submitExchangeRequest(input.workspace, {
+      ...input.request, request_id: 'request-media-mime-rejected',
+      inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/wav' }, transcript: null },
+      transcription_mode: 'provider', models: { asr: registry.defaults.asr, chat: registry.defaults.chat },
+    })).rejects.toMatchObject({ code: 'CONTRACT_INVALID' });
+    expect(await (await import('node:fs/promises')).readdir(path.join(input.workspace, 'tasks'))).toEqual([]);
+  });
+
+  it('rejects a tampered provided media copy before strong Chat dispatch', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'provided-strong.mp3');
+    const bytes = Buffer.alloc(417 * 80);
+    for (let offset = 0; offset < bytes.length; offset += 417) bytes.set([0xff, 0xfb, 0x90, 0x64], offset);
+    await writeFile(audio, bytes);
+    input.request.request_id = 'request-provided-strong-media-tamper';
+    const submitted = await submitExchangeRequest(input.workspace, {
+      ...input.request,
+      inputs: { ...input.request.inputs, media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' } },
+    });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    await forceStrongEvidence(directory);
+    const copied = (await readV5Task(directory)).inputs.media!;
+    const changed = Buffer.from(await readFile(path.join(directory, copied.workspace_path))); changed[20] = changed[20]! ^ 0xff;
+    await writeFile(path.join(directory, copied.workspace_path), changed, { mode: 0o600 });
+    const calls: string[] = [];
+    await runWorker(input.workspace, { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    const task = await readV5Task(directory);
+    expect(task.status).toBe('failed');
+    expect(task.error?.code).toBe('INPUT_COPY_HASH_MISMATCH');
+    expect(task.execution.provider_calls).toMatchObject({ asr: { count: 0 }, chat: { count: 0, state: 'not_started' } });
+    expect(calls).toEqual([]);
+  });
+
+  it('rejects provider media changed after ASR and before strong Chat dispatch', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'provider-strong.mp3');
+    const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
+    const registry = await loadModelRegistryV2(input.workspace);
+    const submitted = await submitExchangeRequest(input.workspace, {
+      ...input.request, request_id: 'request-provider-strong-media-tamper',
+      inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: null },
+      transcription_mode: 'provider', models: { asr: registry.defaults.asr, chat: registry.defaults.chat },
+    });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    await forceStrongEvidence(directory);
+    const calls: string[] = [];
+    const mutatingAsr: AsrAdapter = {
+      adapterId: 'fixture_mutating_asr',
+      async run(adapterInput) {
+        const result = await fixtureAsr(calls).run(adapterInput);
+        const changed = Buffer.from(await readFile(adapterInput.audio.sourcePath)); changed[24] = changed[24]! ^ 0xff;
+        await writeFile(adapterInput.audio.sourcePath, changed, { mode: 0o600 });
+        return result;
+      },
+    };
+    await runWorker(input.workspace, { asrAdapter: mutatingAsr, fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    const task = await readV5Task(directory);
+    expect(task.status).toBe('failed');
+    expect(task.error?.code).toBe('INPUT_COPY_HASH_MISMATCH');
+    expect(task.execution.provider_calls).toMatchObject({ asr: { count: 1, state: 'terminal' }, chat: { count: 0, state: 'not_started' } });
+    expect(calls).toEqual(['asr']);
+  });
+
+  it('builds a strong Gemini request from the same verified media buffer', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'provided-strong-pinned.mp3');
+    const bytes = Buffer.alloc(417 * 80);
+    for (let offset = 0; offset < bytes.length; offset += 417) bytes.set([0xff, 0xfb, 0x90, 0x64], offset);
+    await writeFile(audio, bytes);
+    const submitted = await submitExchangeRequest(input.workspace, {
+      ...input.request, request_id: 'request-provided-strong-pinned',
+      inputs: { ...input.request.inputs, media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' } },
+    });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    await forceStrongEvidence(directory, true);
+    let sent: Buffer | null = null; let providerCalls = 0;
+    const generateContent = vi.fn(async (request: Record<string, any>) => {
+      providerCalls += 1;
+      const parts = request.contents[0].parts as Array<Record<string, any>>;
+      sent = Buffer.from(parts.find((part) => part.inlineData)!.inlineData.data, 'base64');
+      const prompt = parts.find((part) => typeof part.text === 'string')!.text as string;
+      const payload = JSON.parse(prompt.slice(prompt.lastIndexOf('\n') + 1)) as { calibration_units: Array<{ unit_id: string; original_text: string }> };
+      return { text: JSON.stringify({ corrected_units: payload.calibration_units.map((unit) => ({ unit_id: unit.unit_id, corrected_text: unit.original_text, rationale: null })) }), responseId: 'fixture-gemini', finishReason: 'STOP' };
+    });
+    await runWorker(input.workspace, {
+      createVertexClient: () => ({ interactions: { create: async () => { throw new Error('unexpected'); } }, models: { generateContent } }),
+    });
+    const task = await readV5Task(directory);
+    expect(task.status, JSON.stringify(task.error)).toBe('completed');
+    expect(providerCalls).toBe(1);
+    expect(sha(sent!)).toBe(task.inputs.media!.sha256);
+    expect(sent).toEqual(bytes);
+  });
+
+  it.each(['transcript', 'reference'] as const)('rejects a tampered provided calibration %s bridge before Chat dispatch', async (source) => {
+    const input = await prepared();
+    input.request.request_id = `request-provided-bridge-${source}-tamper`;
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const pointer = submitted.task.calibration_sources[source]!;
+    await writeFile(path.join(directory, pointer.path), source === 'transcript' ? canonicalJson({ tampered: true }) : '1\n00:00:00,000 --> 00:00:01,000\nTAMPERED\n', { mode: 0o600 });
+    const calls: string[] = [];
+    await runWorker(input.workspace, { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    const task = await readV5Task(directory);
+    expect(task.status).toBe('failed');
+    expect(task.error?.code).toBe('CALIBRATION_SOURCE_INVALID');
+    expect(task.execution.provider_calls).toMatchObject({ asr: { count: 0 }, chat: { count: 0, state: 'not_started' } });
+    expect(calls).toEqual([]);
   });
 
   it.each([
@@ -319,6 +463,38 @@ describe('Exchange v1 external transcript task', () => {
     expect(await readJob(input.workspace, failed.identity.task_id)).toMatchObject({ state: 'terminal' });
   });
 
+  it.each(['task', 'model', 'call', 'audio'] as const)('settles a fresh ASR artifact with wrong %s identity as known terminal', async (_case) => {
+    const input = await prepared();
+    const audio = path.join(input.home, `fresh-asr-${_case}.mp3`);
+    const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
+    const registry = await loadModelRegistryV2(input.workspace);
+    const submitted = await submitExchangeRequest(input.workspace, {
+      ...input.request, request_id: `request-fresh-asr-${_case}`,
+      inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: null },
+      transcription_mode: 'provider', models: { asr: registry.defaults.asr, chat: registry.defaults.chat },
+    });
+    const calls: string[] = [];
+    const invalidAsr: AsrAdapter = {
+      adapterId: `fixture_fresh_asr_${_case}`,
+      async run(adapterInput) {
+        const result = await fixtureAsr(calls).run(adapterInput);
+        if (result.kind !== 'artifact') return result;
+        if (_case === 'task') result.artifact.task_id = 'tsk-20260816-000000-deadbeef';
+        if (_case === 'model') result.artifact.model_snapshot_ref = 'snapshot-wrong';
+        if (_case === 'call') result.artifact.call.model_snapshot_entry_ref = 'entry-wrong';
+        if (_case === 'audio') result.artifact.audio.sha256 = '0'.repeat(64);
+        return result;
+      },
+    };
+    await runWorker(input.workspace, { asrAdapter: invalidAsr, fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    const task = await readV5Task(path.join(input.workspace, 'tasks', submitted.task.identity.task_directory));
+    expect(task.status).toBe('failed');
+    expect(task.error).toMatchObject({ code: 'ASR_ARTIFACT_INVALID', provider_outcome: 'known_terminal' });
+    expect(task.error?.message).not.toContain('结果无法确认');
+    expect(task.execution.provider_calls.asr).toMatchObject({ state: 'terminal', count: 1, outcome: 'known_terminal', evidence_ref: null });
+    expect(calls).toEqual(['asr']);
+  });
+
   it.each(['content', 'task', 'model', 'call'] as const)('rejects %s-tampered persisted Chat evidence without Provider replay', async (_case) => {
     const input = await prepared();
     input.request.request_id = `request-chat-evidence-${_case}`;
@@ -345,6 +521,33 @@ describe('Exchange v1 external transcript task', () => {
     const failed = await readV5Task(directory);
     expect(failed.status).toBe('failed');
     expect(failed.error?.code).toBe('CALIBRATION_RESULT_INVALID');
+    expect(calls).toEqual(['chat']);
+  });
+
+  it.each(['task', 'model', 'call', 'input'] as const)('settles a fresh Chat artifact with wrong %s identity as known terminal', async (_case) => {
+    const input = await prepared();
+    input.request.request_id = `request-fresh-chat-${_case}`;
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const calls: string[] = [];
+    const chatRuntime = {
+      capability: 'calibration' as const,
+      async run(runtimeInput: Parameters<ReturnType<typeof createChatCalibrationRuntimeV2>['run']>[0]) {
+        const base = createChatCalibrationRuntimeV2(runtimeInput.model, { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+        const result = await base.run(runtimeInput);
+        if (result.kind !== 'artifact') return result;
+        if (_case === 'task') result.artifact.task_id = 'tsk-20260816-000000-deadbeef';
+        if (_case === 'model') result.artifact.model_snapshot_ref = 'snapshot-wrong';
+        if (_case === 'call') result.artifact.call.model_snapshot_entry_ref = 'entry-wrong';
+        if (_case === 'input') result.artifact.request.transcript_ref = 'work/transcript.wrong.json' as 'work/transcript.raw.json';
+        return result;
+      },
+    };
+    await runWorker(input.workspace, { chatRuntime, readCredential: async () => 'fixture-secret' });
+    const task = await readV5Task(path.join(input.workspace, 'tasks', submitted.task.identity.task_directory));
+    expect(task.status).toBe('failed');
+    expect(task.error).toMatchObject({ code: 'CALIBRATION_RESULT_INVALID', provider_outcome: 'known_terminal' });
+    expect(task.error?.message).not.toContain('结果无法确认');
+    expect(task.execution.provider_calls.chat).toMatchObject({ state: 'terminal', count: 1, outcome: 'known_terminal', evidence_ref: null });
     expect(calls).toEqual(['chat']);
   });
 
@@ -389,7 +592,11 @@ describe('Exchange v1 external transcript task', () => {
     expect(second.replayed).toBe(true);
     expect(second.task.identity.task_id).toBe(first.task.identity.task_id);
     const directory = path.join(input.workspace, 'tasks', first.task.identity.task_directory);
-    for (const relative of ['request.json', 'task.json', 'events.jsonl', 'attempts.jsonl', 'input/transcript-source.srt', 'work/transcript.normalized.json', first.task.artifacts.transcribed!.path]) {
+    expect(first.task.calibration_sources).toMatchObject({
+      transcript: { path: 'work/transcript.raw.json', validation: 'passed' },
+      reference: { path: 'input/reference.srt', validation: 'passed' },
+    });
+    for (const relative of ['request.json', 'task.json', 'events.jsonl', 'attempts.jsonl', 'input/transcript-source.srt', 'input/reference.srt', 'work/transcript.normalized.json', 'work/transcript.raw.json', first.task.artifacts.transcribed!.path]) {
       if (relative === 'attempts.jsonl') continue;
       expect((await stat(path.join(directory, relative))).mode & 0o777).toBe(0o600);
     }
@@ -408,14 +615,28 @@ describe('Exchange v1 external transcript task', () => {
     const promptData = JSON.parse(prompt.slice(prompt.lastIndexOf('\n') + 1));
     expect(promptData.dictionary_context.entries).toEqual([expect.objectContaining({ entry_id: 'entry-mercury-name', canonical: 'Mercury' })]);
     const found = await findTaskReadOnly(input.workspace, completed.identity.task_id);
+    const bridgeBefore = {
+      transcript: sha(await readFile(path.join(directory, completed.calibration_sources.transcript!.path))),
+      reference: sha(await readFile(path.join(directory, completed.calibration_sources.reference!.path))),
+    };
     const view = await stableTaskView(input.workspace, found);
     const result = await stableTaskResult(input.workspace, found);
+    const response = JSON.parse(await readFile(path.join(directory, 'work/calibration-response.json'), 'utf8'));
+    const calibratedTranscript = JSON.parse(await readFile(path.join(directory, 'work/transcript.calibrated.json'), 'utf8'));
+    expect(response.request).toMatchObject({ transcript_ref: 'work/transcript.raw.json', reference_srt_ref: 'input/reference.srt' });
+    expect(calibratedTranscript.source_refs).toMatchObject({ transcript_ref: 'work/transcript.raw.json', reference_srt_ref: 'input/reference.srt' });
+    expect(sha(await readFile(path.join(directory, completed.calibration_sources.transcript!.path)))).toBe(completed.calibration_sources.transcript!.sha256);
+    expect(sha(await readFile(path.join(directory, completed.calibration_sources.reference!.path)))).toBe(completed.calibration_sources.reference!.sha256);
     expect(view.source_schema_version).toBe('5.0.0');
     expect(view.capabilities.provided_transcript.supported).toBe(true);
     expect(result.transcription).toMatchObject({ mode: 'provided', asr_call_count: 0 });
     expect(result.dictionaries).toMatchObject({ match_count: 1, conflict_count: 0, snapshots: [expect.objectContaining({ revision: dictionaryV2.revision })] });
     expect(result.artifacts.find((entry) => entry.identity === 'transcribed_srt')).toMatchObject({ exists: true, validation: 'passed' });
     expect(result.artifacts.find((entry) => entry.identity === 'calibrated_srt')).toMatchObject({ exists: true, validation: 'passed' });
+    expect({
+      transcript: sha(await readFile(path.join(directory, completed.calibration_sources.transcript!.path))),
+      reference: sha(await readFile(path.join(directory, completed.calibration_sources.reference!.path))),
+    }).toEqual(bridgeBefore);
     const attempts = (await readFile(path.join(directory, 'attempts.jsonl'), 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
     expect(attempts).toEqual([
       expect.objectContaining({ contract: 'mercury.attempt/v1', asr_call_count: 0 }),

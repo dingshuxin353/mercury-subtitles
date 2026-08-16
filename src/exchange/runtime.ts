@@ -10,7 +10,7 @@ import { MercuryError } from '../errors.js';
 import { inspectTranscriptInput, serializeTranscriptSrt } from '../external-input.js';
 import { loadModelRegistryV2, snapshotModelV2 } from '../models-v2.js';
 import { readCredentialReference, readMp3DurationMs, resolveVolcengineCredentialReference } from '../models.js';
-import { CHAT_INLINE_AUDIO_LIMIT_BYTES, createChatCalibrationRuntimeV2, type ChatCalibrationV2Dependencies } from '../adapters/chat-calibration-v2.js';
+import { CHAT_INLINE_AUDIO_LIMIT_BYTES, createChatCalibrationRuntimeV2, type ChatCalibrationRuntimeV2, type ChatCalibrationV2Dependencies } from '../adapters/chat-calibration-v2.js';
 import { VolcengineAsrAdapter, type ResolvedVolcengineCredential } from '../adapters/volcengine-asr.js';
 import { VolcengineSubtitleAsrAdapter } from '../adapters/volcengine-subtitle-asr.js';
 import { legacyAsrEntry } from '../core-integration-v2.js';
@@ -76,6 +76,22 @@ async function copyVerified(source: string, destination: string, expected: strin
   return (await stat(destination)).size;
 }
 
+async function readVerifiedMediaBytes(directory: string, media: NonNullable<TaskRecordV5['inputs']['media']>): Promise<Buffer> {
+  if (media.mime_type !== 'audio/mpeg') throw new MercuryError('MEDIA_MIME_UNSUPPORTED', '0.3.0-alpha.1 只支持 MP3（audio/mpeg）媒体；未调用 Provider。', { exitCode: 2 });
+  const target = managed(directory, media.workspace_path);
+  const entry = await regular(target, 'MEDIA_INPUT_INVALID');
+  const handle = await open(target, constants.O_RDONLY);
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.size !== entry.size || opened.size !== media.bytes) throw new MercuryError('MEDIA_INPUT_INVALID', '任务媒体副本大小与固定记录不一致；未调用 Provider。');
+    const bytes = await handle.readFile();
+    if (bytes.length !== media.bytes || digest(bytes) !== media.sha256) throw new MercuryError('INPUT_COPY_HASH_MISMATCH', '任务媒体副本与固定 hash 不一致；未调用 Provider。');
+    return bytes;
+  } finally {
+    await handle.close();
+  }
+}
+
 export async function readV5Task(directory: string): Promise<TaskRecordV5> {
   const root = path.resolve(directory);
   const parent = await lstat(path.dirname(root)).catch(() => null);
@@ -128,6 +144,13 @@ export async function persistV5Task(directory: string, task: TaskRecordV5): Prom
         }
         if (before.evidence_sha256 && (after.evidence_sha256 !== before.evidence_sha256 || after.evidence_ref !== before.evidence_ref)) {
           throw new MercuryError('PROVIDER_EVIDENCE_IMMUTABLE', `${role} 已固定的 Provider 响应证据不可替换。`);
+        }
+      }
+      for (const source of ['transcript', 'reference'] as const) {
+        const before = current.calibration_sources[source];
+        const after = checked.calibration_sources[source];
+        if (before && (!after || before.path !== after.path || before.sha256 !== after.sha256 || before.validation !== after.validation)) {
+          throw new MercuryError('CALIBRATION_SOURCE_IMMUTABLE', `已固定的校准 ${source} 来源不可替换或清空。`);
         }
       }
       checked.identity.revision = Math.max(checked.identity.revision, current.identity.revision + 1);
@@ -203,6 +226,7 @@ interface ModelSnapshotV3 {
 
 export interface ExchangeRuntimeDependencies extends ChatCalibrationV2Dependencies {
   asrAdapter?: AsrAdapter | AsrHintsCapableAdapter;
+  chatRuntime?: ChatCalibrationRuntimeV2;
   resolveAsrCredential?: (reference: string) => Promise<ResolvedVolcengineCredential>;
 }
 
@@ -264,6 +288,7 @@ async function createTaskDirectory(workspace: string, request: ExchangeRequestV1
   if (provided && request.inputs.transcript?.role !== 'transcript_source') throw new MercuryError('TRANSCRIPT_ROLE_REQUIRED', 'provided 模式必须提供 transcript_source。', { exitCode: 2 });
   if (!provided && request.inputs.transcript && request.inputs.transcript.role !== 'reference') throw new MercuryError('TRANSCRIPT_ROLE_REQUIRED', 'provider 模式的外部字幕只能声明 reference。', { exitCode: 2 });
   if (!provided && !request.inputs.media) throw new MercuryError('REQUEST_INVALID', 'provider 模式必须提供媒体输入。', { exitCode: 2 });
+  if (request.inputs.media && request.inputs.media.mime_type !== 'audio/mpeg') throw new MercuryError('MEDIA_MIME_UNSUPPORTED', '0.3.0-alpha.1 只支持 MP3（audio/mpeg）媒体；任务未提交。', { exitCode: 2 });
   const inspected = request.inputs.transcript
     ? await inspectTranscriptInput({ filePath: request.inputs.transcript.path, format: request.inputs.transcript.format, role: request.inputs.transcript.role })
     : null;
@@ -314,7 +339,7 @@ async function createTaskDirectory(workspace: string, request: ExchangeRequestV1
       try { await handle.writeFile(srtFromTranscript(inspected!.transcript), 'utf8'); await handle.sync(); } finally { await handle.close(); }
     }
     const fingerprint = jsonFingerprint(JSON.parse(canonicalJson(request)));
-    const task = assertV5TaskRecord({
+    const taskCandidate = {
       schema_version: '5.0.0', identity: { task_id: taskId, request_id: request.request_id, request_fingerprint: fingerprint, task_directory: directoryName, revision: 0 },
       created_at: createdAt, updated_at: createdAt, status: 'queued', stage: null,
       input_config: { transcription_mode: request.transcription_mode, calibration_mode: request.calibration.mode, source_language: request.calibration.source_language, evidence_mode: decision.mode },
@@ -324,6 +349,7 @@ async function createTaskDirectory(workspace: string, request: ExchangeRequestV1
         reference: !provided && request.inputs.transcript ? { original_path: request.inputs.transcript.path, workspace_path: transcriptRelative!, sha256: request.inputs.transcript.sha256, bytes: inspected!.bytes, mime_type: request.inputs.transcript.format === 'srt' ? 'application/x-subrip' : request.inputs.transcript.format === 'vtt' ? 'text/vtt' : 'application/json', format: request.inputs.transcript.format, role: 'reference' as const } : null,
         reference_normalized: normalizedReference,
       },
+      calibration_sources: { transcript: null, reference: normalizedReference },
       models: { asr: request.models.asr, chat: request.models.chat, snapshot_path: 'work/model-snapshot.json', snapshot_sha256: await sha256File(path.join(staging, 'work/model-snapshot.json')) },
       dictionary_snapshot: { ...dictionaryPointer, resolved: dictionarySnapshot.resolved },
       execution: { queued_at: createdAt, started_at: null, ended_at: null, worker_id: null, heartbeat_at: null, attempt_id: null, attempt_count: 0, safe_checkpoint: 'queued', provider_calls: { asr: initialCall(), chat: initialCall() }, cancel_requested_at: null },
@@ -331,7 +357,17 @@ async function createTaskDirectory(workspace: string, request: ExchangeRequestV1
         transcript: provided ? { path: 'work/transcript.normalized.json', sha256: await sha256File(path.join(staging, 'work/transcript.normalized.json')), validation: 'passed' as const } : null,
         transcribed: provided ? { path: transcribedRelative, sha256: await sha256File(path.join(staging, transcribedRelative)), validation: 'passed' as const } : null, calibrated: null, approved: null, report: null,
       }, review: { status: 'not_ready', pending_count: null }, warnings: [...(inspected?.warnings ?? []), ...(decision.reason ? [`Chat 使用 text-only：${decision.reason}`] : [])], error: null,
-    });
+    } as TaskRecordV5;
+    if (provided) {
+      const bridge = legacyTranscript(taskCandidate, inspected!.transcript, snapshot);
+      await writeStableJsonAtomic(path.join(staging, 'work/transcript.raw.json'), bridge);
+      await writeFile0600(path.join(staging, 'input/reference.srt'), srtFromTranscript(inspected!.transcript));
+      taskCandidate.calibration_sources = {
+        transcript: { path: 'work/transcript.raw.json', sha256: await sha256File(path.join(staging, 'work/transcript.raw.json')), validation: 'passed' },
+        reference: { path: 'input/reference.srt', sha256: await sha256File(path.join(staging, 'input/reference.srt')), validation: 'passed' },
+      };
+    }
+    const task = assertV5TaskRecord(taskCandidate);
     await writeStableJsonAtomic(path.join(staging, 'task.json'), task);
     await rename(staging, final);
     await chmod(final, 0o700);
@@ -517,13 +553,13 @@ function assertChatEvidenceIdentity(candidate: unknown, task: TaskRecordV5, snap
   if (!checked.valid) throw new MercuryError('CALIBRATION_RESULT_INVALID', checked.issues.map((entry) => `${entry.path} ${entry.message}`).join('; '));
   const calibration = checked.value;
   const media = task.inputs.media;
-  const expectedReference = task.inputs.reference || task.input_config.transcription_mode === 'provided' ? 'input/reference.srt' : null;
+  const expectedReference = task.calibration_sources.reference?.path ?? null;
   const expectedMode = expectedReference ? task.input_config.calibration_mode : null;
   const expectedAudio = task.input_config.evidence_mode === 'audio_multimodal' && media ? media : null;
   if (calibration.task_id !== task.identity.task_id
     || calibration.model_snapshot_ref !== snapshot.snapshot_id
     || calibration.call.model_snapshot_entry_ref !== snapshot.models.chat.snapshot_entry_id
-    || calibration.request.transcript_ref !== 'work/transcript.raw.json'
+    || calibration.request.transcript_ref !== task.calibration_sources.transcript?.path
     || calibration.request.alignment_ref !== 'work/alignment.json'
     || calibration.request.reference_srt_ref !== expectedReference
     || calibration.request.mode !== expectedMode
@@ -536,6 +572,104 @@ function assertChatEvidenceIdentity(candidate: unknown, task: TaskRecordV5, snap
     throw new MercuryError('CALIBRATION_RESULT_INVALID', 'Chat 响应与 task/model/call/input identity 不一致；不会采纳或重放 Provider。');
   }
   return calibration;
+}
+
+async function assertCalibrationSourceEvidence(
+  directory: string,
+  task: TaskRecordV5,
+  legacy: TranscriptRaw,
+  referenceText: string | null,
+): Promise<void> {
+  const transcriptSource = task.calibration_sources.transcript;
+  if (!transcriptSource || transcriptSource.path !== 'work/transcript.raw.json') {
+    throw new MercuryError('CALIBRATION_SOURCE_INVALID', '校准 transcript 来源未固定到真实任务文件；不会调用 Provider。');
+  }
+  const transcriptPath = managed(directory, transcriptSource.path);
+  await regular(transcriptPath, 'CALIBRATION_SOURCE_INVALID');
+  if (await sha256File(transcriptPath) !== transcriptSource.sha256) throw new MercuryError('CALIBRATION_SOURCE_INVALID', '校准 transcript 来源 hash 不一致；不会调用 Provider。');
+  const pinnedTranscript = await readStableJson(transcriptPath, 'CALIBRATION_SOURCE_INVALID');
+  if (canonicalJson(pinnedTranscript) !== canonicalJson(legacy)) throw new MercuryError('CALIBRATION_SOURCE_INVALID', '校准 transcript 来源与当前任务转录不一致；不会调用 Provider。');
+
+  const referenceSource = task.calibration_sources.reference;
+  if (referenceText === null) {
+    if (referenceSource !== null) throw new MercuryError('CALIBRATION_SOURCE_INVALID', '无 reference 的任务不能声明校准 reference 来源；不会调用 Provider。');
+    return;
+  }
+  if (!referenceSource || referenceSource.path !== 'input/reference.srt') throw new MercuryError('CALIBRATION_SOURCE_INVALID', '校准 reference 来源未固定到真实任务文件；不会调用 Provider。');
+  const referencePath = managed(directory, referenceSource.path);
+  await regular(referencePath, 'CALIBRATION_SOURCE_INVALID');
+  if (await sha256File(referencePath) !== referenceSource.sha256) throw new MercuryError('CALIBRATION_SOURCE_INVALID', '校准 reference 来源 hash 不一致；不会调用 Provider。');
+  if (await readFile(referencePath, 'utf8') !== referenceText) throw new MercuryError('CALIBRATION_SOURCE_INVALID', '校准 reference 来源正文与任务输入不一致；不会调用 Provider。');
+}
+
+export async function verifyV5CalibrationSources(directory: string, taskInput?: TaskRecordV5): Promise<void> {
+  const task = taskInput ?? await readV5Task(directory);
+  if (!task.artifacts.transcript) throw new MercuryError('CALIBRATION_SOURCE_INVALID', '任务尚未形成可验证的规范化转录来源。');
+  if (await sha256File(managed(directory, task.artifacts.transcript.path)).catch(() => null) !== task.artifacts.transcript.sha256) {
+    throw new MercuryError('CALIBRATION_SOURCE_INVALID', '规范化转录来源缺失或 hash 不一致。');
+  }
+  const transcript = assertExchangeContract('transcript', await readStableJson(managed(directory, task.artifacts.transcript.path), 'CALIBRATION_SOURCE_INVALID'));
+  const snapshot = await readStableJson(managed(directory, task.models.snapshot_path), 'MODEL_SNAPSHOT_INVALID') as ModelSnapshotV3;
+  if (snapshot.contract !== 'mercury.model-snapshot/v3' || snapshot.task_id !== task.identity.task_id) throw new MercuryError('MODEL_SNAPSHOT_INVALID', '校准来源引用的模型快照 identity 无效。');
+  let legacy: TranscriptRaw;
+  if (task.input_config.transcription_mode === 'provided') {
+    const source = task.inputs.transcript_source;
+    if (!source || await sha256File(managed(directory, source.workspace_path)).catch(() => null) !== source.sha256) throw new MercuryError('CALIBRATION_SOURCE_INVALID', '外部转录原件缺失或 hash 不一致。');
+    legacy = legacyTranscript(task, transcript, snapshot);
+  } else {
+    const media = task.inputs.media;
+    if (!media || !task.calibration_sources.transcript) throw new MercuryError('CALIBRATION_SOURCE_INVALID', 'provider 任务缺少固定的 ASR 校准来源。');
+    const rawCandidate = await readStableJson(managed(directory, task.calibration_sources.transcript.path), 'CALIBRATION_SOURCE_INVALID');
+    const rawValue = validateContract('transcript.raw', rawCandidate);
+    if (!rawValue.valid) throw new MercuryError('CALIBRATION_SOURCE_INVALID', rawValue.issues.map((entry) => `${entry.path} ${entry.message}`).join('; '));
+    legacy = assertAsrEvidenceIdentity(rawValue.value, task, snapshot, media, rawValue.value.audio.duration_ms);
+    if (canonicalJson(exchangeTranscriptFromProvider(task, legacy, snapshot)) !== canonicalJson(transcript)) throw new MercuryError('CALIBRATION_SOURCE_INVALID', '规范化转录与固定 ASR 来源不一致。');
+  }
+  let referenceText: string | null = null;
+  if (task.input_config.transcription_mode === 'provided') {
+    referenceText = srtFromTranscript(transcript);
+  } else if (task.inputs.reference) {
+    if (!task.inputs.reference_normalized
+      || await sha256File(managed(directory, task.inputs.reference.workspace_path)).catch(() => null) !== task.inputs.reference.sha256
+      || await sha256File(managed(directory, task.inputs.reference_normalized.path)).catch(() => null) !== task.inputs.reference_normalized.sha256) {
+      throw new MercuryError('CALIBRATION_SOURCE_INVALID', '参考字幕原件或规范化来源缺失或 hash 不一致。');
+    }
+    referenceText = await readFile(managed(directory, task.inputs.reference_normalized.path), 'utf8');
+  }
+  await assertCalibrationSourceEvidence(directory, task, legacy, referenceText);
+  if (task.execution.provider_calls.chat.evidence_ref) {
+    assertChatEvidenceIdentity(await readPinnedEvidence(directory, task.execution.provider_calls.chat, 'CALIBRATION_RESULT_INVALID'), task, snapshot);
+  }
+  if (task.artifacts.calibrated) {
+    const calibratedPath = managed(directory, 'work/transcript.calibrated.json');
+    const candidate = await readStableJson(calibratedPath, 'CALIBRATION_SOURCE_INVALID') as Partial<CalibratedTranscript>;
+    if (candidate.task_id !== task.identity.task_id
+      || candidate.source_refs?.transcript_ref !== task.calibration_sources.transcript!.path
+      || candidate.source_refs?.reference_srt_ref !== (task.calibration_sources.reference?.path ?? null)
+      || candidate.source_refs?.calibration_ref !== 'work/calibration-result.json') {
+      throw new MercuryError('CALIBRATION_SOURCE_INVALID', '校验后 transcript 的来源引用与任务固定证据不一致。');
+    }
+  }
+}
+
+async function settleReturnedArtifactInvalid(
+  directory: string,
+  snapshot: ModelSnapshotV3,
+  role: 'asr' | 'chat',
+  error: unknown,
+  fault?: (point: V5FaultPoint, task: TaskRecordV5) => Promise<void> | void,
+): Promise<TaskRecordV5> {
+  const task = await readV5Task(directory);
+  const code = error instanceof MercuryError ? error.code : role === 'asr' ? 'ASR_ARTIFACT_INVALID' : 'CALIBRATION_RESULT_INVALID';
+  const detail = error instanceof Error ? error.message : String(error);
+  task.execution.provider_calls[role] = { state: 'terminal', count: Math.max(1, task.execution.provider_calls[role].count), outcome: 'known_terminal', evidence_ref: null, evidence_sha256: null };
+  task.status = 'failed'; task.stage = null; task.execution.ended_at = new Date().toISOString();
+  task.error = exchangeError(code, `${role === 'asr' ? 'ASR' : 'Chat'} 已返回响应，但响应合同或任务身份无效；不会自动重放。`, 'known_terminal', detail);
+  await writeReport(directory, task, snapshot, null);
+  await persistV5Task(directory, task);
+  await crashFault(fault, 'terminal_task_before_result', task);
+  await writeV5Result(directory, task);
+  return task;
 }
 
 function hintsDispatchEvidence(planned: Array<{ entryId: string }>, evidence: AsrHintsDispatchEvidence | undefined): AsrHintsDispatchEvidence {
@@ -645,12 +779,17 @@ async function prepareProviderTranscript(
       task.error = exchangeError(certainty === 'outcome_unknown' ? 'TASK_INTERRUPTED_PROVIDER_UNKNOWN' : result.failure.errors[0]!.code, result.failure.errors[0]!.message, certainty, result.failure.errors[0]!.message);
       await writeReport(directory, task, snapshot, null); await persistV5Task(directory, task); await crashFault(fault, 'terminal_task_before_result', task); await writeV5Result(directory, task); return null;
     }
-    raw = result.artifact;
-    raw = assertAsrEvidenceIdentity(raw, task, snapshot, media, duration);
+    try {
+      raw = assertAsrEvidenceIdentity(result.artifact, task, snapshot, media, duration);
+    } catch (error) {
+      await settleReturnedArtifactInvalid(directory, snapshot, 'asr', error, fault);
+      return null;
+    }
     await writeStableJsonAtomic(path.join(directory, 'work/transcript.raw.json'), raw);
     const evidenceSha256 = await sha256File(path.join(directory, 'work/transcript.raw.json'));
     task = await readV5Task(directory);
     task.execution.provider_calls.asr = { state: 'response_persisted', count: 1, outcome: 'response_persisted', evidence_ref: 'work/transcript.raw.json', evidence_sha256: evidenceSha256 };
+    task.calibration_sources.transcript = { path: 'work/transcript.raw.json', sha256: evidenceSha256, validation: 'passed' };
     task.execution.safe_checkpoint = 'asr_response_persisted'; await persistV5Task(directory, task);
     await crashFault(fault, 'after_response_persisted', task);
   }
@@ -708,6 +847,7 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
   try {
     const normalizedSrt = srtFromTranscript(transcript);
     const referenceText = normalizedReferenceText ?? (task.input_config.transcription_mode === 'provided' ? normalizedSrt : null);
+    await assertCalibrationSourceEvidence(directory, task, legacy, referenceText);
     const initial = preflight(task, legacy, snapshot, referenceText);
     if (initial.status !== 'completed' || initial.alignment === null) throw new MercuryError(initial.issues[0]?.code ?? 'ALIGNMENT_FAILED', initial.issues[0]?.message ?? '外部转录无法形成合法校验单元。');
     await writeStableJsonAtomic(path.join(directory, 'work/alignment.json'), initial.alignment);
@@ -717,8 +857,11 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
     if (task.execution.provider_calls.chat.evidence_ref && ['response_persisted', 'terminal'].includes(task.execution.provider_calls.chat.state)) {
       calibration = assertChatEvidenceIdentity(await readPinnedEvidence(directory, task.execution.provider_calls.chat, 'CALIBRATION_RESULT_INVALID'), task, snapshot);
     } else {
-      const runtime = createChatCalibrationRuntimeV2(snapshot.models.chat, { ...dependencies, readCredential: dependencies.readCredential ?? readCredentialReference });
+      const runtime = dependencies.chatRuntime ?? createChatCalibrationRuntimeV2(snapshot.models.chat, { ...dependencies, readCredential: dependencies.readCredential ?? readCredentialReference });
       const media = task.inputs.media;
+      const verifiedAudioBytes = task.input_config.evidence_mode === 'audio_multimodal' && media
+        ? await readVerifiedMediaBytes(directory, media)
+        : null;
       const result = await runtime.run({
         taskId: task.identity.task_id, modelSnapshotRef: snapshot.snapshot_id, model: snapshot.models.chat, transcript: legacy, alignment: initial.alignment,
         referenceSrt: referenceText ? { pathRef: 'input/reference.srt', text: referenceText } : null, mode: referenceText ? task.input_config.calibration_mode : null, evidenceMode: task.input_config.evidence_mode,
@@ -727,7 +870,7 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
           snapshot_refs: dictionarySnapshot.resolved.map(({ dictionary_id, revision, content_hash }) => ({ dictionary_id, revision, content_hash })),
           entries: dictionarySnapshot.entries.filter((entry) => dictionarySnapshot.chat_context_entry_ids.includes(entry.entry_id)).map((entry) => ({ entry_id: entry.entry_id, kind: entry.kind, canonical: entry.canonical, variants: entry.variants, language: entry.language, case_sensitive: entry.case_sensitive, number_sensitive: entry.number_sensitive, notes: entry.notes })),
         },
-        audio: task.input_config.evidence_mode === 'audio_multimodal' && media ? { sourcePath: managed(directory, media.workspace_path), pathRef: media.workspace_path, sha256: media.sha256, bytes: media.bytes, durationMs: await readMp3DurationMs(managed(directory, media.workspace_path)), mimeType: 'audio/mpeg' } : null,
+        audio: verifiedAudioBytes && media ? { sourcePath: managed(directory, media.workspace_path), verifiedBytes: verifiedAudioBytes, pathRef: media.workspace_path, sha256: media.sha256, bytes: media.bytes, durationMs: legacy.audio.duration_ms, mimeType: 'audio/mpeg' } : null,
         beforeProviderDispatch: async () => {
           task = await readV5Task(directory);
           if (task.execution.cancel_requested_at) throw new MercuryError('TASK_CANCELLED', '任务已请求取消，未调用 Chat。');
@@ -746,7 +889,11 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
         task.error = exchangeError(certainty === 'outcome_unknown' ? 'TASK_INTERRUPTED_PROVIDER_UNKNOWN' : result.failure.errors[0]!.code, result.failure.errors[0]!.message, certainty, result.failure.errors[0]!.message);
         await writeReport(directory, task, snapshot, null); await persistV5Task(directory, task); await crashFault(fault, 'terminal_task_before_result', task); await writeV5Result(directory, task); return task;
       }
-      calibration = assertChatEvidenceIdentity(result.artifact, task, snapshot);
+      try {
+        calibration = assertChatEvidenceIdentity(result.artifact, task, snapshot);
+      } catch (error) {
+        return settleReturnedArtifactInvalid(directory, snapshot, 'chat', error, fault);
+      }
       await writeStableJsonAtomic(path.join(directory, 'work/calibration-response.json'), calibration);
       const evidenceSha256 = await sha256File(path.join(directory, 'work/calibration-response.json'));
       task = await readV5Task(directory);
@@ -833,6 +980,7 @@ async function artifact(root: string, identity: ExchangeTaskV1['artifacts'][numb
 
 export async function projectV5Task(directory: string, input?: TaskRecordV5): Promise<ExchangeTaskV1> {
   const task = input ?? await readV5Task(directory);
+  if (task.artifacts.calibrated || task.execution.provider_calls.chat.evidence_ref) await verifyV5CalibrationSources(directory, task);
   let review = task.review;
   let approved = task.artifacts.approved;
   const reviewExists = await lstat(path.join(directory, 'review.json')).then((entry) => entry.isFile() && !entry.isSymbolicLink()).catch((error) => {

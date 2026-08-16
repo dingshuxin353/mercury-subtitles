@@ -24,7 +24,7 @@
               "properties": {
                 "path": { "$ref": "common.schema.json#/$defs/absolutePath" },
                 "sha256": { "$ref": "common.schema.json#/$defs/sha256" },
-                "mime_type": { "type": "string", "minLength": 3, "maxLength": 100 }
+                "mime_type": { "const": "audio/mpeg" }
               }
             }
           ]
