@@ -1,5 +1,7 @@
 import { execFile } from 'node:child_process';
 import {
+  cp,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
@@ -336,13 +338,39 @@ try {
   }
   const { stdout: skillStatusOutput } = await runCli(['skill', 'status', '--json']);
   const skillStatus = JSON.parse(skillStatusOutput);
-  if (!skillStatus.ok || skillStatus.data.product_version !== productVersion) {
+  if (
+    !skillStatus.ok ||
+    skillStatus.data.product_version !== productVersion ||
+    skillStatus.data.installed ||
+    skillStatus.data.recommended_install_command !==
+      'npx skills add dingshuxin353/mercury-subtitles'
+  ) {
     throw new Error('Installed package Skill status is unavailable or incompatible');
   }
+  const standardSkillParent = path.join(isolatedHome, '.agents', 'skills');
+  await mkdir(standardSkillParent, { recursive: true });
+  await cp(
+    path.join(installedPackage, 'skills', 'mercury-subtitles'),
+    path.join(standardSkillParent, 'mercury-subtitles'),
+    { recursive: true, errorOnExist: true, force: false },
+  );
   const { stdout: skillInstallOutput } = await runCli(['skill', 'install', '--json']);
   const skillInstall = JSON.parse(skillInstallOutput);
-  if (!skillInstall.ok || !skillInstall.data.installed || !skillInstall.data.compatible) {
-    throw new Error('Installed package cannot deterministically install its Skill');
+  if (
+    !skillInstall.ok ||
+    !skillInstall.data.installed ||
+    !skillInstall.data.compatible ||
+    skillInstall.data.install_method !== 'agents_global' ||
+    skillInstall.data.install_action !== 'already_installed'
+  ) {
+    throw new Error('Installed package cannot recognize a standard Skills CLI installation');
+  }
+  const legacySkill = path.join(isolatedHome, '.codex', 'skills', 'mercury-subtitles');
+  if (await lstat(legacySkill).then(() => true, (error) => {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  })) {
+    throw new Error('Compatibility install duplicated a standard Skill into the legacy directory');
   }
   const helpCommands = [
     ['--help'],

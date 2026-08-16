@@ -45,7 +45,7 @@ const requiredPaths = [
   'docs/cli.md',
   'docs/privacy.md',
   'docs/providers.md',
-  'docs/skill.md',
+  'docs/agent-skill.md',
   'docs/troubleshooting.md',
   'CHANGELOG.md',
   'CODE_OF_CONDUCT.md',
@@ -141,7 +141,7 @@ const lockJson = JSON.parse(await readFile(path.join(snapshotRoot, 'package-lock
 const version = (await readFile(path.join(snapshotRoot, 'VERSION'), 'utf8')).trim();
 if (
   packageJson.name !== 'mercury-subtitles' ||
-  packageJson.version !== '0.2.0-alpha.2' ||
+  packageJson.version !== '0.2.0-alpha.3' ||
   packageJson.version !== version ||
   lockJson.name !== packageJson.name ||
   lockJson.version !== packageJson.version ||
@@ -163,7 +163,7 @@ for (const required of [
   '## 方式二：让 Agent 通过 Skill 使用',
   '## 你的数据会去哪里',
   'mercury-subtitles@next',
-  'mercury skill install --json',
+  'npx skills add dingshuxin353/mercury-subtitles',
   'Public Alpha',
 ]) {
   if (!readme.includes(required)) {
@@ -172,6 +172,9 @@ for (const required of [
 }
 if (!readme.includes('Skill 只使用 Mercury 的机器命令')) {
   throw new Error('Public README does not state the Skill execution boundary');
+}
+if (readme.includes('github.com/dingshuxin353/mercury-subtitles/blob/main/docs/skill.md')) {
+  throw new Error('Public README links to the retired ambiguous docs/skill.md path');
 }
 
 const license = await readFile(path.join(snapshotRoot, 'LICENSE'), 'utf8');

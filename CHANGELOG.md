@@ -1,5 +1,19 @@
 # Mercury Changelog
 
+## 0.2.0-alpha.3 — 2026-08-16
+
+### Skill 安装与兼容
+
+- README 将 Agent Skill 的首选安装方式改为标准 `npx skills add dingshuxin353/mercury-subtitles`，并分开说明 CLI 与 Skill 的安装、更新和卸载。
+- `mercury skill status` 现在只读识别项目 `.agents/skills`、用户全局 `.agents/skills` 与旧版 `.codex/skills` 安装，并报告重复、冲突或不兼容状态。
+- 旧版 `mercury skill install` 继续作为兼容入口；发现标准兼容安装时直接复用，不再复制第二份 Skill，也不会覆盖或删除已有目录。
+- 公开 Skill 文档改名为 `docs/agent-skill.md`，避免标准 Skills CLI 把普通说明页误识别为缺少 frontmatter 的 Skill。
+
+### 发布边界
+
+- 本版本只修复公开安装入口与安装发现兼容，不改变字幕、Provider、后台任务、审阅或机器合同。
+- 要求 Node.js `>=24.0.0 <25.0.0`，Public Alpha 推荐通过 npm `next` 安装。
+
 ## 0.2.0-alpha.2 — 2026-08-16
 
 ### 公开发布
@@ -13,7 +27,7 @@
 ### 运行时
 
 - 字幕、后台任务、审阅和 Skill 运行时继承 `0.2.0-alpha.1` 已验收能力；本版本不扩展字幕业务范围。
-- 要求 Node.js `>=24.0.0 <25.0.0`，Alpha 版本发布到 npm `next`，不占用 `latest`。
+- 要求 Node.js `>=24.0.0 <25.0.0`，Alpha 版本发布到 npm `next`。
 
 ## 0.2.0-alpha.1 — 2026-08-16
 
