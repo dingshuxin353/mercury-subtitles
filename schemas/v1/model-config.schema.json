@@ -1,0 +1,372 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercury.local/schemas/v1/model-config.schema.json",
+  "title": "ModelConfigRegistry",
+  "x-mercury-invariant-id": "INV-MOD-008",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "updated_at", "models", "defaults"],
+  "properties": {
+    "schema_version": { "$ref": "common.schema.json#/$defs/SchemaVersion" },
+    "updated_at": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "models": {
+      "type": "array",
+      "minItems": 2,
+      "items": { "$ref": "#/$defs/ModelConfig" }
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asr", "calibration"],
+      "properties": {
+        "asr": { "$ref": "common.schema.json#/$defs/ProtocolId" },
+        "calibration": { "$ref": "common.schema.json#/$defs/ProtocolId" },
+        "audio_verification": { "$ref": "common.schema.json#/$defs/ProtocolId" }
+      }
+    }
+  },
+  "$defs": {
+    "ModelCapabilityProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task_capabilities", "input_modalities", "output_types", "structured_output"],
+      "properties": {
+        "task_capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "enum": ["transcription", "proofreading", "audio_verification"] }
+        },
+        "input_modalities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "enum": ["text", "audio", "image", "video"] }
+        },
+        "output_types": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "enum": ["text", "timed_transcript", "structured_result"] }
+        },
+        "structured_output": { "type": "boolean" }
+      }
+    },
+    "PluginModelCheckBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["check_id", "config_id", "config_fingerprint", "role", "confirmation_ref", "started_at", "ended_at", "actual_model", "outcome", "capabilities", "verified_capabilities", "error"],
+      "properties": {
+        "check_id": { "$ref": "common.schema.json#/$defs/ProtocolId" },
+        "config_id": { "$ref": "common.schema.json#/$defs/ProtocolId" },
+        "config_fingerprint": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "role": { "$ref": "common.schema.json#/$defs/ModelRole" },
+        "confirmation_ref": { "$ref": "common.schema.json#/$defs/ProtocolId" },
+        "started_at": { "$ref": "common.schema.json#/$defs/Timestamp" },
+        "ended_at": { "$ref": "common.schema.json#/$defs/Timestamp" },
+        "outcome": { "type": "string", "enum": ["passed", "failed"] },
+        "actual_model": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/NonBlankString" },
+            { "type": "null" }
+          ]
+        },
+        "capabilities": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/ModelCapabilities" },
+            { "type": "null" }
+          ]
+        },
+        "verified_capabilities": {
+          "oneOf": [
+            { "$ref": "#/$defs/ModelCapabilityProfile" },
+            { "type": "null" }
+          ]
+        },
+        "error": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/ErrorRecord" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "VerifiedModelCheckRecord": {
+      "type": "object",
+      "oneOf": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/PluginModelCheckBase" },
+            {
+              "type": "object",
+              "required": ["actual_model", "outcome", "capabilities", "verified_capabilities", "error"],
+              "properties": {
+                "actual_model": { "$ref": "common.schema.json#/$defs/NonBlankString" },
+                "outcome": { "const": "passed" },
+                "capabilities": { "$ref": "common.schema.json#/$defs/ModelCapabilities" },
+                "verified_capabilities": { "$ref": "#/$defs/ModelCapabilityProfile" },
+                "error": { "type": "null" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/PluginModelCheckBase" },
+            {
+              "type": "object",
+              "required": ["outcome", "capabilities", "verified_capabilities", "error"],
+              "properties": {
+                "outcome": { "const": "failed" },
+                "capabilities": { "type": "null" },
+                "verified_capabilities": { "type": "null" },
+                "error": {
+                  "allOf": [
+                    { "not": { "type": "null" } },
+                    { "$ref": "common.schema.json#/$defs/ErrorRecord" }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "ModelConfigBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["config_id", "name", "role", "runtime", "adapter", "model", "endpoint", "credential_ref", "provider_config", "enabled", "cloud_data_confirmation", "config_fingerprint", "last_check"],
+      "properties": {
+        "config_id": { "$ref": "common.schema.json#/$defs/ProtocolId" },
+        "name": { "$ref": "common.schema.json#/$defs/NonBlankString" },
+        "role": { "$ref": "common.schema.json#/$defs/ModelRole" },
+        "runtime": { "$ref": "common.schema.json#/$defs/Runtime" },
+        "adapter": { "$ref": "common.schema.json#/$defs/NonBlankString" },
+        "model": { "$ref": "common.schema.json#/$defs/NonBlankString" },
+        "endpoint": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/AbsoluteHttpsUrl" },
+            { "type": "null" }
+          ]
+        },
+        "credential_ref": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/CredentialRef" },
+            { "type": "null" }
+          ]
+        },
+        "provider_config": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/VolcengineAsrProviderConfig" },
+            { "$ref": "common.schema.json#/$defs/ChatCompletionsProviderConfig" },
+            { "$ref": "common.schema.json#/$defs/VertexAudioProviderConfig" }
+          ]
+        },
+        "enabled": { "type": "boolean" },
+        "cloud_data_confirmation": { "$ref": "common.schema.json#/$defs/CloudDataConfirmation" },
+        "config_fingerprint": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "last_check": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/ModelCheckRecord" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "PluginModelConfigBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["config_id", "name", "role", "runtime", "plugin_id", "connection_id", "connection_type", "model", "endpoint", "credential_ref", "provider_config", "declared_capabilities", "enabled", "cloud_data_confirmation", "config_fingerprint", "last_check"],
+      "properties": {
+        "config_id": { "$ref": "common.schema.json#/$defs/ProtocolId" },
+        "name": { "$ref": "common.schema.json#/$defs/NonBlankString" },
+        "role": { "$ref": "common.schema.json#/$defs/ModelRole" },
+        "runtime": { "$ref": "common.schema.json#/$defs/Runtime" },
+        "plugin_id": { "$ref": "common.schema.json#/$defs/NonBlankString" },
+        "connection_id": { "$ref": "common.schema.json#/$defs/ProtocolId" },
+        "connection_type": { "$ref": "common.schema.json#/$defs/NonBlankString" },
+        "model": { "$ref": "common.schema.json#/$defs/NonBlankString" },
+        "endpoint": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/AbsoluteHttpsUrl" },
+            { "type": "null" }
+          ]
+        },
+        "credential_ref": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/CredentialRef" },
+            { "type": "null" }
+          ]
+        },
+        "provider_config": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/VolcengineAsrProviderConfig" },
+            { "$ref": "common.schema.json#/$defs/ChatCompletionsProviderConfig" },
+            { "$ref": "common.schema.json#/$defs/VertexAudioProviderConfig" }
+          ]
+        },
+        "declared_capabilities": { "$ref": "#/$defs/ModelCapabilityProfile" },
+        "enabled": { "type": "boolean" },
+        "cloud_data_confirmation": { "$ref": "common.schema.json#/$defs/CloudDataConfirmation" },
+        "config_fingerprint": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "last_check": {
+          "oneOf": [
+            { "$ref": "#/$defs/VerifiedModelCheckRecord" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "AsrModelConfig": {
+      "allOf": [
+        { "$ref": "#/$defs/ModelConfigBase" },
+        {
+          "type": "object",
+          "properties": {
+            "role": { "const": "asr" },
+            "runtime": { "const": "cloud" },
+            "adapter": { "const": "volcengine_asr" },
+            "endpoint": { "type": "null" },
+            "credential_ref": { "$ref": "common.schema.json#/$defs/CredentialRef" },
+            "provider_config": { "$ref": "common.schema.json#/$defs/VolcengineAsrProviderConfig" }
+          }
+        }
+      ]
+    },
+    "CalibrationModelConfig": {
+      "allOf": [
+        { "$ref": "#/$defs/ModelConfigBase" },
+        {
+          "type": "object",
+          "properties": {
+            "role": { "const": "calibration" },
+            "runtime": { "const": "cloud" },
+            "adapter": { "const": "openai_chat_completions" },
+            "endpoint": { "$ref": "common.schema.json#/$defs/AbsoluteHttpsUrl" },
+            "credential_ref": {
+              "oneOf": [
+                { "$ref": "common.schema.json#/$defs/CredentialRef" },
+                { "type": "null" }
+              ]
+            },
+            "provider_config": { "$ref": "common.schema.json#/$defs/ChatCompletionsProviderConfig" }
+          }
+        }
+      ]
+    },
+    "AudioVerificationModelConfig": {
+      "allOf": [
+        { "$ref": "#/$defs/ModelConfigBase" },
+        {
+          "type": "object",
+          "properties": {
+            "role": { "const": "audio_verification" },
+            "runtime": { "const": "cloud" },
+            "adapter": { "const": "vertex_gemini_audio_verifier" },
+            "endpoint": { "type": "null" },
+            "credential_ref": { "$ref": "common.schema.json#/$defs/CredentialRef" },
+            "provider_config": { "$ref": "common.schema.json#/$defs/VertexAudioProviderConfig" }
+          }
+        }
+      ]
+    },
+    "VolcenginePluginModelConfig": {
+      "allOf": [
+        { "$ref": "#/$defs/PluginModelConfigBase" },
+        {
+          "type": "object",
+          "properties": {
+            "role": { "const": "asr" },
+            "runtime": { "const": "cloud" },
+            "plugin_id": { "const": "volcengine_asr" },
+            "connection_type": { "const": "volcengine_cloud" },
+            "endpoint": { "type": "null" },
+            "credential_ref": { "$ref": "common.schema.json#/$defs/CredentialRef" },
+            "provider_config": { "$ref": "common.schema.json#/$defs/VolcengineAsrProviderConfig" }
+          }
+        }
+      ]
+    },
+    "ChatPluginModelConfig": {
+      "allOf": [
+        { "$ref": "#/$defs/PluginModelConfigBase" },
+        {
+          "type": "object",
+          "properties": {
+            "role": { "const": "calibration" },
+            "runtime": { "const": "cloud" },
+            "plugin_id": { "const": "openai_chat_completions" },
+            "connection_type": { "const": "compatible_endpoint" },
+            "endpoint": { "$ref": "common.schema.json#/$defs/AbsoluteHttpsUrl" },
+            "credential_ref": {
+              "oneOf": [
+                { "$ref": "common.schema.json#/$defs/CredentialRef" },
+                { "type": "null" }
+              ]
+            },
+            "provider_config": { "$ref": "common.schema.json#/$defs/ChatCompletionsProviderConfig" }
+          }
+        }
+      ]
+    },
+    "GeminiPluginModelConfig": {
+      "allOf": [
+        { "$ref": "#/$defs/PluginModelConfigBase" },
+        {
+          "type": "object",
+          "properties": {
+            "role": { "const": "audio_verification" },
+            "runtime": { "const": "cloud" },
+            "plugin_id": { "const": "gemini" },
+            "endpoint": { "type": "null" },
+            "credential_ref": { "$ref": "common.schema.json#/$defs/CredentialRef" }
+          }
+        },
+        {
+          "type": "object",
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "connection_type": { "const": "developer_api" },
+                "provider_config": { "$ref": "common.schema.json#/$defs/GeminiDeveloperProviderConfig" }
+              }
+            },
+            {
+              "type": "object",
+              "properties": {
+                "connection_type": { "const": "vertex_ai" },
+                "provider_config": { "$ref": "common.schema.json#/$defs/VertexAudioProviderConfig" }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "ModelConfig": {
+      "x-mercury-invariant-id": "INV-MOD-008",
+      "type": "object",
+      "oneOf": [
+        { "$ref": "#/$defs/AsrModelConfig" },
+        { "$ref": "#/$defs/CalibrationModelConfig" },
+        { "$ref": "#/$defs/AudioVerificationModelConfig" },
+        { "$ref": "#/$defs/VolcenginePluginModelConfig" },
+        { "$ref": "#/$defs/ChatPluginModelConfig" },
+        { "$ref": "#/$defs/GeminiPluginModelConfig" }
+      ]
+    }
+  },
+  "x-mercury-semantic-checks": [
+    { "check": "unique-model-config-ids", "invariant_id": "INV-GEN-004" },
+    { "check": "model-defaults", "invariant_id": "INV-MOD-001" },
+    { "check": "model-fingerprints", "invariant_id": "INV-MOD-002-FP" },
+    { "check": "model-check-consistency", "invariant_id": "INV-MOD-002" },
+    { "check": "model-confirmation-before-check", "invariant_id": "INV-CLD-001" },
+    { "check": "model-check-times", "invariant_id": "INV-GEN-003" },
+    { "check": "model-confirmation-consistency", "invariant_id": "INV-CLD-002" },
+    { "check": "model-registry-times", "invariant_id": "INV-GEN-003" },
+    { "check": "model-gcs-capability", "invariant_id": "INV-GCS-002" },
+    { "check": "no-sensitive-provider-config", "invariant_id": "INV-SEC-001" },
+    { "check": "no-sensitive-model-metadata", "invariant_id": "INV-SEC-001" }
+  ]
+}

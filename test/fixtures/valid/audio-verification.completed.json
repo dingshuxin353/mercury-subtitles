@@ -1,0 +1,52 @@
+{
+  "schema_version": "1.0.0",
+  "task_id": "task-001",
+  "created_at": "2026-08-05T08:04:06.000+08:00",
+  "status": "completed",
+  "model_snapshot_ref": "snapshot-001",
+  "input": {
+    "audio_ref": "input/sample.mp3",
+    "audio_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "transcript_ref": "work/transcript.raw.json",
+    "calibration_ref": "work/calibration-result.json",
+    "reference_srt_ref": "input/reference.srt"
+  },
+  "calls": [{
+    "call_id": "call-verification-0001",
+    "model_snapshot_entry_ref": "snapshot-entry-audio",
+    "started_at": "2026-08-05T08:04:00.000+08:00",
+    "ended_at": "2026-08-05T08:04:03.000+08:00",
+    "outcome": "completed",
+    "provider_request_id": "request-fixture-verification-0001",
+    "error_ref": null
+  }],
+  "staging": [{
+    "staging_id": "staging-001",
+    "call_ref": "call-verification-0001",
+    "object_uri": "gs://fixture-bucket/task-001/object-0001.mp3",
+    "created_at": "2026-08-05T08:03:30.000+08:00",
+    "cleanup_status": "completed",
+    "cleanup_finished_at": "2026-08-05T08:04:05.000+08:00",
+    "error_ref": null
+  }],
+  "findings": [{
+    "finding_id": "finding-0001",
+    "kind": "text_correction",
+    "start_ms": 0,
+    "end_ms": 2500,
+    "current_text": "欢迎使用水兴",
+    "suggested_text": "欢迎使用水星",
+    "rationale": "音频证据支持该文字修正。",
+    "confidence": "high"
+  }],
+  "application_results": [{
+    "application_id": "application-0001",
+    "finding_ref": "finding-0001",
+    "disposition": "applied",
+    "reason": "accepted_by_rules",
+    "modification_ref": "modification-0001"
+  }],
+  "skip_reason": null,
+  "warnings": [],
+  "errors": []
+}

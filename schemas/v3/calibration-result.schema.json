@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercury.local/schemas/v3/calibration-result.schema.json",
+  "title": "CalibrationResultV3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "created_at",
+    "status",
+    "request",
+    "model_snapshot_ref",
+    "call",
+    "strategy",
+    "corrected_units",
+    "suggestions",
+    "warnings",
+    "errors"
+  ],
+  "properties": {
+    "schema_version": { "const": "3.0.0" },
+    "task_id": { "$ref": "../v1/common.schema.json#/$defs/ProtocolId" },
+    "created_at": { "$ref": "../v1/common.schema.json#/$defs/Timestamp" },
+    "status": { "type": "string", "enum": ["completed", "failed"] },
+    "request": { "$ref": "../v2/calibration-result.schema.json#/$defs/CalibrationRequestV2" },
+    "model_snapshot_ref": { "$ref": "../v1/common.schema.json#/$defs/ProtocolId" },
+    "provider_outcome_certainty": { "enum": ["known_terminal", "outcome_unknown"] },
+    "call": { "$ref": "../v1/common.schema.json#/$defs/CallRecord" },
+    "strategy": { "$ref": "#/$defs/CalibrationStrategyV3" },
+    "corrected_units": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/CorrectedUnitV3" }
+    },
+    "suggestions": {
+      "type": "array",
+      "items": { "$ref": "../v2/calibration-result.schema.json#/$defs/CalibrationSuggestionV2" }
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "$ref": "../v1/common.schema.json#/$defs/WarningRecord" }
+    },
+    "errors": {
+      "type": "array",
+      "items": { "$ref": "../v1/common.schema.json#/$defs/ErrorRecord" }
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "status": { "const": "completed" },
+        "call": { "type": "object", "properties": { "outcome": { "const": "completed" } } },
+        "strategy": { "type": "object", "properties": { "coverage_complete": { "const": true } } },
+        "corrected_units": { "type": "array", "minItems": 1 },
+        "errors": { "type": "array", "maxItems": 0 }
+      }
+    },
+    {
+      "properties": {
+        "status": { "const": "failed" },
+        "call": { "type": "object", "properties": { "outcome": { "const": "failed" } } },
+        "strategy": { "type": "object", "properties": { "coverage_complete": { "const": false } } },
+        "corrected_units": { "type": "array", "maxItems": 0 },
+        "suggestions": { "type": "array", "maxItems": 0 },
+        "errors": { "type": "array", "minItems": 1 }
+      }
+    }
+  ],
+  "$defs": {
+    "CalibrationStrategyV3": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "prompt_version",
+        "response_contract_version",
+        "output_budget_tokens",
+        "provider_finish_reason",
+        "input_unit_count",
+        "returned_unit_count",
+        "coverage_complete"
+      ],
+      "properties": {
+        "prompt_version": { "const": "mercury-alpha3-full-calibration-v2" },
+        "response_contract_version": { "const": "corrected-units-v1" },
+        "output_budget_tokens": { "type": "integer", "minimum": 1024 },
+        "provider_finish_reason": {
+          "oneOf": [
+            { "$ref": "../v1/common.schema.json#/$defs/NonBlankString" },
+            { "type": "null" }
+          ]
+        },
+        "input_unit_count": { "type": "integer", "minimum": 1 },
+        "returned_unit_count": { "type": "integer", "minimum": 0 },
+        "coverage_complete": { "type": "boolean" }
+      }
+    },
+    "CorrectedUnitV3": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit_id",
+        "original_text",
+        "corrected_text",
+        "rationale",
+        "start_ms",
+        "end_ms",
+        "asr_segment_refs",
+        "reference_segment_refs",
+        "changed"
+      ],
+      "properties": {
+        "unit_id": { "$ref": "../v1/common.schema.json#/$defs/ProtocolId" },
+        "original_text": { "$ref": "../v1/common.schema.json#/$defs/NonBlankString" },
+        "corrected_text": { "$ref": "../v1/common.schema.json#/$defs/NonBlankString" },
+        "rationale": {
+          "oneOf": [
+            { "$ref": "../v1/common.schema.json#/$defs/NonBlankString" },
+            { "type": "null" }
+          ]
+        },
+        "start_ms": { "$ref": "../v1/common.schema.json#/$defs/NonNegativeMilliseconds" },
+        "end_ms": { "$ref": "../v1/common.schema.json#/$defs/PositiveMilliseconds" },
+        "asr_segment_refs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "../v1/common.schema.json#/$defs/ProtocolId" }
+        },
+        "reference_segment_refs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "../v1/common.schema.json#/$defs/ProtocolId" }
+        },
+        "changed": { "type": "boolean" }
+      }
+    }
+  }
+}

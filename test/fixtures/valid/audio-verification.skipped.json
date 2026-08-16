@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0.0",
+  "task_id": "task-001",
+  "created_at": "2026-08-05T08:03:04.000+08:00",
+  "status": "skipped",
+  "model_snapshot_ref": null,
+  "input": {
+    "audio_ref": "input/sample.mp3",
+    "audio_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "transcript_ref": "work/transcript.raw.json",
+    "calibration_ref": "work/calibration-result.json",
+    "reference_srt_ref": "input/reference.srt"
+  },
+  "calls": [],
+  "staging": [],
+  "findings": [],
+  "application_results": [],
+  "skip_reason": "not_configured",
+  "warnings": [],
+  "errors": []
+}

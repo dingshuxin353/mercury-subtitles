@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercury.local/schemas/v2/model-snapshot.schema.json",
+  "title": "ModelSnapshotV2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "snapshot_id",
+    "task_id",
+    "captured_at",
+    "models"
+  ],
+  "properties": {
+    "schema_version": { "const": "2.0.0" },
+    "snapshot_id": { "$ref": "../v1/common.schema.json#/$defs/ProtocolId" },
+    "task_id": { "$ref": "../v1/common.schema.json#/$defs/ProtocolId" },
+    "captured_at": { "$ref": "../v1/common.schema.json#/$defs/Timestamp" },
+    "models": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asr", "chat"],
+      "properties": {
+        "asr": { "$ref": "#/$defs/ModelSnapshotEntryV2" },
+        "chat": { "$ref": "#/$defs/ModelSnapshotEntryV2" }
+      }
+    }
+  },
+  "$defs": {
+    "ModelCapabilityProfileV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capabilities",
+        "input_modalities",
+        "output_types",
+        "structured_output"
+      ],
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["transcription", "calibration"]
+          }
+        },
+        "input_modalities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["text", "audio", "image", "video"]
+          }
+        },
+        "output_types": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["timed_transcript", "structured_result"]
+          }
+        },
+        "structured_output": { "type": "boolean" }
+      }
+    },
+    "ModelCheckSnapshotV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "check_id",
+        "model_id",
+        "config_fingerprint",
+        "category",
+        "confirmation_ref",
+        "started_at",
+        "ended_at",
+        "outcome",
+        "actual_model",
+        "verified_capabilities",
+        "evidence",
+        "error"
+      ],
+      "properties": {
+        "check_id": { "$ref": "../v1/common.schema.json#/$defs/ProtocolId" },
+        "model_id": { "$ref": "../v1/common.schema.json#/$defs/ProtocolId" },
+        "config_fingerprint": {
+          "$ref": "../v1/common.schema.json#/$defs/Sha256"
+        },
+        "category": { "type": "string", "enum": ["asr", "chat"] },
+        "confirmation_ref": {
+          "$ref": "../v1/common.schema.json#/$defs/ProtocolId"
+        },
+        "started_at": { "$ref": "../v1/common.schema.json#/$defs/Timestamp" },
+        "ended_at": { "$ref": "../v1/common.schema.json#/$defs/Timestamp" },
+        "outcome": { "const": "passed" },
+        "actual_model": {
+          "$ref": "../v1/common.schema.json#/$defs/NonBlankString"
+        },
+        "verified_capabilities": { "$ref": "#/$defs/ModelCapabilityProfileV2" },
+        "evidence": { "type": "object" },
+        "error": { "type": "null" }
+      }
+    },
+    "ModelSnapshotEntryV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "snapshot_entry_id",
+        "model_id",
+        "name",
+        "category",
+        "plugin_id",
+        "connection_id",
+        "connection_type",
+        "provider_model",
+        "runtime",
+        "endpoint",
+        "credential_ref",
+        "provider_config",
+        "declared_capabilities",
+        "verified_capabilities",
+        "cloud_data_confirmation",
+        "config_fingerprint",
+        "check_snapshot"
+      ],
+      "properties": {
+        "snapshot_entry_id": {
+          "$ref": "../v1/common.schema.json#/$defs/ProtocolId"
+        },
+        "model_id": { "$ref": "../v1/common.schema.json#/$defs/ProtocolId" },
+        "name": { "$ref": "../v1/common.schema.json#/$defs/NonBlankString" },
+        "category": { "type": "string", "enum": ["asr", "chat"] },
+        "plugin_id": {
+          "type": "string",
+          "enum": ["volcengine_asr", "volcengine_subtitle_asr", "openai_chat_completions", "gemini"]
+        },
+        "connection_id": {
+          "$ref": "../v1/common.schema.json#/$defs/ProtocolId"
+        },
+        "connection_type": {
+          "type": "string",
+          "enum": [
+            "volcengine_cloud",
+            "volcengine_subtitle_cloud",
+            "compatible_endpoint",
+            "vertex_ai",
+            "developer_api"
+          ]
+        },
+        "provider_model": {
+          "$ref": "../v1/common.schema.json#/$defs/NonBlankString"
+        },
+        "runtime": { "const": "cloud" },
+        "endpoint": {
+          "oneOf": [
+            { "$ref": "../v1/common.schema.json#/$defs/AbsoluteHttpsUrl" },
+            { "type": "null" }
+          ]
+        },
+        "credential_ref": {
+          "oneOf": [
+            { "$ref": "../v1/common.schema.json#/$defs/CredentialRef" },
+            { "type": "null" }
+          ]
+        },
+        "provider_config": { "type": "object" },
+        "declared_capabilities": { "$ref": "#/$defs/ModelCapabilityProfileV2" },
+        "verified_capabilities": { "$ref": "#/$defs/ModelCapabilityProfileV2" },
+        "cloud_data_confirmation": {
+          "$ref": "../v1/common.schema.json#/$defs/CloudDataConfirmation"
+        },
+        "config_fingerprint": {
+          "$ref": "../v1/common.schema.json#/$defs/Sha256"
+        },
+        "check_snapshot": { "$ref": "#/$defs/ModelCheckSnapshotV2" }
+      }
+    }
+  }
+}

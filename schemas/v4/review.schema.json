@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercury.local/schemas/v4/review.schema.json",
+  "title": "ReviewRecordV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "task_id", "created_at", "updated_at", "status", "sources", "counts", "changes", "batches", "approved_artifact"],
+  "properties": {
+    "contract_version": { "const": "mercury-review-experimental-v1" },
+    "task_id": { "type": "string" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "status": { "enum": ["not_ready", "pending", "in_progress", "approved", "not_required"] },
+    "sources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["calibration_result_ref", "calibration_result_sha256", "calibrated_transcript", "transcribed_srt", "calibrated_srt"],
+      "properties": {
+        "calibration_result_ref": { "const": "work/calibration-result.json" },
+        "calibration_result_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "calibrated_transcript": {
+          "type": "object", "additionalProperties": false, "required": ["path", "sha256"],
+          "properties": { "path": { "const": "work/transcript.calibrated.json" }, "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" } }
+        },
+        "transcribed_srt": { "$ref": "#/$defs/source" },
+        "calibrated_srt": { "$ref": "#/$defs/source" }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "pending", "accepted", "rejected", "edited"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "pending": { "type": "integer", "minimum": 0 },
+        "accepted": { "type": "integer", "minimum": 0 },
+        "rejected": { "type": "integer", "minimum": 0 },
+        "edited": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "changes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/change" }
+    },
+    "batches": { "type": "array", "items": { "$ref": "#/$defs/batch" } },
+    "approved_artifact": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/artifact" }] }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "type": "string" },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    },
+    "history": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision", "final_text", "decided_at", "actor"],
+      "properties": {
+        "decision": { "enum": ["accepted", "rejected", "edited"] },
+        "final_text": { "type": "string", "minLength": 1 },
+        "decided_at": { "type": "string", "format": "date-time" },
+        "actor": { "enum": ["user_via_cli", "user_via_skill"] }
+      }
+    },
+    "change": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["change_id", "unit_id", "segment_index", "target_segment_indexes", "target_text_start", "target_text_end", "source_refs", "start_ms", "end_ms", "original_text", "proposed_text", "reason", "decision", "final_text", "decided_at", "actor", "history"],
+      "properties": {
+        "change_id": { "type": "string", "pattern": "^chg-[a-f0-9]{16}$" },
+        "unit_id": { "type": "string", "minLength": 1 },
+        "segment_index": { "type": "integer", "minimum": 0 },
+        "target_segment_indexes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "integer", "minimum": 0 } },
+        "target_text_start": { "type": "integer", "minimum": 0 },
+        "target_text_end": { "type": "integer", "minimum": 1 },
+        "source_refs": { "type": "array", "items": { "type": "string" } },
+        "start_ms": { "type": "integer", "minimum": 0 },
+        "end_ms": { "type": "integer", "minimum": 1 },
+        "original_text": { "type": "string", "minLength": 1 },
+        "proposed_text": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 },
+        "decision": { "enum": ["pending", "accepted", "rejected", "edited"] },
+        "final_text": { "type": ["string", "null"] },
+        "decided_at": { "type": ["string", "null"], "format": "date-time" },
+        "actor": { "type": ["string", "null"], "enum": ["user_via_cli", "user_via_skill", null] },
+        "history": { "type": "array", "items": { "$ref": "#/$defs/history" } }
+      }
+    },
+    "batch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["batch_id", "operation", "count", "occurred_at", "actor"],
+      "properties": {
+        "batch_id": { "type": "string" },
+        "operation": { "const": "accept_all" },
+        "count": { "type": "integer", "minimum": 0 },
+        "occurred_at": { "type": "string", "format": "date-time" },
+        "actor": { "enum": ["user_via_cli", "user_via_skill"] }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "segment_count", "generated_at", "validation"],
+      "properties": {
+        "path": { "type": "string" },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "segment_count": { "type": "integer", "minimum": 1 },
+        "generated_at": { "type": "string", "format": "date-time" },
+        "validation": { "const": "passed" }
+      }
+    }
+  }
+}

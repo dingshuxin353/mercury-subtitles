@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercury.local/schemas/v1/transcript.raw.schema.json",
+  "title": "TranscriptRaw",
+  "x-mercury-invariant-id": "INV-ASR-001",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "created_at",
+    "audio",
+    "full_text",
+    "segments",
+    "model_snapshot_ref",
+    "call",
+    "raw_response_ref",
+    "warnings",
+    "errors"
+  ],
+  "properties": {
+    "schema_version": { "$ref": "common.schema.json#/$defs/SchemaVersion" },
+    "task_id": { "$ref": "common.schema.json#/$defs/ProtocolId" },
+    "created_at": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "audio": { "$ref": "common.schema.json#/$defs/AudioSource" },
+    "full_text": { "$ref": "common.schema.json#/$defs/MultilineNonBlankString" },
+    "segments": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/TranscriptSegment" }
+    },
+    "model_snapshot_ref": { "$ref": "common.schema.json#/$defs/ProtocolId" },
+    "call": { "$ref": "common.schema.json#/$defs/CallRecord" },
+    "raw_response_ref": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/TaskRelativePath" },
+        { "type": "null" }
+      ]
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/WarningRecord" }
+    },
+    "errors": {
+      "x-mercury-invariant-id": "INV-ASR-002",
+      "type": "array",
+      "maxItems": 0,
+      "items": { "$ref": "common.schema.json#/$defs/ErrorRecord" }
+    }
+  },
+  "$defs": {
+    "NullableConfidence": {
+      "oneOf": [
+        { "type": "number", "minimum": 0, "maximum": 1 },
+        { "type": "null" }
+      ]
+    },
+    "WordTiming": {
+      "x-mercury-invariant-id": "INV-ASR-001",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["word_id", "index", "start_ms", "end_ms", "text", "confidence"],
+      "properties": {
+        "word_id": { "$ref": "common.schema.json#/$defs/ProtocolId" },
+        "index": { "type": "integer", "minimum": 0 },
+        "start_ms": { "$ref": "common.schema.json#/$defs/NonNegativeMilliseconds" },
+        "end_ms": { "$ref": "common.schema.json#/$defs/PositiveMilliseconds" },
+        "text": { "$ref": "common.schema.json#/$defs/NonBlankString" },
+        "confidence": { "$ref": "#/$defs/NullableConfidence" }
+      }
+    },
+    "TranscriptSegment": {
+      "x-mercury-invariant-id": "INV-ASR-001",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["segment_id", "index", "start_ms", "end_ms", "text", "confidence", "words"],
+      "properties": {
+        "segment_id": { "$ref": "common.schema.json#/$defs/ProtocolId" },
+        "index": { "type": "integer", "minimum": 0 },
+        "start_ms": { "$ref": "common.schema.json#/$defs/NonNegativeMilliseconds" },
+        "end_ms": { "$ref": "common.schema.json#/$defs/PositiveMilliseconds" },
+        "text": { "$ref": "common.schema.json#/$defs/NonBlankString" },
+        "confidence": { "$ref": "#/$defs/NullableConfidence" },
+        "words": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/WordTiming" }
+        }
+      }
+    }
+  },
+  "x-mercury-semantic-checks": [
+    { "check": "transcript-content-consistency", "invariant_id": "INV-ASR-001" },
+    { "check": "transcript-segment-order", "invariant_id": "INV-ASR-001" },
+    { "check": "transcript-segment-time-ranges", "invariant_id": "INV-ASR-001" },
+    { "check": "transcript-word-time-ranges", "invariant_id": "INV-ASR-001" },
+    { "check": "transcript-unique-ids", "invariant_id": "INV-GEN-004" },
+    { "check": "transcript-call-success", "invariant_id": "INV-ASR-002" },
+    { "check": "artifact-created-after-terminal-records", "invariant_id": "INV-GEN-003" },
+    { "check": "artifact-diagnostic-links", "invariant_id": "INV-GEN-004" },
+    { "check": "no-sensitive-provider-config", "invariant_id": "INV-SEC-001" },
+    { "check": "no-sensitive-model-metadata", "invariant_id": "INV-SEC-001" }
+  ]
+}

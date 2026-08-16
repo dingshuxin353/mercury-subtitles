@@ -1,0 +1,340 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercury.local/schemas/v1/audio-verification.schema.json",
+  "title": "AudioVerification",
+  "x-mercury-invariant-id": "INV-AV-001",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "created_at",
+    "status",
+    "model_snapshot_ref",
+    "input",
+    "calls",
+    "staging",
+    "findings",
+    "application_results",
+    "skip_reason",
+    "warnings",
+    "errors"
+  ],
+  "properties": {
+    "schema_version": { "$ref": "common.schema.json#/$defs/SchemaVersion" },
+    "task_id": { "$ref": "common.schema.json#/$defs/ProtocolId" },
+    "created_at": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "status": {
+      "type": "string",
+      "enum": ["not_requested", "skipped", "failed", "completed"]
+    },
+    "model_snapshot_ref": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/ProtocolId" },
+        { "type": "null" }
+      ]
+    },
+    "input": {
+      "oneOf": [
+        { "$ref": "#/$defs/VerificationInput" },
+        { "type": "null" }
+      ]
+    },
+    "calls": {
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/CallRecord" }
+    },
+    "staging": {
+      "type": "array",
+      "maxItems": 1,
+      "items": { "$ref": "common.schema.json#/$defs/StagingRecord" }
+    },
+    "local_chunking": {
+      "oneOf": [
+        { "$ref": "#/$defs/LocalAudioChunkingExecution" },
+        { "type": "null" }
+      ]
+    },
+    "findings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/VerificationFinding" }
+    },
+    "application_results": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ApplicationResult" }
+    },
+    "skip_reason": {
+      "oneOf": [
+        { "$ref": "#/$defs/SkipReason" },
+        { "type": "null" }
+      ]
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/WarningRecord" }
+    },
+    "errors": {
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/ErrorRecord" }
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/NotRequestedState" },
+    { "$ref": "#/$defs/SkippedState" },
+    { "$ref": "#/$defs/FailedState" },
+    { "$ref": "#/$defs/CompletedState" }
+  ],
+  "$defs": {
+    "LocalAudioChunkingExecution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["threshold_bytes", "source_bytes", "parts"],
+      "properties": {
+        "threshold_bytes": { "const": 15000000 },
+        "source_bytes": { "type": "integer", "minimum": 1 },
+        "parts": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "common.schema.json#/$defs/AudioChunkRecord" }
+        }
+      }
+    },
+    "SkipReason": {
+      "type": "string",
+      "enum": [
+        "not_configured",
+        "cloud_confirmation_missing",
+        "check_missing_or_stale",
+        "input_limit_exceeded",
+        "known_model_limitation",
+        "base_result_unavailable"
+      ]
+    },
+    "VerificationInput": {
+      "x-mercury-invariant-id": "INV-AV-006",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "audio_ref",
+        "audio_sha256",
+        "transcript_ref",
+        "calibration_ref",
+        "reference_srt_ref"
+      ],
+      "properties": {
+        "audio_ref": { "$ref": "common.schema.json#/$defs/TaskRelativePath" },
+        "audio_sha256": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "transcript_ref": { "const": "work/transcript.raw.json" },
+        "calibration_ref": { "const": "work/calibration-result.json" },
+        "reference_srt_ref": {
+          "oneOf": [
+            { "const": "input/reference.srt" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "VerificationFinding": {
+      "x-mercury-invariant-id": "INV-AV-004",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "finding_id",
+        "kind",
+        "start_ms",
+        "end_ms",
+        "current_text",
+        "suggested_text",
+        "rationale",
+        "confidence"
+      ],
+      "properties": {
+        "finding_id": { "$ref": "common.schema.json#/$defs/ProtocolId" },
+        "kind": {
+          "type": "string",
+          "enum": ["text_correction", "segmentation", "timing", "translation", "uncertain"]
+        },
+        "start_ms": { "$ref": "common.schema.json#/$defs/NonNegativeMilliseconds" },
+        "end_ms": { "$ref": "common.schema.json#/$defs/PositiveMilliseconds" },
+        "current_text": { "$ref": "common.schema.json#/$defs/NonBlankString" },
+        "suggested_text": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/NonBlankString" },
+            { "type": "null" }
+          ]
+        },
+        "rationale": { "$ref": "common.schema.json#/$defs/NonBlankString" },
+        "confidence": { "type": "string", "enum": ["low", "medium", "high"] },
+        "source_segment_refs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "common.schema.json#/$defs/ProtocolId" }
+        }
+      },
+      "if": { "properties": { "kind": { "const": "uncertain" } }, "required": ["kind"] },
+      "else": {
+            "properties": {
+              "suggested_text": { "$ref": "common.schema.json#/$defs/NonBlankString" }
+            }
+      }
+    },
+    "ApplicationResult": {
+      "x-mercury-invariant-id": "INV-AV-004",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["application_id", "finding_ref", "disposition", "reason", "modification_ref"],
+      "properties": {
+        "application_id": { "$ref": "common.schema.json#/$defs/ProtocolId" },
+        "finding_ref": { "$ref": "common.schema.json#/$defs/ProtocolId" },
+        "disposition": { "type": "string", "enum": ["applied", "not_applied"] },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "accepted_by_rules",
+            "verification_failed",
+            "translation_out_of_scope",
+            "insufficient_evidence",
+            "mode_disallows_change",
+            "invalid_timeline",
+            "no_change"
+          ]
+        },
+        "modification_ref": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/ProtocolId" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "if": { "properties": { "disposition": { "const": "applied" } }, "required": ["disposition"] },
+      "then": {
+            "properties": {
+              "reason": { "const": "accepted_by_rules" },
+              "modification_ref": { "$ref": "common.schema.json#/$defs/ProtocolId" }
+            }
+      },
+      "else": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "verification_failed",
+                  "translation_out_of_scope",
+                  "insufficient_evidence",
+                  "mode_disallows_change",
+                  "invalid_timeline",
+                  "no_change"
+                ]
+              },
+              "modification_ref": { "type": "null" }
+            }
+      }
+    },
+    "NotRequestedState": {
+      "x-mercury-invariant-id": "INV-AV-002-N",
+      "type": "object",
+      "properties": {
+        "status": { "const": "not_requested" },
+        "model_snapshot_ref": { "type": "null" },
+        "input": { "type": "null" },
+        "calls": { "type": "array", "maxItems": 0 },
+        "staging": { "type": "array", "maxItems": 0 },
+        "findings": { "type": "array", "maxItems": 0 },
+        "application_results": { "type": "array", "maxItems": 0 },
+        "skip_reason": { "type": "null" },
+        "warnings": { "type": "array", "maxItems": 0 },
+        "errors": { "type": "array", "maxItems": 0 }
+      }
+    },
+    "SkippedState": {
+      "x-mercury-invariant-id": "INV-AV-002-S",
+      "type": "object",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "status": { "const": "skipped" },
+            "model_snapshot_ref": { "type": "null" },
+            "input": { "$ref": "#/$defs/VerificationInput" },
+            "skip_reason": {
+              "enum": ["not_configured", "cloud_confirmation_missing", "check_missing_or_stale"]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": { "const": "skipped" },
+            "model_snapshot_ref": { "$ref": "common.schema.json#/$defs/ProtocolId" },
+            "input": { "$ref": "#/$defs/VerificationInput" },
+            "skip_reason": { "enum": ["input_limit_exceeded", "known_model_limitation"] }
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": { "const": "skipped" },
+            "model_snapshot_ref": { "$ref": "common.schema.json#/$defs/ProtocolId" },
+            "input": { "type": "null" },
+            "skip_reason": { "const": "base_result_unavailable" }
+          }
+        }
+      ],
+      "properties": {
+        "calls": { "type": "array", "maxItems": 0 },
+        "staging": { "type": "array", "maxItems": 0 },
+        "findings": { "type": "array", "maxItems": 0 },
+        "application_results": { "type": "array", "maxItems": 0 },
+        "warnings": { "type": "array", "maxItems": 0 },
+        "errors": { "type": "array", "maxItems": 0 }
+      }
+    },
+    "FailedState": {
+      "x-mercury-invariant-id": "INV-AV-002-F",
+      "type": "object",
+      "properties": {
+        "status": { "const": "failed" },
+        "model_snapshot_ref": { "$ref": "common.schema.json#/$defs/ProtocolId" },
+        "input": { "$ref": "#/$defs/VerificationInput" },
+        "calls": { "type": "array" },
+        "staging": { "type": "array", "maxItems": 1 },
+        "skip_reason": { "type": "null" },
+        "errors": { "type": "array", "minItems": 1 }
+      }
+    },
+    "CompletedState": {
+      "x-mercury-invariant-id": "INV-AV-002-C",
+      "type": "object",
+      "properties": {
+        "status": { "const": "completed" },
+        "model_snapshot_ref": { "$ref": "common.schema.json#/$defs/ProtocolId" },
+        "input": { "$ref": "#/$defs/VerificationInput" },
+        "calls": { "type": "array", "minItems": 1 },
+        "staging": { "type": "array", "maxItems": 1 },
+        "skip_reason": { "type": "null" },
+        "errors": { "type": "array", "maxItems": 0 }
+      }
+    }
+  },
+  "x-mercury-semantic-checks": [
+    { "check": "audio-verification-failed-consistency", "invariant_id": "INV-AV-002-F" },
+    { "check": "audio-verification-completed-consistency", "invariant_id": "INV-AV-002-C" },
+    { "check": "audio-verification-finding-time-ranges", "invariant_id": "INV-GEN-003" },
+    { "check": "audio-verification-application-links", "invariant_id": "INV-AV-004" },
+    { "check": "audio-verification-application-policy", "invariant_id": "INV-AV-003" },
+    { "check": "audio-verification-staging-call-links", "invariant_id": "INV-GEN-004" },
+    { "check": "audio-verification-staging-call-times", "invariant_id": "INV-GEN-003" },
+    { "check": "audio-verification-chunk-ranges", "invariant_id": "INV-GEN-003" },
+    { "check": "audio-verification-chunk-links", "invariant_id": "INV-GEN-004" },
+    { "check": "audio-verification-chunk-local-only", "invariant_id": "INV-AV-006" },
+    { "check": "audio-verification-chunk-completed-status", "invariant_id": "INV-AV-002-C" },
+    { "check": "audio-verification-chunk-failed-status", "invariant_id": "INV-AV-002-F" },
+    { "check": "audio-verification-unique-ids", "invariant_id": "INV-GEN-004" },
+    { "check": "audio-verification-cleanup-consistency", "invariant_id": "INV-GCS-004-F" },
+    { "check": "staging-time-consistency", "invariant_id": "INV-GCS-004-C" },
+    { "check": "artifact-created-after-terminal-records", "invariant_id": "INV-GEN-003" },
+    { "check": "artifact-diagnostic-links", "invariant_id": "INV-GEN-004" },
+    { "check": "no-sensitive-provider-config", "invariant_id": "INV-SEC-001" },
+    { "check": "no-sensitive-model-metadata", "invariant_id": "INV-SEC-001" }
+  ]
+}

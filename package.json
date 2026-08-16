@@ -1,0 +1,96 @@
+{
+  "name": "mercury-subtitles",
+  "version": "0.2.0-alpha.2",
+  "description": "Local-first Chinese MP3 transcription, AI proofreading, and human-approved SRT workflow for CLI users and AI agents.",
+  "type": "module",
+  "packageManager": "npm@11.12.1",
+  "files": [
+    "dist",
+    "schemas",
+    "skills",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "NOTICE",
+    "VERSION"
+  ],
+  "main": "./dist/src/contracts/index.js",
+  "types": "./dist/src/contracts/index.d.ts",
+  "bin": {
+    "mercury": "./dist/src/bin.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/src/contracts/index.d.ts",
+      "import": "./dist/src/contracts/index.js"
+    },
+    "./subtitle-core": {
+      "types": "./dist/src/subtitle-core/index.d.ts",
+      "import": "./dist/src/subtitle-core/index.js"
+    },
+    "./output-report": {
+      "types": "./dist/src/output-report/index.d.ts",
+      "import": "./dist/src/output-report/index.js"
+    },
+    "./model-center": {
+      "types": "./dist/src/model-center/index.d.ts",
+      "import": "./dist/src/model-center/index.js"
+    },
+    "./schemas/v1/*": "./schemas/v1/*",
+    "./schemas/v2/*": "./schemas/v2/*",
+    "./schemas/v3/*": "./schemas/v3/*",
+    "./schemas/v4/*": "./schemas/v4/*"
+  },
+  "engines": {
+    "node": ">=24.0.0 <25.0.0"
+  },
+  "keywords": [
+    "subtitles",
+    "srt",
+    "transcription",
+    "chinese",
+    "cli",
+    "ai-agent",
+    "codex-skill"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dingshuxin353/mercury-subtitles.git"
+  },
+  "homepage": "https://github.com/dingshuxin353/mercury-subtitles#readme",
+  "bugs": {
+    "url": "https://github.com/dingshuxin353/mercury-subtitles/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "next"
+  },
+  "scripts": {
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "postbuild": "node scripts/mark-bin-executable.mjs",
+    "clean": "node scripts/clean.mjs",
+    "generate:types": "node scripts/generate-types.mjs",
+    "prepack": "npm run build",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "verify:d011": "vitest run test/d011-chat-calibration.test.ts test/cli.test.ts test/models.test.ts",
+    "verify:generated": "node scripts/verify-generated-types.mjs",
+    "verify:package": "node scripts/verify-package.mjs",
+    "build:public-snapshot": "node scripts/build-public-snapshot.mjs",
+    "verify:public-snapshot": "node scripts/verify-public-snapshot.mjs",
+    "verify:sensitive": "node scripts/scan-sensitive.mjs",
+    "verify": "npm run verify:generated && npm run typecheck && npm run build && npm test && npm run verify:package && npm run verify:sensitive"
+  },
+  "dependencies": {
+    "@google/genai": "^2.16.0",
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "json-schema-to-typescript": "15.0.4",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}

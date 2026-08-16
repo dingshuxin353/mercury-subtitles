@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 私密安全报告
+    url: https://github.com/dingshuxin353/mercury-subtitles/security/advisories/new
+    about: 未公开漏洞和需要私密处理的问题请使用此入口。

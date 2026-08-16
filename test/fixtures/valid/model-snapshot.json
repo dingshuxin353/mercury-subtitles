@@ -1,0 +1,149 @@
+{
+  "schema_version": "1.0.0",
+  "snapshot_id": "snapshot-001",
+  "task_id": "task-001",
+  "captured_at": "2026-08-05T08:01:00.000+08:00",
+  "models": {
+    "asr": {
+      "snapshot_entry_id": "snapshot-entry-asr",
+      "role": "asr",
+      "config_id": "asr-default",
+      "name": "ASR contract fixture",
+      "config_fingerprint": "74ca3bf4886c9149dd3d516b2a8dc4278108e6022961dd94e25799f23c3b61ec",
+      "adapter": "volcengine_asr",
+      "model": "bigmodel",
+      "runtime": "cloud",
+      "endpoint": null,
+      "credential_ref": "env:VOLCENGINE_API_KEY",
+      "provider_config": { "resource_id": "volc.bigasr.auc_turbo" },
+      "cloud_data_confirmation": {
+        "confirmation_id": "confirm-001",
+        "confirmed": true,
+        "confirmed_at": "2026-08-05T08:00:00.000+08:00",
+        "method": "interactive_cli",
+        "data_categories": ["audio"]
+      },
+      "check_snapshot": {
+        "check_id": "check-asr-001",
+        "config_id": "asr-default",
+        "config_fingerprint": "74ca3bf4886c9149dd3d516b2a8dc4278108e6022961dd94e25799f23c3b61ec",
+        "role": "asr",
+        "confirmation_ref": "confirm-001",
+        "started_at": "2026-08-05T08:00:10.000+08:00",
+        "ended_at": "2026-08-05T08:00:20.000+08:00",
+        "actual_model": "bigmodel",
+        "outcome": "passed",
+        "capabilities": {
+          "role": "asr",
+          "sample_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "language": "zh-CN",
+          "mime_type": "audio/mpeg",
+          "audio_input": "audio_data_base64",
+          "max_input_bytes": 104857600,
+          "max_audio_duration_ms": 7200000,
+          "transcript_chars": 12,
+          "segment_count": 2,
+          "timing_granularity": "segment"
+        },
+        "error": null
+      }
+    },
+    "calibration": {
+      "snapshot_entry_id": "snapshot-entry-calibration",
+      "role": "calibration",
+      "config_id": "calibration-default",
+      "name": "Calibration contract fixture",
+      "config_fingerprint": "1ccb1343404e2aa2fac9b97c420057875fa84fe78833e84d92e69f5ce127075b",
+      "adapter": "openai_chat_completions",
+      "model": "fixture-calibration-model",
+      "runtime": "cloud",
+      "endpoint": "https://chat.example.invalid/v1",
+      "credential_ref": "keychain:mercury-calibration",
+      "provider_config": {},
+      "cloud_data_confirmation": {
+        "confirmation_id": "confirm-002",
+        "confirmed": true,
+        "confirmed_at": "2026-08-05T08:00:00.000+08:00",
+        "method": "non_interactive_flag",
+        "data_categories": ["transcript", "reference_srt", "context"]
+      },
+      "check_snapshot": {
+        "check_id": "check-calibration-001",
+        "config_id": "calibration-default",
+        "config_fingerprint": "1ccb1343404e2aa2fac9b97c420057875fa84fe78833e84d92e69f5ce127075b",
+        "role": "calibration",
+        "confirmation_ref": "confirm-002",
+        "started_at": "2026-08-05T08:00:20.000+08:00",
+        "ended_at": "2026-08-05T08:00:30.000+08:00",
+        "actual_model": "fixture-calibration-model",
+        "outcome": "passed",
+        "capabilities": {
+          "role": "calibration",
+          "fixture_id": "calibration-fixture-v1",
+          "language": "zh-CN",
+          "request_profile": "chat_completions_minimal",
+          "parsed_suggestion_count": 1,
+          "result_schema_version": "1.0.0"
+        },
+        "error": null
+      }
+    },
+    "audio_verification": {
+      "snapshot_entry_id": "snapshot-entry-audio",
+      "role": "audio_verification",
+      "config_id": "audio-verification-default",
+      "name": "Audio verification contract fixture",
+      "config_fingerprint": "9319cd67a12e483f061a0d0f7db5b63eb70ea2b83d3e26cea652bb0a72fc2626",
+      "adapter": "vertex_gemini_audio_verifier",
+      "model": "gemini-audio-fixture",
+      "runtime": "cloud",
+      "endpoint": null,
+      "credential_ref": "adc:mercury-audio-verification",
+      "provider_config": {
+        "project": "fixture-project",
+        "location": "us-central1",
+        "gcs_bucket": "fixture-bucket"
+      },
+      "cloud_data_confirmation": {
+        "confirmation_id": "confirm-003",
+        "confirmed": true,
+        "confirmed_at": "2026-08-05T08:00:00.000+08:00",
+        "method": "interactive_cli",
+        "data_categories": ["audio", "reference_srt", "calibration_candidate", "timed_text", "context"]
+      },
+      "check_snapshot": {
+        "check_id": "check-audio-001",
+        "config_id": "audio-verification-default",
+        "config_fingerprint": "9319cd67a12e483f061a0d0f7db5b63eb70ea2b83d3e26cea652bb0a72fc2626",
+        "role": "audio_verification",
+        "confirmation_ref": "confirm-003",
+        "started_at": "2026-08-05T08:00:30.000+08:00",
+        "ended_at": "2026-08-05T08:00:40.000+08:00",
+        "actual_model": "gemini-audio-fixture-v1",
+        "outcome": "passed",
+        "capabilities": {
+          "role": "audio_verification",
+          "sample_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "mime_type": "audio/mpeg",
+          "timed_text_fixture_id": "timed-text-fixture-v1",
+          "result_schema_version": "1.0.0",
+          "inline_audio": {
+            "max_inline_bytes": 20971520,
+            "max_audio_duration_ms": 3600000,
+            "parsed_finding_count": 0
+          },
+          "private_gcs": {
+            "object_uri": "gs://fixture-bucket/check/object.mp3",
+            "uploaded_at": "2026-08-05T08:00:31.000+08:00",
+            "model_read_at": "2026-08-05T08:00:35.000+08:00",
+            "deleted_at": "2026-08-05T08:00:39.000+08:00",
+            "parsed_finding_count": 0,
+            "max_input_bytes": 104857600,
+            "max_audio_duration_ms": 7200000
+          }
+        },
+        "error": null
+      }
+    }
+  }
+}

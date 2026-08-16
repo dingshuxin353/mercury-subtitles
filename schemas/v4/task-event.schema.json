@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercury.local/schemas/v4/task-event.schema.json",
+  "title": "TaskEventV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "event_id", "sequence", "task_id", "occurred_at", "type", "message", "data"],
+  "properties": {
+    "contract_version": { "const": "mercury-event-experimental-v1" },
+    "event_id": { "type": "string", "pattern": "^evt-[a-f0-9]{16}$" },
+    "sequence": { "type": "integer", "minimum": 1 },
+    "task_id": { "type": "string", "pattern": "^tsk-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}$" },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "type": { "enum": ["task_queued", "task_requeued", "worker_claimed", "stage_started", "stage_completed", "progress_updated", "cancellation_requested", "task_cancelled", "task_interrupted", "task_failed", "task_completed", "review_ready", "artifact_ready"] },
+    "message": { "type": "string", "minLength": 1, "maxLength": 500 },
+    "data": { "type": "object" }
+  }
+}

@@ -1,0 +1,43 @@
+name: 缺陷报告
+description: 报告可复现的 Mercury 行为错误
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。不要粘贴 Key、Token、ADC、私有音频、完整字幕、Provider 原始响应或整个 Mercury 工作区；请先脱敏本机路径和 ID。
+  - type: input
+    id: version
+    attributes:
+      label: Mercury 和 Node 版本
+      description: 请运行 mercury --version 与 node --version。
+      placeholder: Mercury 0.2.0-alpha.2；Node v24.x.x
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 最小复现步骤
+      description: 使用不含私人内容的路径占位符和 fixture。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果与脱敏错误码
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隐私确认
+      options:
+        - label: 我已删除凭据、私人媒体/字幕、Provider 原始响应、本机路径和完整任务标识。
+          required: true

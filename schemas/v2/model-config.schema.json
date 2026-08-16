@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercury.local/schemas/v2/model-config.schema.json",
+  "title": "ModelConfigRegistryV2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "updated_at", "defaults", "models"],
+  "properties": {
+    "schema_version": { "const": "2.0.0" },
+    "updated_at": { "$ref": "../v1/common.schema.json#/$defs/Timestamp" },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asr", "chat"],
+      "properties": {
+        "asr": { "$ref": "../v1/common.schema.json#/$defs/ProtocolId" },
+        "chat": { "$ref": "../v1/common.schema.json#/$defs/ProtocolId" }
+      }
+    },
+    "models": {
+      "type": "array",
+      "minItems": 2,
+      "items": { "$ref": "#/$defs/ModelConfigV2" }
+    }
+  },
+  "$defs": {
+    "ModelCategory": { "type": "string", "enum": ["asr", "chat"] },
+    "ModelCapabilityProfileV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capabilities",
+        "input_modalities",
+        "output_types",
+        "structured_output"
+      ],
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["transcription", "calibration"]
+          }
+        },
+        "input_modalities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["text", "audio", "image", "video"]
+          }
+        },
+        "output_types": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["timed_transcript", "structured_result"]
+          }
+        },
+        "structured_output": { "type": "boolean" }
+      }
+    },
+    "ModelCheckV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "check_id",
+        "model_id",
+        "config_fingerprint",
+        "category",
+        "confirmation_ref",
+        "started_at",
+        "ended_at",
+        "outcome",
+        "actual_model",
+        "verified_capabilities",
+        "evidence",
+        "error"
+      ],
+      "properties": {
+        "check_id": { "$ref": "../v1/common.schema.json#/$defs/ProtocolId" },
+        "model_id": { "$ref": "../v1/common.schema.json#/$defs/ProtocolId" },
+        "config_fingerprint": {
+          "$ref": "../v1/common.schema.json#/$defs/Sha256"
+        },
+        "category": { "$ref": "#/$defs/ModelCategory" },
+        "confirmation_ref": {
+          "$ref": "../v1/common.schema.json#/$defs/ProtocolId"
+        },
+        "started_at": { "$ref": "../v1/common.schema.json#/$defs/Timestamp" },
+        "ended_at": { "$ref": "../v1/common.schema.json#/$defs/Timestamp" },
+        "outcome": { "type": "string", "enum": ["passed", "failed"] },
+        "actual_model": {
+          "oneOf": [
+            { "$ref": "../v1/common.schema.json#/$defs/NonBlankString" },
+            { "type": "null" }
+          ]
+        },
+        "verified_capabilities": {
+          "oneOf": [
+            { "$ref": "#/$defs/ModelCapabilityProfileV2" },
+            { "type": "null" }
+          ]
+        },
+        "evidence": { "type": "object" },
+        "error": {
+          "oneOf": [
+            { "$ref": "../v1/common.schema.json#/$defs/ErrorRecord" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "ModelConfigV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_id",
+        "name",
+        "category",
+        "plugin_id",
+        "connection_id",
+        "connection_type",
+        "provider_model",
+        "runtime",
+        "endpoint",
+        "credential_ref",
+        "provider_config",
+        "declared_capabilities",
+        "verified_capabilities",
+        "enabled",
+        "cloud_data_confirmation",
+        "config_fingerprint",
+        "check"
+      ],
+      "properties": {
+        "model_id": { "$ref": "../v1/common.schema.json#/$defs/ProtocolId" },
+        "name": { "$ref": "../v1/common.schema.json#/$defs/NonBlankString" },
+        "category": { "$ref": "#/$defs/ModelCategory" },
+        "plugin_id": {
+          "type": "string",
+          "enum": ["volcengine_asr", "volcengine_subtitle_asr", "openai_chat_completions", "gemini"]
+        },
+        "connection_id": {
+          "$ref": "../v1/common.schema.json#/$defs/ProtocolId"
+        },
+        "connection_type": {
+          "type": "string",
+          "enum": [
+            "volcengine_cloud",
+            "volcengine_subtitle_cloud",
+            "compatible_endpoint",
+            "vertex_ai",
+            "developer_api"
+          ]
+        },
+        "provider_model": {
+          "$ref": "../v1/common.schema.json#/$defs/NonBlankString"
+        },
+        "runtime": { "const": "cloud" },
+        "endpoint": {
+          "oneOf": [
+            { "$ref": "../v1/common.schema.json#/$defs/AbsoluteHttpsUrl" },
+            { "type": "null" }
+          ]
+        },
+        "credential_ref": {
+          "oneOf": [
+            { "$ref": "../v1/common.schema.json#/$defs/CredentialRef" },
+            { "type": "null" }
+          ]
+        },
+        "provider_config": { "type": "object" },
+        "declared_capabilities": { "$ref": "#/$defs/ModelCapabilityProfileV2" },
+        "verified_capabilities": {
+          "oneOf": [
+            { "$ref": "#/$defs/ModelCapabilityProfileV2" },
+            { "type": "null" }
+          ]
+        },
+        "enabled": { "type": "boolean" },
+        "cloud_data_confirmation": {
+          "$ref": "../v1/common.schema.json#/$defs/CloudDataConfirmation"
+        },
+        "config_fingerprint": {
+          "$ref": "../v1/common.schema.json#/$defs/Sha256"
+        },
+        "check": {
+          "oneOf": [{ "$ref": "#/$defs/ModelCheckV2" }, { "type": "null" }]
+        }
+      }
+    }
+  }
+}

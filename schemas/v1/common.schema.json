@@ -1,0 +1,823 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercury.local/schemas/v1/common.schema.json",
+  "title": "Mercury Common Contract Definitions",
+  "$defs": {
+    "SchemaVersion": {
+      "x-mercury-invariant-id": "INV-GEN-001",
+      "const": "1.0.0"
+    },
+    "ModelRole": {
+      "type": "string",
+      "enum": ["asr", "calibration", "audio_verification"]
+    },
+    "Runtime": {
+      "type": "string",
+      "enum": ["local", "cloud"]
+    },
+    "VisibleString": {
+      "x-mercury-invariant-id": "INV-GEN-002",
+      "type": "string",
+      "pattern": "^[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]*$"
+    },
+    "NonBlankString": {
+      "x-mercury-invariant-id": "INV-GEN-002",
+      "allOf": [
+        { "$ref": "#/$defs/VisibleString" },
+        {
+          "x-mercury-invariant-id": "INV-GEN-002",
+          "type": "string",
+          "pattern": "^(?=\\S(?:.*\\S)?$).+$"
+        }
+      ]
+    },
+    "MultilineNonBlankString": {
+      "x-mercury-invariant-id": "INV-GEN-002",
+      "type": "string",
+      "pattern": "^(?=\\S(?:[\\s\\S]*\\S)?$)(?:[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]|\\n)+$"
+    },
+    "Timestamp": {
+      "x-mercury-invariant-id": "INV-GEN-003",
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "NonNegativeMilliseconds": {
+      "x-mercury-invariant-id": "INV-GEN-003",
+      "type": "integer",
+      "minimum": 0
+    },
+    "PositiveMilliseconds": {
+      "x-mercury-invariant-id": "INV-GEN-003",
+      "type": "integer",
+      "minimum": 1
+    },
+    "ProtocolId": {
+      "x-mercury-invariant-id": "INV-GEN-004",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "Sha256": {
+      "x-mercury-invariant-id": "INV-GEN-004",
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "TaskRelativePath": {
+      "x-mercury-invariant-id": "INV-GEN-004",
+      "allOf": [
+        { "$ref": "#/$defs/VisibleString" },
+        {
+          "x-mercury-invariant-id": "INV-GEN-004",
+          "type": "string",
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?=\\S(?:.*\\S)?$)[^\\\\]+$"
+        }
+      ]
+    },
+    "GcsObjectUri": {
+      "x-mercury-invariant-id": "INV-GEN-004",
+      "allOf": [
+        { "$ref": "#/$defs/VisibleString" },
+        {
+          "x-mercury-invariant-id": "INV-GEN-004",
+          "type": "string",
+          "pattern": "^gs://[^/?#\\s\\\\]+/[^?#\\s\\\\]+$"
+        }
+      ]
+    },
+    "GeminiFileResourceName": {
+      "x-mercury-invariant-id": "INV-GEN-004",
+      "allOf": [
+        { "$ref": "#/$defs/VisibleString" },
+        {
+          "x-mercury-invariant-id": "INV-GEN-004",
+          "type": "string",
+          "pattern": "^files/[A-Za-z0-9][A-Za-z0-9._~-]*$"
+        }
+      ]
+    },
+    "CredentialRef": {
+      "x-mercury-invariant-id": "INV-SEC-001",
+      "allOf": [
+        { "$ref": "#/$defs/VisibleString" },
+        {
+          "x-mercury-invariant-id": "INV-SEC-001",
+          "oneOf": [
+            {
+              "x-mercury-invariant-id": "INV-SEC-001",
+              "type": "string",
+              "pattern": "^env:[A-Z][A-Z0-9_]*$"
+            },
+            {
+              "x-mercury-invariant-id": "INV-SEC-001",
+              "type": "string",
+              "pattern": "^keychain:[A-Za-z0-9][A-Za-z0-9._/-]*$"
+            },
+            {
+              "x-mercury-invariant-id": "INV-SEC-001",
+              "type": "string",
+              "pattern": "^adc:[A-Za-z0-9][A-Za-z0-9._/-]*$"
+            },
+            {
+              "x-mercury-invariant-id": "INV-SEC-001",
+              "type": "string",
+              "pattern": "^file:/(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\s?#\\\\]+$"
+            }
+          ]
+        }
+      ]
+    },
+    "CallId": {
+      "$ref": "#/$defs/ProtocolId"
+    },
+    "AbsoluteHttpsUrl": {
+      "x-mercury-invariant-id": "INV-MOD-008",
+      "allOf": [
+        { "$ref": "#/$defs/VisibleString" },
+        {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://[^/?#\\s]+(?:[/?#][^\\s]*)?$"
+        }
+      ]
+    },
+    "VolcengineAsrProviderConfig": {
+      "x-mercury-invariant-id": "INV-MOD-007",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resource_id"],
+      "properties": {
+        "resource_id": { "const": "volc.bigasr.auc_turbo" }
+      }
+    },
+    "ChatCompletionsProviderConfig": {
+      "x-mercury-invariant-id": "INV-MOD-007",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {}
+    },
+    "VertexAudioProviderConfig": {
+      "x-mercury-invariant-id": "INV-MOD-007",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project", "location"],
+      "properties": {
+        "project": { "$ref": "#/$defs/NonBlankString" },
+        "location": { "$ref": "#/$defs/NonBlankString" },
+        "gcs_bucket": { "$ref": "#/$defs/NonBlankString" }
+      }
+    },
+    "GeminiDeveloperProviderConfig": {
+      "x-mercury-invariant-id": "INV-MOD-007",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {}
+    },
+    "CloudDataConfirmationBase": {
+      "x-mercury-invariant-id": "INV-CLD-002",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["confirmation_id", "confirmed", "confirmed_at", "method", "data_categories"],
+      "properties": {
+        "confirmation_id": { "$ref": "#/$defs/ProtocolId" },
+        "confirmed": { "type": "boolean" },
+        "confirmed_at": {
+          "oneOf": [
+            { "$ref": "#/$defs/Timestamp" },
+            { "type": "null" }
+          ]
+        },
+        "method": {
+          "oneOf": [
+            { "type": "string", "enum": ["interactive_cli", "non_interactive_flag"] },
+            { "type": "null" }
+          ]
+        },
+        "data_categories": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "audio",
+              "transcript",
+              "reference_srt",
+              "calibration_candidate",
+              "timed_text",
+              "context"
+            ]
+          }
+        }
+      }
+    },
+    "CloudDataConfirmation": {
+      "x-mercury-invariant-id": "INV-CLD-002",
+      "type": "object",
+      "unevaluatedProperties": false,
+      "oneOf": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/CloudDataConfirmationBase" },
+            {
+              "type": "object",
+              "properties": {
+                "confirmed": { "x-mercury-invariant-id": "INV-CLD-002", "const": false },
+                "confirmed_at": { "x-mercury-invariant-id": "INV-CLD-002", "type": "null" },
+                "method": { "x-mercury-invariant-id": "INV-CLD-002", "type": "null" },
+                "data_categories": { "x-mercury-invariant-id": "INV-CLD-002", "type": "array", "maxItems": 0 }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/CloudDataConfirmationBase" },
+            {
+              "type": "object",
+              "properties": {
+                "confirmed": { "x-mercury-invariant-id": "INV-CLD-002", "const": true },
+                "confirmed_at": { "x-mercury-invariant-id": "INV-CLD-002", "$ref": "#/$defs/Timestamp" },
+                "method": { "x-mercury-invariant-id": "INV-CLD-002", "type": "string", "enum": ["interactive_cli", "non_interactive_flag"] },
+                "data_categories": { "x-mercury-invariant-id": "INV-CLD-002", "type": "array", "minItems": 1 }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "AsrCapabilities": {
+      "x-mercury-invariant-id": "INV-MOD-003-P",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "sample_sha256", "language", "mime_type", "audio_input", "max_input_bytes", "max_audio_duration_ms", "transcript_chars", "segment_count", "timing_granularity"],
+      "properties": {
+        "role": { "const": "asr" },
+        "sample_sha256": { "$ref": "#/$defs/Sha256" },
+        "language": { "const": "zh-CN" },
+        "mime_type": { "const": "audio/mpeg" },
+        "audio_input": { "const": "audio_data_base64" },
+        "max_input_bytes": { "type": "integer", "minimum": 1 },
+        "max_audio_duration_ms": { "$ref": "#/$defs/PositiveMilliseconds" },
+        "transcript_chars": { "type": "integer", "minimum": 1 },
+        "segment_count": { "type": "integer", "minimum": 1 },
+        "timing_granularity": { "type": "string", "enum": ["segment", "word"] }
+      }
+    },
+    "CalibrationCapabilities": {
+      "x-mercury-invariant-id": "INV-MOD-003-P",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "fixture_id", "language", "request_profile", "parsed_suggestion_count", "result_schema_version"],
+      "properties": {
+        "role": { "const": "calibration" },
+        "fixture_id": { "$ref": "#/$defs/ProtocolId" },
+        "language": { "const": "zh-CN" },
+        "request_profile": { "const": "chat_completions_minimal" },
+        "parsed_suggestion_count": { "type": "integer", "minimum": 0 },
+        "result_schema_version": { "$ref": "#/$defs/SchemaVersion" }
+      }
+    },
+    "InlineAudioCapabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_inline_bytes", "max_audio_duration_ms", "parsed_finding_count"],
+      "properties": {
+        "max_inline_bytes": { "type": "integer", "minimum": 1 },
+        "max_audio_duration_ms": { "$ref": "#/$defs/PositiveMilliseconds" },
+        "parsed_finding_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "AudioChunkRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["chunk_id", "bytes", "start_ms", "end_ms", "call_ref", "outcome", "error_ref"],
+      "properties": {
+        "chunk_id": { "$ref": "#/$defs/ProtocolId" },
+        "bytes": { "type": "integer", "minimum": 1, "maximum": 15000000 },
+        "start_ms": { "$ref": "#/$defs/NonNegativeMilliseconds" },
+        "end_ms": { "$ref": "#/$defs/PositiveMilliseconds" },
+        "call_ref": {
+          "oneOf": [
+            { "$ref": "#/$defs/ProtocolId" },
+            { "type": "null" }
+          ]
+        },
+        "outcome": { "type": "string", "enum": ["completed", "failed", "not_called"] },
+        "error_ref": {
+          "oneOf": [
+            { "$ref": "#/$defs/ProtocolId" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "outcome": { "const": "completed" },
+            "call_ref": { "$ref": "#/$defs/ProtocolId" },
+            "error_ref": { "type": "null" }
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "outcome": { "const": "failed" },
+            "call_ref": { "$ref": "#/$defs/ProtocolId" },
+            "error_ref": { "$ref": "#/$defs/ProtocolId" }
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "outcome": { "const": "not_called" },
+            "call_ref": { "type": "null" },
+            "error_ref": { "type": "null" }
+          }
+        }
+      ]
+    },
+    "LocalAudioChunkingCapabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["threshold_bytes", "source_bytes", "part_count", "largest_part_bytes", "model_request_count", "parts"],
+      "properties": {
+        "threshold_bytes": { "const": 15000000 },
+        "source_bytes": { "type": "integer", "minimum": 1 },
+        "part_count": { "type": "integer", "minimum": 1 },
+        "largest_part_bytes": { "type": "integer", "minimum": 1, "maximum": 15000000 },
+        "model_request_count": { "type": "integer", "minimum": 1 },
+        "parts": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/AudioChunkRecord" }
+        }
+      }
+    },
+    "PrivateGcsCapabilities": {
+      "x-mercury-invariant-id": "INV-GCS-002",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["object_uri", "uploaded_at", "model_read_at", "deleted_at", "parsed_finding_count", "max_input_bytes", "max_audio_duration_ms"],
+      "properties": {
+        "object_uri": { "$ref": "#/$defs/GcsObjectUri" },
+        "uploaded_at": { "$ref": "#/$defs/Timestamp" },
+        "model_read_at": { "$ref": "#/$defs/Timestamp" },
+        "deleted_at": { "$ref": "#/$defs/Timestamp" },
+        "parsed_finding_count": { "type": "integer", "minimum": 0 },
+        "max_input_bytes": { "type": "integer", "minimum": 1 },
+        "max_audio_duration_ms": { "$ref": "#/$defs/PositiveMilliseconds" }
+      }
+    },
+    "GeminiFilesCapabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resource_name", "uploaded_at", "model_read_at", "deleted_at", "parsed_finding_count", "max_input_bytes", "max_audio_duration_ms"],
+      "properties": {
+        "resource_name": { "$ref": "#/$defs/GeminiFileResourceName" },
+        "uploaded_at": { "$ref": "#/$defs/Timestamp" },
+        "model_read_at": { "$ref": "#/$defs/Timestamp" },
+        "deleted_at": { "$ref": "#/$defs/Timestamp" },
+        "parsed_finding_count": { "type": "integer", "minimum": 0 },
+        "max_input_bytes": { "type": "integer", "minimum": 1 },
+        "max_audio_duration_ms": { "$ref": "#/$defs/PositiveMilliseconds" }
+      }
+    },
+    "AudioVerificationCapabilities": {
+      "x-mercury-invariant-id": "INV-MOD-003-P",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "sample_sha256", "mime_type", "timed_text_fixture_id", "result_schema_version", "inline_audio", "private_gcs"],
+      "properties": {
+        "role": { "const": "audio_verification" },
+        "sample_sha256": { "$ref": "#/$defs/Sha256" },
+        "mime_type": { "const": "audio/mpeg" },
+        "timed_text_fixture_id": { "$ref": "#/$defs/ProtocolId" },
+        "result_schema_version": { "$ref": "#/$defs/SchemaVersion" },
+        "inline_audio": { "$ref": "#/$defs/InlineAudioCapabilities" },
+        "private_gcs": {
+          "oneOf": [
+            { "$ref": "#/$defs/PrivateGcsCapabilities" },
+            { "type": "null" }
+          ]
+        },
+        "gemini_files": {
+          "oneOf": [
+            { "$ref": "#/$defs/GeminiFilesCapabilities" },
+            { "type": "null" }
+          ]
+        },
+        "local_chunking": {
+          "$ref": "#/$defs/LocalAudioChunkingCapabilities"
+        }
+      }
+    },
+    "ModelCapabilities": {
+      "oneOf": [
+        { "$ref": "#/$defs/AsrCapabilities" },
+        { "$ref": "#/$defs/CalibrationCapabilities" },
+        { "$ref": "#/$defs/AudioVerificationCapabilities" }
+      ]
+    },
+    "ModelCheckBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["check_id", "config_id", "config_fingerprint", "role", "confirmation_ref", "started_at", "ended_at", "actual_model", "outcome", "capabilities", "error"],
+      "properties": {
+        "check_id": { "$ref": "#/$defs/ProtocolId" },
+        "config_id": { "$ref": "#/$defs/ProtocolId" },
+        "config_fingerprint": { "$ref": "#/$defs/Sha256" },
+        "role": { "$ref": "#/$defs/ModelRole" },
+        "confirmation_ref": { "$ref": "#/$defs/ProtocolId" },
+        "started_at": { "$ref": "#/$defs/Timestamp" },
+        "ended_at": { "$ref": "#/$defs/Timestamp" },
+        "outcome": { "type": "string", "enum": ["passed", "failed"] },
+        "actual_model": {
+          "oneOf": [
+            { "$ref": "#/$defs/NonBlankString" },
+            { "type": "null" }
+          ]
+        },
+        "capabilities": {
+          "oneOf": [
+            { "$ref": "#/$defs/ModelCapabilities" },
+            { "type": "null" }
+          ]
+        },
+        "error": {
+          "oneOf": [
+            { "$ref": "#/$defs/ErrorRecord" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "ModelCheckRecord": {
+      "type": "object",
+      "oneOf": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ModelCheckBase" },
+            {
+              "x-mercury-invariant-id": "INV-MOD-003-P",
+              "type": "object",
+              "required": ["actual_model", "outcome", "capabilities", "error"],
+              "properties": {
+                "actual_model": { "x-mercury-invariant-id": "INV-MOD-003-P", "$ref": "#/$defs/NonBlankString" },
+                "outcome": { "x-mercury-invariant-id": "INV-MOD-003-P", "const": "passed" },
+                "capabilities": { "x-mercury-invariant-id": "INV-MOD-003-P", "$ref": "#/$defs/ModelCapabilities" },
+                "error": { "x-mercury-invariant-id": "INV-MOD-003-P", "type": "null" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ModelCheckBase" },
+            {
+              "x-mercury-invariant-id": "INV-MOD-003-F",
+              "type": "object",
+              "required": ["outcome", "capabilities", "error"],
+              "properties": {
+                "outcome": { "x-mercury-invariant-id": "INV-MOD-003-F", "const": "failed" },
+                "capabilities": { "x-mercury-invariant-id": "INV-MOD-003-F", "type": "null" },
+                "error": {
+                  "x-mercury-invariant-id": "INV-MOD-003-F",
+                  "allOf": [
+                    { "x-mercury-invariant-id": "INV-MOD-003-F", "not": { "type": "null" } },
+                    { "$ref": "#/$defs/ErrorRecord" }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "ErrorRecord": {
+      "x-mercury-invariant-id": "INV-GEN-006",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error_id", "code", "message", "stage", "retryable"],
+      "properties": {
+        "error_id": { "$ref": "#/$defs/ProtocolId" },
+        "code": {
+          "x-mercury-invariant-id": "INV-GEN-006",
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]{2,63}$"
+        },
+        "message": { "$ref": "#/$defs/NonBlankString" },
+        "stage": {
+          "x-mercury-invariant-id": "INV-GEN-006",
+          "type": "string",
+          "enum": [
+            "workspace",
+            "input_validation",
+            "media_decode",
+            "configuration",
+            "confirmation",
+            "connectivity",
+            "capability",
+            "model_call",
+            "gcs_upload",
+            "gcs_model_read",
+            "staging_upload",
+            "staging_model_read",
+            "response_parse",
+            "response_validation",
+            "gcs_cleanup",
+            "staging_cleanup",
+            "alignment",
+            "output_validation",
+            "artifact_write",
+            "reference_resolution",
+            "execution"
+          ]
+        },
+        "retryable": {
+          "x-mercury-invariant-id": "INV-GEN-006",
+          "type": "boolean"
+        },
+        "resource_uri": { "$ref": "#/$defs/NonBlankString" },
+        "remediation": { "$ref": "#/$defs/NonBlankString" }
+      }
+    },
+    "WarningRecord": {
+      "x-mercury-invariant-id": "INV-GEN-006",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["warning_id", "code", "message", "stage", "severity"],
+      "properties": {
+        "warning_id": { "$ref": "#/$defs/ProtocolId" },
+        "code": {
+          "x-mercury-invariant-id": "INV-GEN-006",
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]{2,63}$"
+        },
+        "message": { "$ref": "#/$defs/NonBlankString" },
+        "stage": { "$ref": "#/$defs/ErrorRecord/properties/stage" },
+        "severity": {
+          "x-mercury-invariant-id": "INV-GEN-006",
+          "type": "string",
+          "enum": ["low", "medium", "high"]
+        },
+        "related_error_ref": { "$ref": "#/$defs/ProtocolId" },
+        "related_staging_ref": { "$ref": "#/$defs/ProtocolId" }
+      }
+    },
+    "CallRecordBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "call_id",
+        "model_snapshot_entry_ref",
+        "started_at",
+        "ended_at",
+        "outcome",
+        "error_ref"
+      ],
+      "properties": {
+        "call_id": { "$ref": "#/$defs/CallId" },
+        "model_snapshot_entry_ref": {
+          "x-mercury-invariant-id": "INV-CALL-001",
+          "$ref": "#/$defs/ProtocolId"
+        },
+        "started_at": { "$ref": "#/$defs/Timestamp" },
+        "ended_at": { "$ref": "#/$defs/Timestamp" },
+        "provider_request_id": { "$ref": "#/$defs/NonBlankString" },
+        "outcome": {
+          "x-mercury-invariant-id": "INV-CALL-003",
+          "type": "string",
+          "enum": ["completed", "failed"]
+        },
+        "error_ref": {
+          "oneOf": [
+            { "$ref": "#/$defs/ProtocolId" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "CallRecord": {
+      "x-mercury-invariant-id": "INV-CALL-002",
+      "x-mercury-semantic-checks": [
+        { "check": "call-record-time-consistency", "invariant_id": "INV-CALL-002" }
+      ],
+      "type": "object",
+      "oneOf": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/CallRecordBase" },
+            {
+              "x-mercury-invariant-id": "INV-CALL-002",
+              "type": "object",
+              "properties": {
+                "outcome": {
+                  "x-mercury-invariant-id": "INV-CALL-002",
+                  "const": "completed"
+                },
+                "error_ref": {
+                  "x-mercury-invariant-id": "INV-CALL-002",
+                  "type": "null"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/CallRecordBase" },
+            {
+              "x-mercury-invariant-id": "INV-CALL-002",
+              "type": "object",
+              "properties": {
+                "outcome": {
+                  "x-mercury-invariant-id": "INV-CALL-002",
+                  "const": "failed"
+                },
+                "error_ref": {
+                  "x-mercury-invariant-id": "INV-CALL-002",
+                  "$ref": "#/$defs/ProtocolId"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "StagingRecordBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "staging_id",
+        "call_ref",
+        "object_uri",
+        "created_at",
+        "cleanup_status",
+        "cleanup_finished_at",
+        "error_ref"
+      ],
+      "properties": {
+        "staging_id": { "$ref": "#/$defs/ProtocolId" },
+        "staging_kind": {
+          "type": "string",
+          "enum": ["gcs", "gemini_file"]
+        },
+        "call_ref": {
+          "oneOf": [
+            { "$ref": "#/$defs/CallId" },
+            { "type": "null" }
+          ]
+        },
+        "object_uri": {
+          "oneOf": [
+            { "$ref": "#/$defs/GcsObjectUri" },
+            { "$ref": "#/$defs/GeminiFileResourceName" }
+          ]
+        },
+        "created_at": { "$ref": "#/$defs/Timestamp" },
+        "cleanup_status": {
+          "x-mercury-invariant-id": "INV-CALL-003",
+          "type": "string",
+          "enum": ["completed", "failed"]
+        },
+        "cleanup_finished_at": { "$ref": "#/$defs/Timestamp" },
+        "error_ref": {
+          "oneOf": [
+            { "$ref": "#/$defs/ProtocolId" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "staging_kind": { "const": "gcs" },
+            "object_uri": { "$ref": "#/$defs/GcsObjectUri" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["staging_kind"],
+          "properties": {
+            "staging_kind": { "const": "gemini_file" },
+            "object_uri": { "$ref": "#/$defs/GeminiFileResourceName" }
+          }
+        }
+      ]
+    },
+    "StagingRecord": {
+      "x-mercury-invariant-id": "INV-CALL-003",
+      "type": "object",
+      "oneOf": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/StagingRecordBase" },
+            {
+              "x-mercury-invariant-id": "INV-GCS-004-C",
+              "type": "object",
+              "properties": {
+                "cleanup_status": {
+                  "x-mercury-invariant-id": "INV-GCS-004-C",
+                  "const": "completed"
+                },
+                "error_ref": {
+                  "x-mercury-invariant-id": "INV-GCS-004-C",
+                  "type": "null"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/StagingRecordBase" },
+            {
+              "x-mercury-invariant-id": "INV-GCS-004-F",
+              "type": "object",
+              "properties": {
+                "cleanup_status": {
+                  "x-mercury-invariant-id": "INV-GCS-004-F",
+                  "const": "failed"
+                },
+                "error_ref": {
+                  "x-mercury-invariant-id": "INV-GCS-004-F",
+                  "$ref": "#/$defs/ProtocolId"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "AdapterFailureRecord": {
+      "x-mercury-invariant-id": "INV-ADP-001",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["failure_id", "task_id", "role", "model_snapshot_ref", "occurred_at", "errors", "warnings", "call", "staging"],
+      "properties": {
+        "failure_id": { "$ref": "#/$defs/ProtocolId" },
+        "task_id": { "$ref": "#/$defs/ProtocolId" },
+        "role": { "$ref": "#/$defs/ModelRole" },
+        "model_snapshot_ref": { "$ref": "#/$defs/ProtocolId" },
+        "occurred_at": { "$ref": "#/$defs/Timestamp" },
+        "provider_outcome_certainty": { "enum": ["not_dispatched", "known_terminal", "outcome_unknown"] },
+        "errors": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/ErrorRecord" }
+        },
+        "warnings": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/WarningRecord" }
+        },
+        "call": {
+          "oneOf": [
+            { "$ref": "#/$defs/CallRecord" },
+            { "type": "null" }
+          ]
+        },
+        "staging": {
+          "type": "array",
+          "maxItems": 1,
+          "items": { "$ref": "#/$defs/StagingRecord" }
+        }
+      },
+      "x-mercury-semantic-checks": [
+        { "check": "adapter-failure-consistency", "invariant_id": "INV-ADP-001" }
+      ]
+    },
+    "AudioSource": {
+      "x-mercury-invariant-id": "INV-ASR-001",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path_ref", "sha256", "duration_ms", "language", "mime_type"],
+      "properties": {
+        "path_ref": { "$ref": "#/$defs/TaskRelativePath" },
+        "sha256": { "$ref": "#/$defs/Sha256" },
+        "duration_ms": { "type": "integer", "minimum": 1 },
+        "language": { "const": "zh-CN" },
+        "mime_type": { "const": "audio/mpeg" }
+      }
+    },
+    "Evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "description"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["audio", "asr", "reference_srt", "context"]
+        },
+        "description": { "$ref": "#/$defs/NonBlankString" },
+        "segment_id": { "$ref": "#/$defs/NonBlankString" },
+        "start_ms": { "type": "integer", "minimum": 0 },
+        "end_ms": { "type": "integer", "minimum": 1 }
+      },
+      "dependentRequired": {
+        "start_ms": ["end_ms"],
+        "end_ms": ["start_ms"]
+      }
+    }
+  }
+}

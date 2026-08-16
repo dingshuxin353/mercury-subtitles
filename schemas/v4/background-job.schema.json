@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercury.local/schemas/v4/background-job.schema.json",
+  "title": "BackgroundJobV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "task_id", "task_directory", "state", "created_at", "updated_at", "claim_token", "worker_id"],
+  "properties": {
+    "contract_version": { "const": "mercury-job-experimental-v1" },
+    "task_id": { "type": "string", "pattern": "^tsk-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}$" },
+    "task_directory": { "type": "string", "minLength": 1 },
+    "state": { "enum": ["queued", "claimed", "terminal"] },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "claim_token": { "type": ["string", "null"], "pattern": "^[a-f0-9]{32}$" },
+    "worker_id": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._-]{1,80}$" }
+  }
+}

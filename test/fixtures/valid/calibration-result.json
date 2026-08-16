@@ -1,0 +1,38 @@
+{
+  "schema_version": "1.0.0",
+  "task_id": "task-001",
+  "created_at": "2026-08-05T08:03:03.000+08:00",
+  "status": "completed",
+  "request": {
+    "transcript_ref": "work/transcript.raw.json",
+    "reference_srt_ref": "input/reference.srt",
+    "mode": "text-only"
+  },
+  "model_snapshot_ref": "snapshot-001",
+  "call": {
+    "call_id": "call-calibration-0001",
+    "model_snapshot_entry_ref": "snapshot-entry-calibration",
+    "started_at": "2026-08-05T08:03:00.000+08:00",
+    "ended_at": "2026-08-05T08:03:02.000+08:00",
+    "outcome": "completed",
+    "provider_request_id": "request-fixture-calibration-0001",
+    "error_ref": null
+  },
+  "suggestions": [
+    {
+      "suggestion_id": "suggestion-0001",
+      "kind": "text_correction",
+      "source_segment_refs": ["seg-0001"],
+      "start_ms": 0,
+      "end_ms": 2500,
+      "original_text": "欢迎使用水兴",
+      "suggested_text": "欢迎使用水星",
+      "rationale": "上下文支持该同音字修正。",
+      "confidence": "high",
+      "disposition": "applied",
+      "disposition_reason": "accepted_by_rules"
+    }
+  ],
+  "warnings": [],
+  "errors": []
+}

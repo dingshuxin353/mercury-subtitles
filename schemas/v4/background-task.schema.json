@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercury.local/schemas/v4/background-task.schema.json",
+  "title": "BackgroundTaskV4",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "task_id", "task_type", "created_at", "updated_at", "task_directory", "input_config", "inputs", "model_snapshot", "execution", "artifacts", "adapter_failures", "warnings", "error", "failure_stage"],
+  "properties": {
+    "schema_version": { "const": "4.0.0" },
+    "task_id": { "type": "string", "pattern": "^tsk-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}$" },
+    "task_type": { "const": "subtitle_calibration" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "task_directory": { "type": "string", "minLength": 1, "pattern": "^tsk-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}-.+$" },
+    "input_config": {
+      "type": "object", "additionalProperties": false,
+      "required": ["has_reference_srt", "mode", "source_language", "evidence_mode", "non_strong_reason"],
+      "properties": {
+        "has_reference_srt": { "type": "boolean" },
+        "mode": { "type": ["string", "null"], "enum": ["text-only", "text-and-segmentation", null] },
+        "source_language": { "const": "zh-CN" },
+        "evidence_mode": { "enum": ["text", "audio_multimodal"] },
+        "non_strong_reason": { "type": ["string", "null"], "enum": ["audio_not_supported", "audio_check_missing_or_stale", "audio_data_confirmation_missing", "audio_inline_unsupported", "audio_input_limit_exceeded", null] }
+      }
+    },
+    "inputs": {
+      "type": "object", "additionalProperties": false, "required": ["audio", "reference_srt"],
+      "properties": {
+        "audio": { "$ref": "#/$defs/audioInput" },
+        "reference_srt": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/input" }] }
+      }
+    },
+    "model_snapshot": {
+      "type": "object", "additionalProperties": false, "required": ["path", "sha256"],
+      "properties": { "path": { "const": "work/model-snapshot.json" }, "sha256": { "$ref": "#/$defs/sha256" } }
+    },
+    "execution": { "$ref": "#/$defs/execution" },
+    "artifacts": {
+      "type": "object", "additionalProperties": false, "required": ["work", "outputs", "report", "subtitles"],
+      "properties": {
+        "work": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/taskRelativePath" } },
+        "outputs": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/taskRelativePath" } },
+        "report": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/taskRelativePath" }] },
+        "subtitles": {
+          "type": "object", "additionalProperties": false, "required": ["transcribed", "calibrated"],
+          "properties": {
+            "transcribed": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/subtitle" }] },
+            "calibrated": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/subtitle" }] },
+            "approved": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/subtitle" }] }
+          }
+        },
+        "review": {
+          "type": "object", "additionalProperties": false, "required": ["path", "status", "pending_count"],
+          "properties": {
+            "path": { "const": "review.json" },
+            "status": { "enum": ["not_ready", "pending", "in_progress", "approved", "not_required"] },
+            "pending_count": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "adapter_failures": { "type": "array", "items": { "$ref": "#/$defs/adapterFailure" } },
+    "warnings": { "type": "array", "items": { "$ref": "../v1/common.schema.json#/$defs/WarningRecord" } },
+    "error": { "anyOf": [{ "type": "null" }, { "$ref": "../v1/common.schema.json#/$defs/ErrorRecord" }] },
+    "failure_stage": { "type": ["string", "null"] }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "taskRelativePath": { "type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?=\\S(?:.*\\S)?$)[^\\\\]+$" },
+    "input": {
+      "type": "object", "additionalProperties": false,
+      "required": ["original_path", "original_name", "workspace_copy_path", "bytes", "modified_at", "sha256", "copy_verified"],
+      "properties": {
+        "original_path": { "type": "string", "minLength": 1 }, "original_name": { "type": "string", "minLength": 1 },
+        "workspace_copy_path": { "type": "string", "minLength": 1 }, "bytes": { "type": "integer", "minimum": 1 },
+        "modified_at": { "type": "string", "format": "date-time" }, "sha256": { "$ref": "#/$defs/sha256" }, "copy_verified": { "const": true }
+      }
+    },
+    "audioInput": {
+      "type": "object", "additionalProperties": false,
+      "required": ["original_path", "original_name", "workspace_copy_path", "bytes", "modified_at", "sha256", "copy_verified", "duration_ms"],
+      "properties": {
+        "original_path": { "type": "string", "minLength": 1 }, "original_name": { "type": "string", "minLength": 1 },
+        "workspace_copy_path": { "type": "string", "minLength": 1 }, "bytes": { "type": "integer", "minimum": 1 },
+        "modified_at": { "type": "string", "format": "date-time" }, "sha256": { "$ref": "#/$defs/sha256" },
+        "copy_verified": { "const": true }, "duration_ms": { "type": ["integer", "null"], "minimum": 1 }
+      }
+    },
+    "providerCall": {
+      "type": "object", "additionalProperties": false, "required": ["state", "evidence_ref"],
+      "properties": { "state": { "enum": ["not_started", "in_flight", "response_persisted", "terminal"] }, "evidence_ref": { "type": ["string", "null"] } }
+    },
+    "executionBase": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "stage", "last_completed_stage", "started_at", "ended_at", "execution_interrupted", "queued_at", "claimed_at", "heartbeat_at", "worker_id", "attempt", "cancellation_requested_at", "last_event_sequence", "safe_checkpoint", "provider_call"],
+      "properties": {
+        "status": { "enum": ["queued", "running", "completed", "needs_input", "failed", "cancelled", "interrupted"] },
+        "stage": { "type": ["string", "null"], "enum": ["preparing", "analyzing_audio", "aligning", "calibrating", "segmenting", "validating", null] },
+        "last_completed_stage": { "type": ["string", "null"], "enum": ["preparing", "analyzing_audio", "aligning", "calibrating", "segmenting", "validating", null] },
+        "started_at": { "type": ["string", "null"], "format": "date-time" }, "ended_at": { "type": ["string", "null"], "format": "date-time" },
+        "execution_interrupted": { "type": "boolean" }, "queued_at": { "type": "string", "format": "date-time" },
+        "claimed_at": { "type": ["string", "null"], "format": "date-time" }, "heartbeat_at": { "type": ["string", "null"], "format": "date-time" },
+        "worker_id": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._-]{1,80}$" }, "attempt": { "type": "integer", "minimum": 0, "maximum": 1000 },
+        "cancellation_requested_at": { "type": ["string", "null"], "format": "date-time" }, "last_event_sequence": { "type": "integer", "minimum": 0 },
+        "safe_checkpoint": { "enum": ["queued", "claimed", "asr_not_started", "asr_response_persisted", "chat_not_started", "chat_response_persisted", "outputs_validated", null] },
+        "provider_call": { "type": "object", "additionalProperties": false, "required": ["asr", "chat"], "properties": { "asr": { "$ref": "#/$defs/providerCall" }, "chat": { "$ref": "#/$defs/providerCall" } } }
+      }
+    },
+    "execution": {
+      "allOf": [
+        { "$ref": "#/$defs/executionBase" },
+        { "oneOf": [
+          { "type": "object", "properties": { "status": { "const": "queued" }, "stage": { "type": "null" }, "started_at": { "type": "null" }, "ended_at": { "type": "null" }, "claimed_at": { "type": "null" }, "heartbeat_at": { "type": "null" }, "worker_id": { "type": "null" }, "safe_checkpoint": { "enum": ["queued", "asr_response_persisted", "chat_response_persisted"] }, "execution_interrupted": { "const": false } } },
+          { "type": "object", "properties": { "status": { "const": "running" }, "stage": { "type": "string" }, "started_at": { "type": "string" }, "ended_at": { "type": "null" }, "claimed_at": { "type": "string" }, "heartbeat_at": { "type": "string" }, "worker_id": { "type": "string" }, "attempt": { "type": "integer", "minimum": 1 }, "safe_checkpoint": { "enum": ["claimed", "asr_not_started", "asr_response_persisted", "chat_not_started", "chat_response_persisted"] }, "execution_interrupted": { "const": false } } },
+          { "type": "object", "properties": { "status": { "enum": ["completed", "needs_input", "failed", "cancelled"] }, "stage": { "type": "null" }, "ended_at": { "type": "string" }, "execution_interrupted": { "const": false } } },
+          { "type": "object", "properties": { "status": { "const": "interrupted" }, "stage": { "type": "null" }, "ended_at": { "type": "string" }, "execution_interrupted": { "const": true } } }
+        ] }
+      ]
+    },
+    "subtitle": {
+      "type": "object", "additionalProperties": false, "required": ["path", "purpose", "sha256", "segment_count", "validation"],
+      "properties": { "path": { "$ref": "#/$defs/taskRelativePath" }, "purpose": { "enum": ["unverified_transcription", "calibrated_result", "approved_result"] }, "sha256": { "$ref": "#/$defs/sha256" }, "segment_count": { "type": "integer", "minimum": 1 }, "validation": { "const": "passed" } }
+    },
+    "adapterFailure": {
+      "type": "object", "additionalProperties": false,
+      "required": ["failure_id", "task_id", "model_category", "capability", "model_snapshot_ref", "occurred_at", "provider_outcome_certainty", "errors", "warnings", "call"],
+      "properties": {
+        "failure_id": { "type": "string", "minLength": 1 }, "task_id": { "type": "string", "minLength": 1 },
+        "model_category": { "enum": ["asr", "chat"] }, "capability": { "enum": ["transcription", "calibration"] },
+        "model_snapshot_ref": { "type": "string", "minLength": 1 }, "occurred_at": { "type": "string", "format": "date-time" },
+        "provider_outcome_certainty": { "enum": ["not_dispatched", "known_terminal", "outcome_unknown"] },
+        "errors": { "type": "array", "minItems": 1, "items": { "$ref": "../v1/common.schema.json#/$defs/ErrorRecord" } },
+        "warnings": { "type": "array", "items": { "$ref": "../v1/common.schema.json#/$defs/WarningRecord" } }, "call": {}
+      }
+    }
+  }
+}

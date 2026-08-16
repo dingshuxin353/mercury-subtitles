@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercury.local/schemas/v4/background-request.schema.json",
+  "title": "BackgroundRequestV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "request_id_hash", "input_fingerprint", "task_id", "task_directory", "state", "owner", "created_at", "updated_at"],
+  "properties": {
+    "contract_version": { "const": "mercury-request-experimental-v1" },
+    "request_id_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "input_fingerprint": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "task_id": { "type": "string", "pattern": "^tsk-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}$" },
+    "task_directory": { "type": ["string", "null"] },
+    "state": { "enum": ["reserved", "committed"] },
+    "owner": {
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["owner_token", "pid", "process_started_at_ms", "lease_acquired_at"],
+          "properties": {
+            "owner_token": { "type": "string", "pattern": "^[a-f0-9]{32}$" },
+            "pid": { "type": "integer", "minimum": 1 },
+            "process_started_at_ms": { "type": ["number", "null"] },
+            "lease_acquired_at": { "type": "string", "format": "date-time" }
+          }
+        }
+      ]
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "state": { "const": "reserved" },
+        "task_directory": { "type": "string", "minLength": 1 },
+        "owner": { "type": "object" }
+      }
+    },
+    {
+      "type": "object",
+      "properties": {
+        "state": { "const": "committed" },
+        "task_directory": { "type": "string", "minLength": 1 },
+        "owner": { "type": "null" }
+      }
+    }
+  ]
+}

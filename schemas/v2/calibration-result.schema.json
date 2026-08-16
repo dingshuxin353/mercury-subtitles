@@ -1,0 +1,229 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercury.local/schemas/v2/calibration-result.schema.json",
+  "title": "CalibrationResultV2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "created_at",
+    "status",
+    "request",
+    "model_snapshot_ref",
+    "call",
+    "suggestions",
+    "warnings",
+    "errors"
+  ],
+  "properties": {
+    "schema_version": { "const": "2.0.0" },
+    "task_id": { "$ref": "../v1/common.schema.json#/$defs/ProtocolId" },
+    "created_at": { "$ref": "../v1/common.schema.json#/$defs/Timestamp" },
+    "status": { "type": "string", "enum": ["completed", "failed"] },
+    "request": { "$ref": "#/$defs/CalibrationRequestV2" },
+    "model_snapshot_ref": {
+      "$ref": "../v1/common.schema.json#/$defs/ProtocolId"
+    },
+    "call": { "$ref": "../v1/common.schema.json#/$defs/CallRecord" },
+    "suggestions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/CalibrationSuggestionV2" }
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "$ref": "../v1/common.schema.json#/$defs/WarningRecord" }
+    },
+    "errors": {
+      "type": "array",
+      "items": { "$ref": "../v1/common.schema.json#/$defs/ErrorRecord" }
+    }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "status": { "const": "completed" },
+        "call": {
+          "type": "object",
+          "properties": { "outcome": { "const": "completed" } }
+        },
+        "errors": { "type": "array", "maxItems": 0 }
+      }
+    },
+    {
+      "type": "object",
+      "properties": {
+        "status": { "const": "failed" },
+        "call": {
+          "type": "object",
+          "properties": { "outcome": { "const": "failed" } }
+        },
+        "suggestions": { "type": "array", "maxItems": 0 },
+        "errors": { "type": "array", "minItems": 1 }
+      }
+    }
+  ],
+  "$defs": {
+    "AudioInputRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path_ref", "mime_type", "bytes", "sha256"],
+      "properties": {
+        "path_ref": {
+          "$ref": "../v1/common.schema.json#/$defs/TaskRelativePath"
+        },
+        "mime_type": { "const": "audio/mpeg" },
+        "bytes": { "type": "integer", "minimum": 1, "maximum": 15000000 },
+        "sha256": { "$ref": "../v1/common.schema.json#/$defs/Sha256" }
+      }
+    },
+    "CalibrationRequestV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transcript_ref",
+        "alignment_ref",
+        "reference_srt_ref",
+        "mode",
+        "evidence_mode",
+        "non_strong_reason",
+        "input_modalities",
+        "audio"
+      ],
+      "properties": {
+        "transcript_ref": { "const": "work/transcript.raw.json" },
+        "alignment_ref": { "const": "work/alignment.json" },
+        "reference_srt_ref": {
+          "oneOf": [{ "const": "input/reference.srt" }, { "type": "null" }]
+        },
+        "mode": {
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": ["text-only", "text-and-segmentation"]
+            },
+            { "type": "null" }
+          ]
+        },
+        "evidence_mode": {
+          "type": "string",
+          "enum": ["text", "audio_multimodal"]
+        },
+        "non_strong_reason": {
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "audio_not_supported",
+                "audio_check_missing_or_stale",
+                "audio_data_confirmation_missing",
+                "audio_inline_unsupported",
+                "audio_input_limit_exceeded"
+              ]
+            },
+            { "type": "null" }
+          ]
+        },
+        "input_modalities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "enum": ["text", "audio"] }
+        },
+        "audio": {
+          "oneOf": [{ "$ref": "#/$defs/AudioInputRef" }, { "type": "null" }]
+        }
+      },
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "evidence_mode": { "const": "text" },
+            "non_strong_reason": { "type": "string" },
+            "input_modalities": { "const": ["text"] },
+            "audio": { "type": "null" }
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "evidence_mode": { "const": "audio_multimodal" },
+            "non_strong_reason": { "type": "null" },
+            "input_modalities": { "const": ["text", "audio"] },
+            "audio": { "$ref": "#/$defs/AudioInputRef" }
+          }
+        }
+      ]
+    },
+    "CalibrationSuggestionV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "suggestion_id",
+        "kind",
+        "source_segment_refs",
+        "start_ms",
+        "end_ms",
+        "original_text",
+        "suggested_text",
+        "rationale",
+        "confidence",
+        "disposition",
+        "disposition_reason",
+        "modification_refs"
+      ],
+      "properties": {
+        "suggestion_id": {
+          "$ref": "../v1/common.schema.json#/$defs/ProtocolId"
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["text_correction", "segmentation", "timing", "uncertain"]
+        },
+        "source_segment_refs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "../v1/common.schema.json#/$defs/ProtocolId" }
+        },
+        "start_ms": {
+          "$ref": "../v1/common.schema.json#/$defs/NonNegativeMilliseconds"
+        },
+        "end_ms": {
+          "$ref": "../v1/common.schema.json#/$defs/PositiveMilliseconds"
+        },
+        "original_text": {
+          "$ref": "../v1/common.schema.json#/$defs/NonBlankString"
+        },
+        "suggested_text": {
+          "oneOf": [
+            { "$ref": "../v1/common.schema.json#/$defs/NonBlankString" },
+            { "type": "null" }
+          ]
+        },
+        "rationale": {
+          "$ref": "../v1/common.schema.json#/$defs/NonBlankString"
+        },
+        "confidence": { "type": "string", "enum": ["low", "medium", "high"] },
+        "disposition": { "type": "string", "enum": ["applied", "not_applied"] },
+        "disposition_reason": {
+          "type": "string",
+          "enum": [
+            "accepted_by_rules",
+            "insufficient_evidence",
+            "mode_disallows_change",
+            "invalid_timeline",
+            "out_of_scope",
+            "suggestion_incomplete"
+          ]
+        },
+        "modification_refs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "../v1/common.schema.json#/$defs/ProtocolId" }
+        }
+      }
+    }
+  }
+}
