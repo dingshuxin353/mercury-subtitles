@@ -15,7 +15,7 @@ import { VolcengineAsrAdapter } from '../src/adapters/volcengine-asr.js';
 import { VolcengineSubtitleAsrAdapter } from '../src/adapters/volcengine-subtitle-asr.js';
 import { canonicalJson } from '../src/exchange/storage.js';
 import { readJob } from '../src/background/storage.js';
-import { createChatCalibrationRuntimeV2 } from '../src/adapters/chat-calibration-v2.js';
+import { createChatCalibrationRuntimeV2, type ChatCalibrationRuntimeV2 } from '../src/adapters/chat-calibration-v2.js';
 import { readVerifiedV5Review } from '../src/review-v5.js';
 
 function sha(value: Buffer | string) { return createHash('sha256').update(value).digest('hex'); }
@@ -65,6 +65,19 @@ function fixtureFetch(calls: string[], captured: Array<Record<string, any>> = []
     const content = JSON.stringify({ corrected_units: payload.calibration_units.map((unit, index) => ({ unit_id: unit.unit_id, corrected_text: correct?.(unit.original_text, index) ?? unit.original_text, rationale: correct && index === 0 ? 'fixture correction' : null })) });
     return new Response(`data: ${JSON.stringify({ id: 'fixture-chat', choices: [{ delta: { content }, finish_reason: null }] })}\n\ndata: ${JSON.stringify({ id: 'fixture-chat', choices: [{ delta: {}, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
   });
+}
+
+function knownFailureChat(calls: string[]): ChatCalibrationRuntimeV2 {
+  return {
+    capability: 'calibration',
+    async run(runtimeInput) {
+      await runtimeInput.beforeProviderDispatch?.('openai_chat_calibration');
+      calls.push('chat');
+      const at = new Date().toISOString();
+      const error = { error_id: 'error-known-chat', code: 'FIXTURE_KNOWN_CHAT', message: 'Known Chat response.', stage: 'model_call' as const, retryable: false };
+      return { kind: 'failure', failure: { failure_id: 'failure-known-chat', task_id: runtimeInput.taskId, role: 'calibration', model_snapshot_ref: runtimeInput.modelSnapshotRef, occurred_at: at, provider_outcome_certainty: 'known_terminal', errors: [error], warnings: [], call: { call_id: 'call-known-chat', model_snapshot_entry_ref: runtimeInput.model.snapshot_entry_id, started_at: at, ended_at: at, provider_request_id: 'provider-known-chat', outcome: 'failed', error_ref: error.error_id }, staging: [] } };
+    },
+  };
 }
 
 function fixtureAsr(calls: string[]): AsrAdapter {
@@ -706,16 +719,7 @@ describe('Exchange v1 external transcript task', () => {
           if (returned.kind === 'artifact') returned.artifact.task_id = 'tsk-20260816-000000-deadbeef';
           return returned;
         },
-      } : {
-        capability: 'calibration' as const,
-        async run(runtimeInput: Parameters<ReturnType<typeof createChatCalibrationRuntimeV2>['run']>[0]) {
-          await runtimeInput.beforeProviderDispatch?.('openai_chat_calibration');
-          calls.push('chat');
-          const at = new Date().toISOString();
-          const error = { error_id: 'error-known-chat', code: 'FIXTURE_KNOWN_CHAT', message: 'Known Chat response.', stage: 'model_call' as const, retryable: false };
-          return { kind: 'failure' as const, failure: { failure_id: 'failure-known-chat', task_id: runtimeInput.taskId, role: 'calibration' as const, model_snapshot_ref: runtimeInput.modelSnapshotRef, occurred_at: at, provider_outcome_certainty: 'known_terminal' as const, errors: [error] as [typeof error], warnings: [], call: { call_id: 'call-known-chat', model_snapshot_entry_ref: runtimeInput.model.snapshot_entry_id, started_at: at, ended_at: at, provider_request_id: 'provider-known-chat', outcome: 'failed' as const, error_ref: error.error_id }, staging: [] as [] } };
-        },
-      };
+      } : knownFailureChat(calls);
       dependencies = { chatRuntime, readCredential: async () => 'fixture-secret' };
     }
     const submitted = await submitExchangeRequest(input.workspace, request);
@@ -738,7 +742,76 @@ describe('Exchange v1 external transcript task', () => {
     expect(calls).toEqual(callsBeforeRecovery);
     const recovered = await readV5Task(directory);
     expect(recovered).toMatchObject({ status: 'failed', error: { provider_outcome: 'known_terminal' } });
-    expect(JSON.parse(await readFile(path.join(directory, 'result.json'), 'utf8'))).toMatchObject({ status: 'failed', error: { provider_outcome: 'known_terminal' } });
+    expect(recovered.artifacts.report).toMatchObject({ path: 'output/calibration-report.md', validation: 'passed' });
+    const reportPath = path.join(directory, recovered.artifacts.report!.path);
+    expect((await stat(reportPath)).mode & 0o777).toBe(0o600);
+    expect(sha(await readFile(reportPath))).toBe(recovered.artifacts.report!.sha256);
+    expect(JSON.parse(await readFile(path.join(directory, 'result.json'), 'utf8'))).toMatchObject({
+      status: 'failed', error: { provider_outcome: 'known_terminal' },
+      artifacts: expect.arrayContaining([expect.objectContaining({ identity: 'calibration_report', exists: true, validation: 'passed', sha256: recovered.artifacts.report!.sha256 })]),
+    });
+  });
+
+  it.each(['after_terminal_report_written', 'after_terminal_report_committed'] as const)('recovers the %s window idempotently without another Provider call', async (point) => {
+    const input = await prepared();
+    input.request.request_id = `request-report-recovery-${point}`;
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const calls: string[] = [];
+    const dependencies = { chatRuntime: knownFailureChat(calls), readCredential: async () => 'fixture-secret' };
+    let crashed = false;
+    await expect(runWorker(input.workspace, dependencies, {
+      v5Fault: async (current, task) => {
+        if (!crashed && current === point && task.error?.provider_outcome === 'known_terminal') {
+          crashed = true;
+          throw new Error(`crash:${point}`);
+        }
+      },
+    })).rejects.toThrow(`crash:${point}`);
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const afterCrash = await readV5Task(directory);
+    expect(afterCrash).toMatchObject({ status: 'failed', execution: { provider_calls: { chat: { state: 'terminal', count: 1, outcome: 'known_terminal' } } } });
+    expect(await stat(path.join(directory, 'output/calibration-report.md')).then(() => true, () => false)).toBe(true);
+    expect(afterCrash.artifacts.report === null).toBe(point === 'after_terminal_report_written');
+    expect(await stat(path.join(directory, 'result.json')).then(() => true, () => false)).toBe(false);
+    const callsAfterCrash = [...calls];
+    await runWorker(input.workspace, dependencies);
+    const recovered = await readV5Task(directory);
+    expect(calls).toEqual(callsAfterCrash);
+    expect(recovered.artifacts.report).toMatchObject({ path: 'output/calibration-report.md', validation: 'passed' });
+    const reportPath = path.join(directory, recovered.artifacts.report!.path);
+    expect((await stat(reportPath)).mode & 0o777).toBe(0o600);
+    expect(sha(await readFile(reportPath))).toBe(recovered.artifacts.report!.sha256);
+    const beforeSecondAudit = await directoryManifest(directory);
+    await runWorker(input.workspace, dependencies);
+    expect(calls).toEqual(callsAfterCrash);
+    expect(await directoryManifest(directory)).toEqual(beforeSecondAudit);
+  });
+
+  it('preserves known terminal truth and emits a structured diagnostic when fixed report evidence is damaged', async () => {
+    const input = await prepared();
+    input.request.request_id = 'request-report-recovery-damaged-evidence';
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const calls: string[] = [];
+    const dependencies = { chatRuntime: knownFailureChat(calls), readCredential: async () => 'fixture-secret' };
+    await expect(runWorker(input.workspace, dependencies, {
+      v5Fault: async (point, task) => {
+        if (point === 'terminal_task_before_result' && task.error?.provider_outcome === 'known_terminal') throw new Error('crash:report-evidence-damage');
+      },
+    })).rejects.toThrow('crash:report-evidence-damage');
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const durable = await readV5Task(directory);
+    await writeFile(path.join(directory, durable.dictionary_snapshot.path), canonicalJson({ tampered: true }), { mode: 0o600 });
+    const callsBeforeAudit = [...calls];
+    await runWorker(input.workspace, dependencies);
+    const afterAudit = await readV5Task(directory);
+    expect(afterAudit).toMatchObject({
+      status: 'failed', error: { provider_outcome: 'known_terminal' },
+      execution: { provider_calls: { chat: { state: 'terminal', count: 1, outcome: 'known_terminal' } } },
+      artifacts: { report: null },
+    });
+    expect(calls).toEqual(callsBeforeAudit);
+    const diagnostics = JSON.parse(await readFile(path.join(input.workspace, 'runtime/worker-diagnostics.json'), 'utf8'));
+    expect(diagnostics.issues).toEqual(expect.arrayContaining([expect.objectContaining({ file: `${afterAudit.identity.task_id}.json`, code: 'DICTIONARY_RECORD_INVALID' })]));
   });
 
   it('keeps a thrown post-dispatch ASR outcome interrupted and never automatically replays it', async () => {

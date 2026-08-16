@@ -31,6 +31,8 @@ export type V5FaultPoint =
   | 'after_response_persisted'
   | 'after_hints_snapshot_written'
   | 'after_dictionary_matches_snapshot_written'
+  | 'after_terminal_report_written'
+  | 'after_terminal_report_committed'
   | 'terminal_task_before_result';
 export class SimulatedV5Crash extends Error {
   constructor(readonly point: V5FaultPoint | 'after_claim' | 'after_execute' | 'after_review' | 'before_finish', readonly cause: unknown) {
@@ -498,7 +500,11 @@ function exchangeError(code: string, message: string, providerOutcome: 'not_disp
 }
 
 async function writeReport(directory: string, task: TaskRecordV5, snapshot: ModelSnapshotV3, calibration: CalibrationResultV3 | null): Promise<void> {
-  const dictionary = await readStableJson(managed(directory, task.dictionary_snapshot.path), 'DICTIONARY_RECORD_INVALID') as ResolvedDictionarySnapshot;
+  const dictionaryPath = managed(directory, task.dictionary_snapshot.path);
+  await regular(dictionaryPath, 'DICTIONARY_RECORD_INVALID');
+  if (await sha256File(dictionaryPath) !== task.dictionary_snapshot.sha256) throw new MercuryError('DICTIONARY_RECORD_INVALID', '词典快照 hash 与任务记录不一致；未生成报告。');
+  const dictionary = await readStableJson(dictionaryPath, 'DICTIONARY_RECORD_INVALID') as ResolvedDictionarySnapshot;
+  if (dictionary.contract !== 'mercury.dictionary-snapshot/v1' || dictionary.task_id !== task.identity.task_id) throw new MercuryError('DICTIONARY_RECORD_INVALID', '词典快照 identity 与任务不一致；未生成报告。');
   const source = task.input_config.transcription_mode === 'provided' ? '外部提供' : `${snapshot.models.asr?.name ?? 'ASR Provider'}`;
   const text = ['# Mercury 字幕校准工作报告', '', `- 任务 ID：\`${task.identity.task_id}\``, `- 转写来源：${source}（ASR 调用数：${task.execution.provider_calls.asr.count}）`, `- 外部格式：${task.inputs.transcript_source?.format ?? task.inputs.reference?.format ?? '—'}`, `- 原件 SHA-256：${task.inputs.transcript_source?.sha256 ?? task.inputs.media?.sha256 ?? '—'}`, `- 规范化 SHA-256：${task.artifacts.transcript?.sha256 ?? '—'}`, `- Chat：${snapshot.models.chat.name} / ${snapshot.models.chat.provider_model}`, `- 校验证据：${task.input_config.evidence_mode === 'audio_multimodal' ? '完整转录 + 音频' : '完整转录'}`, `- Chat 调用：${task.execution.provider_calls.chat.count}`, `- 完整覆盖：${calibration ? `${calibration.strategy.input_unit_count}/${calibration.strategy.returned_unit_count} ${calibration.strategy.coverage_complete ? '通过' : '失败'}` : '未形成'}`, `- 词典快照：${task.dictionary_snapshot.sha256}`, `- 词典 revision：${dictionary.resolved.map((entry) => `${entry.dictionary_id}@${entry.revision}`).join('，') || '无'}`, `- 相关词典条目：${dictionary.matched_entry_ids.join('，') || '无'}`, `- ASR hints：${dictionary.asr_hints.status}（发送 ${dictionary.asr_hints.input_count}/${dictionary.asr_hints.available_count} 项${dictionary.asr_hints.truncated ? '，已按 Adapter 上限截断' : ''}）`, `- 警告：${task.warnings.join('；') || '无'}`, `- 错误：${task.error ? `${task.error.code}：${task.error.message}` : '无'}`, ''].join('\n');
   await writeFile0600(path.join(directory, 'output/calibration-report.md'), text);
@@ -519,7 +525,9 @@ async function commitTerminalThenDerive(
   await persistV5Task(directory, task);
   await crashFault(fault, 'terminal_task_before_result', task);
   await writeReport(directory, task, snapshot, calibration);
+  await crashFault(fault, 'after_terminal_report_written', task);
   await persistV5Task(directory, task);
+  await crashFault(fault, 'after_terminal_report_committed', task);
   await writeV5Result(directory, task);
   return task;
 }
@@ -615,6 +623,32 @@ function assertChatEvidenceIdentity(candidate: unknown, task: TaskRecordV5, snap
     throw new MercuryError('CALIBRATION_RESULT_INVALID', 'Chat 响应与 task/model/call/input identity 不一致；不会采纳或重放 Provider。');
   }
   return calibration;
+}
+
+async function hasVerifiedReport(directory: string, task: TaskRecordV5): Promise<boolean> {
+  const report = task.artifacts.report;
+  if (!report || report.path !== 'output/calibration-report.md' || report.validation !== 'passed') return false;
+  const target = managed(directory, report.path);
+  const entry = await lstat(target).catch(() => null);
+  return Boolean(entry?.isFile() && !entry.isSymbolicLink() && await sha256File(target) === report.sha256);
+}
+
+export async function ensureV5TerminalReport(directory: string, taskInput?: TaskRecordV5): Promise<TaskRecordV5> {
+  const task = taskInput ?? await readV5Task(directory);
+  if (!['completed', 'failed', 'interrupted'].includes(task.status)) return task;
+  if (await hasVerifiedReport(directory, task)) return task;
+  const snapshot = await readVerifiedV5ModelSnapshot(directory, task);
+  let calibration: CalibrationResultV3 | null = null;
+  if (task.execution.provider_calls.chat.evidence_ref) {
+    calibration = assertChatEvidenceIdentity(
+      await readPinnedEvidence(directory, task.execution.provider_calls.chat, 'CALIBRATION_RESULT_INVALID'),
+      task,
+      snapshot,
+    );
+  }
+  await writeReport(directory, task, snapshot, calibration);
+  await persistV5Task(directory, task);
+  return task;
 }
 
 async function assertCalibrationSourceEvidence(
@@ -1150,12 +1184,13 @@ export async function auditV5Job(workspace: string, listed: BackgroundJobV1): Pr
     const eventRevision = (await stableEvents(directory)).at(-1)?.task_revision ?? 0;
     if (eventRevision > task.identity.revision) { task.identity.revision = eventRevision; task.updated_at = new Date().toISOString(); await persistV5Task(directory, task); }
     if (TERMINAL.has(task.status)) {
+      let current = await ensureV5TerminalReport(directory, await readV5Task(directory));
       if (task.status === 'completed') {
         const reviewRuntime = await import('../review-v5.js');
         const review = await reviewRuntime.initializeV5Review(directory);
         if (review.status === 'not_required') await reviewRuntime.finalizeV5Review(directory);
+        current = await readV5Task(directory);
       }
-      let current = await readV5Task(directory);
       const terminalType = current.status === 'completed' ? 'task_completed' : current.status === 'cancelled' ? 'task_cancelled' : current.status === 'interrupted' ? 'task_interrupted' : 'task_failed';
       const events = await stableEvents(directory);
       if (!events.some((event) => event.type === terminalType)) {
