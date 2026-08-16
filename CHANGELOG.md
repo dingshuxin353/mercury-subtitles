@@ -1,5 +1,10 @@
 # Mercury Changelog
 
+## 0.3.0-alpha.1 — Unreleased
+
+- Added Exchange Protocol v1 schemas, generated types and stable machine CLI foundations.
+- Added planned external transcript imports and versioned global/project dictionaries for the Alpha.1 development line.
+
 ## 0.2.0-alpha.3 — 2026-08-16
 
 ### Skill 安装与兼容

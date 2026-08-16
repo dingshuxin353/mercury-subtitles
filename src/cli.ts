@@ -64,6 +64,7 @@ import {
   type ReviewActor,
 } from './review.js';
 import { installSkill, skillStatus } from './skill.js';
+import { tryRunStableCli } from './stable-cli/index.js';
 
 export interface CliIo {
   stdout: (message: string) => void;
@@ -76,7 +77,7 @@ export interface CliIo {
 
 const HELP = `mercury（推荐：打开交互式 App）
 
-Mercury 0.2 Alpha
+Mercury 0.3 Alpha.1
 
 普通用户场景：
   1. 第一次使用：运行 mercury，按向导添加语音转文字和内容校准服务
@@ -87,7 +88,20 @@ Mercury 0.2 Alpha
   mercury --version
   mercury --help
 
-高级 / 兼容命令（脚本和自动化）：
+稳定非交互命令（脚本、Agent 与外部软件）：
+  mercury protocol version --json
+  mercury protocol capabilities --json
+  mercury config status --json
+  mercury config migrate --check --json
+  mercury config migrate --plan <plan-id> --json
+  mercury input inspect --file <absolute-path> --format auto|srt|vtt|transcript-json --role transcript-source|reference --json
+  mercury task submit --request <absolute-request.json> --json
+  mercury task status|result <task-id> --json
+  mercury task list --limit <n> --json
+  mercury task watch <task-id> --after <sequence> --jsonl
+  mercury dictionary ... --json
+
+高级 / 兼容命令（旧实验合同，deprecated）：
   mercury setup [--config <setup.json>] [--confirm-cloud-data]
   mercury model check --model <model-id> [--audio <check.mp3>]
   mercury model list
@@ -106,6 +120,7 @@ Mercury 0.2 Alpha
   npx skills add dingshuxin353/mercury-subtitles
   mercury skill status [--json]
   mercury skill install [--target <skills-directory>] [--json]  # 旧版兼容
+  旧实验机器输出临时兼容：在原机器命令后加 --experimental（至少保留一个 V0.3 Alpha）
 `;
 
 const SETUP_HELP = `用法：
@@ -1188,9 +1203,21 @@ export async function runCli(
     startDetachedWorker?: typeof startDetachedWorker;
   } = {},
 ): Promise<number> {
+  const experimentalMachine = args.includes('--experimental');
+  if (experimentalMachine) {
+    if (!args.includes('--json') && !args.includes('--jsonl')) {
+      io.stderr('CLI_ARGUMENT_INVALID: --experimental 只用于旧 JSON/JSONL 机器合同。\n');
+      return 2;
+    }
+    args = args.filter((argument) => argument !== '--experimental');
+  }
   const workspaceRoot = defaultWorkspaceRoot(io.homeDirectory ?? homedir());
   const requestedMachineCommand = machineCommand(args);
   try {
+    if (!experimentalMachine) {
+      const stable = await tryRunStableCli(args, { workspaceRoot, io });
+      if (stable !== null) return stable;
+    }
     if (args[0] === '__worker') {
       const internalArgs = args.slice(1);
       assertAllowedArguments(internalArgs, new Set(['--workspace']), new Set());

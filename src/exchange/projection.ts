@@ -35,7 +35,7 @@ function artifacts(view: MachineTaskView): ExchangeTaskV1['artifacts'] {
   return sources.map(({ identity, artifact }) => ({
     identity,
     exists: artifact.exists,
-    path: artifact.path,
+    path: artifact.exists ? artifact.path : null,
     sha256: null,
     validation: artifact.validation,
   } satisfies Artifact)) as ExchangeTaskV1['artifacts'];

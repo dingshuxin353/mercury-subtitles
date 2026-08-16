@@ -250,7 +250,7 @@ npm run verify
 
 ## 版本与反馈
 
-- 当前版本：`0.2.0-alpha.3`，推荐通过 npm dist-tag `next` 安装 Public Alpha。
+- 当前开发候选：`0.3.0-alpha.1`；尚未发布，已发布 Public Alpha 仍可通过 npm dist-tag `next` 安装。
 - 版本变化：[CHANGELOG.md](./CHANGELOG.md)
 - 下载与校验：[GitHub Releases](https://github.com/dingshuxin353/mercury-subtitles/releases)
 - 安装或配置求助：[创建安装帮助](https://github.com/dingshuxin353/mercury-subtitles/issues/new?template=installation-help.yml)

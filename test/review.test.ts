@@ -446,7 +446,7 @@ describe('V02-D003 review and approved subtitle', () => {
       const stdout: string[] = [];
       const stderr: string[] = [];
       expect(await (await import('../src/cli.js')).runCli(
-        ['task', command, task.task_id, '--json'],
+        ['task', command, task.task_id, '--json', '--experimental'],
         { homeDirectory: input.root, stdout: (value) => stdout.push(value), stderr: (value) => stderr.push(value) },
       )).toBe(0);
       expect(stderr).toEqual([]);

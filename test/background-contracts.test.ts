@@ -109,7 +109,7 @@ describe('V02-D001 background persistence contracts', () => {
     const stdout: string[] = [];
     const stderr: string[] = [];
     const exit = await runCli(
-      ['task', 'status', result.task.task_id, '--json'],
+      ['task', 'status', result.task.task_id, '--json', '--experimental'],
       { homeDirectory: home, stdout: (value) => stdout.push(value), stderr: (value) => stderr.push(value) },
     );
     expect(exit).toBe(0);
