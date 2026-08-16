@@ -31,15 +31,16 @@ function fixtureAsr(calls: string[]): AsrAdapter {
     adapterId: 'volcengine_asr',
     async run(input) {
       calls.push(input.taskId);
+      const completedAt = new Date().toISOString();
       return {
         kind: 'artifact',
         artifact: {
-          schema_version: '1.0.0', task_id: input.taskId, created_at: new Date().toISOString(),
+          schema_version: '1.0.0', task_id: input.taskId, created_at: completedAt,
           audio: { path_ref: input.audio.pathRef, sha256: input.audio.sha256, duration_ms: input.audio.durationMs, language: 'zh-CN', mime_type: 'audio/mpeg' },
           full_text: '您好世界和平',
           segments: [{ segment_id: 'seg-1', index: 0, start_ms: 0, end_ms: input.audio.durationMs, text: '您好世界和平', confidence: 0.99, words: [] }],
           model_snapshot_ref: input.modelSnapshotRef,
-          call: { call_id: 'fixture-asr', model_snapshot_entry_ref: input.model.snapshot_entry_id, started_at: new Date().toISOString(), ended_at: new Date().toISOString(), outcome: 'completed', error_ref: null },
+          call: { call_id: 'fixture-asr', model_snapshot_entry_ref: input.model.snapshot_entry_id, started_at: completedAt, ended_at: completedAt, outcome: 'completed', error_ref: null },
           raw_response_ref: null, warnings: [], errors: [],
         },
       };
@@ -286,7 +287,7 @@ describe('V02-D002 single background worker', () => {
     release();
     await worker;
     const completed = await readTaskRecordV2(path.join(input.workspace, 'tasks', submitted.task.task_directory));
-    expect(completed.execution.status).toBe('completed');
+    expect(completed.execution.status, JSON.stringify(completed.error)).toBe('completed');
     expect(calls).toHaveLength(2);
   });
 
