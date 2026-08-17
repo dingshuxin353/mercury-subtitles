@@ -116,7 +116,7 @@ mercury worker start --json
 
 `0.3.0-alpha.2` 候选继续使用 Exchange Protocol v1：脚本可显式导入 SRT、VTT 或 transcript JSON 作为转写事实源（ASR 0 调用），也可用 `reference` 继续走 ASR；两种模式共用稳定任务、事件、结果、词典快照和审阅合同。新增安全暂停/同 attempt 恢复，以及只读 retry plan + append-only retry；Provider 结果不确定时仍禁止自动重放。全局/项目词典通过 `mercury dictionary ... --json` 管理，任务创建后固定 revision/hash。
 
-新任务的纯转写、AI 校验、人工批准与业务目录交付 SRT 统一采用无句读风格；版本号、`B-roll`、URL、邮箱和技术缩写中的词法符号会保留。无参考任务优先沿用 ASR/外部转写的合法时间边界，只在词级停顿、句末证据或 24 字硬限制能够证明更合适时拆分，不再为追求 8–18 字软目标重排整稿。Provider/raw 证据仍保持原样，历史任务不会被改写。
+新任务的纯转写、AI 校验、人工批准与业务目录交付 SRT 统一采用无句读风格；版本号、`B-roll`、URL、邮箱和技术缩写中的词法符号会保留，包裹 URL 的括号、方括号和引号不会被误当成 URL 本体。无参考任务优先沿用 ASR/外部转写的合法时间边界，只在内部句末、带逗号等句读证据的词级停顿或 24 字硬限制能够证明更合适时拆分；静音时长本身不触发切分，也不再为追求 8–18 字软目标重排整稿。Provider/raw 证据仍保持原样，历史任务不会被改写。
 
 [CLI 完整说明 →](https://github.com/dingshuxin353/mercury-subtitles/blob/main/docs/cli.md)
 

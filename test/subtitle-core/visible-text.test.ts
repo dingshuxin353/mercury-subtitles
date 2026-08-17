@@ -29,6 +29,17 @@ describe('V03-F017 visible subtitle style', () => {
   it('returns an empty visible value when a segment contains punctuation only', () => {
     expect(normalizeVisibleSubtitleText('，。！？').text).toBe('');
   });
+
+  it.each([
+    ['(https://example.com/a)', 'https://example.com/a'],
+    ['[https://example.com/a]', 'https://example.com/a'],
+    ['“https://example.com/a”', 'https://example.com/a'],
+    ["'https://example.com/a'", 'https://example.com/a'],
+    ['访问 https://example.com/a).', '访问 https://example.com/a'],
+    ['访问 https://example.com/a?x=1#fragment。', '访问 https://example.com/a?x=1#fragment'],
+  ])('protects only the URL body and removes surrounding separators: %s', (source, expected) => {
+    expect(normalizeVisibleSubtitleText(source).text).toBe(expected);
+  });
 });
 
 describe('V03-F017 source-boundary-first segmentation', () => {
@@ -95,13 +106,13 @@ describe('V03-F017 source-boundary-first segmentation', () => {
     ]));
   });
 
-  it('uses a 400 ms word gap but not a 399 ms gap as internal pause evidence', async () => {
-    const withGap = async (gap: number) => {
+  it('does not split on silence alone and requires punctuation plus a 400 ms pause', async () => {
+    const withGap = async (gap: number, punctuation: boolean) => {
       const transcript = await validFixture<TranscriptRaw>('transcript.raw.json');
-      transcript.audio.duration_ms = 1_000;
-      transcript.full_text = '甲乙丙丁';
+      transcript.audio.duration_ms = 2_000;
+      transcript.full_text = punctuation ? '甲乙，丙丁' : '甲乙丙丁';
       transcript.segments = [{
-        segment_id: 'seg-1', index: 0, start_ms: 0, end_ms: 1_000, text: '甲乙丙丁', confidence: 0.99,
+        segment_id: 'seg-1', index: 0, start_ms: 0, end_ms: 2_000, text: transcript.full_text, confidence: 0.99,
         words: [
           { word_id: 'word-1', index: 0, start_ms: 0, end_ms: 100, text: '甲', confidence: 0.99 },
           { word_id: 'word-2', index: 1, start_ms: 100, end_ms: 200, text: '乙', confidence: 0.99 },
@@ -111,16 +122,19 @@ describe('V03-F017 source-boundary-first segmentation', () => {
       }];
       return runTranscript(transcript);
     };
-    const split = await withGap(400);
-    const retained = await withGap(399);
-    expect(split.status).toBe('completed');
-    expect(retained.status).toBe('completed');
-    if (split.status !== 'completed' || retained.status !== 'completed') return;
-    expect(split.artifact.segments).toHaveLength(2);
-    expect(retained.artifact.segments).toHaveLength(1);
+    const silenceOnly = await withGap(800, false);
+    const punctuatedPause = await withGap(400, true);
+    const shortPunctuatedPause = await withGap(399, true);
+    expect(silenceOnly.status).toBe('completed');
+    expect(punctuatedPause.status).toBe('completed');
+    expect(shortPunctuatedPause.status).toBe('completed');
+    if (silenceOnly.status !== 'completed' || punctuatedPause.status !== 'completed' || shortPunctuatedPause.status !== 'completed') return;
+    expect(silenceOnly.artifact.segments).toHaveLength(1);
+    expect(punctuatedPause.artifact.segments).toHaveLength(2);
+    expect(shortPunctuatedPause.artifact.segments).toHaveLength(1);
   });
 
-  it('keeps all twenty frozen semantic phrases intact in a redacted-equivalent fixture', async () => {
+  it('keeps every frozen semantic phrase intact in a redacted-equivalent fixture', async () => {
     const benchmark = JSON.parse(await readFile(fileURLToPath(new URL('../fixtures/segmentation-quality-benchmark.json', import.meta.url)), 'utf8')) as { forbidden_boundaries: Array<[string, string]> };
     const phrases = benchmark.forbidden_boundaries.map(([left, right]) => `${left}${right}`);
     const result = await runSegments(phrases);

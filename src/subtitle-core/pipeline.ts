@@ -60,7 +60,7 @@ interface SegmentationResult {
   warnings: SubtitleCoreWarning[];
 }
 
-type BoundaryReason = 'source_boundary' | 'sentence_punctuation' | 'natural_pause' | 'hard_limit';
+type BoundaryReason = 'source_boundary' | 'sentence_punctuation' | 'punctuated_pause' | 'hard_limit';
 
 export function runSubtitleCore(input: SubtitleCoreInput): SubtitleCoreResult {
   const transcriptValidation = validateContract('transcript.raw', input.transcript);
@@ -447,7 +447,7 @@ function segmentTimedUnits(
   const boundaryCounts: Record<BoundaryReason, number> = {
     source_boundary: 0,
     sentence_punctuation: 0,
-    natural_pause: 0,
+    punctuated_pause: 0,
     hard_limit: 0,
   };
   let current: TimedTextUnit[] = [];
@@ -544,7 +544,7 @@ function segmentTimedUnits(
   warnings.push({
     warning_id: 'warning-segmentation-policy-0001',
     code: 'SEGMENTATION_POLICY_APPLIED',
-    message: `${SEGMENTATION_POLICY_VERSION} kept source boundaries and created ${boundaryCounts.sentence_punctuation} sentence, ${boundaryCounts.natural_pause} pause, and ${boundaryCounts.hard_limit} hard-limit boundaries; ${boundaryCounts.source_boundary} source boundaries were preserved.`,
+    message: `${SEGMENTATION_POLICY_VERSION} kept source boundaries and created ${boundaryCounts.sentence_punctuation} sentence, ${boundaryCounts.punctuated_pause} punctuation-plus-pause, and ${boundaryCounts.hard_limit} hard-limit boundaries; ${boundaryCounts.source_boundary} source boundaries were preserved.`,
     segment_refs: unique(segments.flatMap((segment) => [...segment.asr_segment_refs, ...segment.reference_segment_refs]))
   });
   return { segments, warnings };
@@ -562,7 +562,7 @@ function breakReason(current: TimedTextUnit[], next: TimedTextUnit): BoundaryRea
     !sameValues(previous.source_segment_refs, next.source_segment_refs)
   ) return 'source_boundary';
   if (/[。！？!?；;]$/u.test(text.trim())) return 'sentence_punctuation';
-  if (next.start_ms - currentEnd >= 400) return 'natural_pause';
+  if (next.start_ms - currentEnd >= 400 && /[，,、：:]$/u.test(text.trim())) return 'punctuated_pause';
   if (countSubtitleCharacters(combined) > HARD_MAX_CHARACTERS) return 'hard_limit';
   return null;
 }
