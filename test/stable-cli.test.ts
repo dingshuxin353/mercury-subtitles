@@ -23,7 +23,7 @@ describe('stable CLI v1 protocol and configuration', () => {
       expect(output.stderr).toEqual([]);
       expect(output.stdout).toHaveLength(1);
       const envelope = JSON.parse(output.stdout[0]!);
-      expect(envelope).toMatchObject({ contract: 'mercury.cli/v1', ok: true, error: null, meta: { cli_version: '0.3.0-alpha.1', protocol_versions: ['v1'] } });
+      expect(envelope).toMatchObject({ contract: 'mercury.cli/v1', ok: true, error: null, meta: { cli_version: '0.3.0-alpha.2', protocol_versions: ['v1'] } });
     }
     const capabilities = JSON.parse(capture(home).stdout[0] ?? 'null');
     expect(capabilities).toBeNull();
@@ -31,7 +31,7 @@ describe('stable CLI v1 protocol and configuration', () => {
     const output = capture(home);
     await runCli(['protocol', 'capabilities', '--json'], output.io);
     const data = JSON.parse(output.stdout[0]!).data;
-    expect(data.commands).toMatchObject({ external_srt: true, dictionary: true, pause: false, retry: false, venus_adapter: false });
+    expect(data.commands).toMatchObject({ external_srt: true, dictionary: true, pause: true, retry: true, venus_adapter: false });
     expect(data.query_commands_are_read_only).toBe(true);
   });
 
@@ -44,6 +44,36 @@ describe('stable CLI v1 protocol and configuration', () => {
       contract: 'mercury.cli/v1', command: 'config.status', ok: true,
       data: { configured: false, state: 'not_configured', migration_required: false },
     });
+    await expect(lstat(path.join(home, 'mercury-workspace'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('projects only non-sensitive model readiness/default facts for stable Agent discovery', async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), 'mercury-stable-config-models-'));
+    const configDirectory = path.join(home, 'mercury-workspace', 'config');
+    await mkdir(configDirectory, { recursive: true });
+    const target = path.join(configDirectory, 'model-config.json');
+    await cp(path.join(process.cwd(), 'test/fixtures/valid/model-config.json'), target);
+    await (await import('node:fs/promises')).chmod(target, 0o600);
+    const migration = await inspectConfigMigration(path.join(home, 'mercury-workspace'));
+    await applyConfigMigration(path.join(home, 'mercury-workspace'), migration.plan_id!);
+    const output = capture(home);
+    expect(await runCli(['config', 'status', '--json'], output.io)).toBe(0);
+    const envelope = JSON.parse(output.stdout[0]!);
+    expect(envelope).toMatchObject({ contract: 'mercury.cli/v1', ok: true, data: { state: 'current', defaults: { asr: expect.any(String), chat: expect.any(String) }, models: expect.any(Array) } });
+    expect(envelope.data.models.length).toBeGreaterThanOrEqual(2);
+    expect(envelope.data.models[0]).toEqual(expect.objectContaining({ model_id: expect.any(String), name: expect.any(String), category: expect.stringMatching(/^(?:asr|chat)$/u), provider: expect.any(String), enabled: expect.any(Boolean), check: expect.any(String), ready: expect.any(Boolean) }));
+    expect(JSON.stringify(envelope)).not.toMatch(/credential_ref|keychain:|env:|api[_-]?key|access[_-]?token|secret/iu);
+  });
+
+  it('inspects one immutable MP3 buffer without creating workspace state', async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), 'mercury-stable-media-inspect-'));
+    const audio = path.join(home, 'fixture.mp3');
+    const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417);
+    await writeFile(audio, bytes, { mode: 0o600 });
+    const output = capture(home);
+    expect(await runCli(['input', 'inspect', '--file', audio, '--format', 'mp3', '--role', 'media', '--json'], output.io)).toBe(0);
+    expect(output.stderr).toEqual([]);
+    expect(JSON.parse(output.stdout[0]!)).toMatchObject({ contract: 'mercury.cli/v1', command: 'input.inspect', ok: true, data: { path: audio, format: 'mp3', role: 'media', bytes: 834, sha256: await sha256File(audio), duration_ms: expect.any(Number), mime_type: 'audio/mpeg', valid: true } });
     await expect(lstat(path.join(home, 'mercury-workspace'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 

@@ -1,4 +1,4 @@
 interface:
   display_name: "Mercury 字幕助手"
-  short_description: "后台生成、找回并人工审阅 Mercury 中文字幕"
-  default_prompt: "Use $mercury-subtitles to create a background subtitle task for my local MP3 and help me review the result."
+  short_description: "稳定提交、控制、审阅并交付 Mercury 中文字幕"
+  default_prompt: "Use $mercury-subtitles with Mercury's stable Exchange CLI to submit my subtitle request, manage it safely, review changes, and deliver the approved SRT."

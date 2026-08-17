@@ -50,13 +50,19 @@ npx skills remove mercury-subtitles
 
 > 用 Mercury 列出这个任务的校验变化，我要逐项决定，然后生成批准稿。
 
+> 暂停这个 Mercury 任务；等它真正到安全检查点后再告诉我。随后从同一 attempt 恢复，不要重复已固定的 Provider 调用。
+
+> 先只读分析这个失败任务能不能安全重试，告诉我将复用什么、会新增几次 ASR/Chat；没有我确认不要执行。
+
 ## 安全边界
 
 - Agent 不应向你索要或打印 Key、Token、ADC 内容、`.env` 或 Mercury secret 文件。
 - Skill 不直接调用 Provider，不自己转写音频，不绕过 Mercury 编辑 task/review 文件。
 - 同一逻辑请求输出丢失时复用稳定 request ID；不确定结果不得换 ID 自动重试。
 - 查询命令不会启动 Worker。queued 且 Worker 未运行时，使用显式 `worker start`。
+- 暂停/恢复不创建新 attempt；重试前必须展示只读 plan，并且只能执行仍匹配当前 task revision 的 plan。
+- `outcome_unknown` 不得自动恢复或重试。若用户仍要重新处理，必须作为可能重复计费的全新逻辑 request 明示确认。
 - 只报告 Mercury 返回的绝对结果路径，不猜测文件位置。
 - 除非用户明确要求检查特定内容，不把整份字幕复制到聊天。
 
-Skill 的机器合同目前是实验性 `mercury-cli-experimental-v1`。升级 Alpha 前可以运行 `mercury skill status --json` 检查兼容性；更新 Skill 本身仍使用标准 Skills CLI。
+Skill 只消费稳定 `mercury.cli/v1` / Exchange Protocol v1；不会解析中文 App 页面或旧实验输出。升级 Alpha 前可以运行 `mercury skill status --json` 检查兼容性；更新 Skill 本身仍使用标准 Skills CLI。

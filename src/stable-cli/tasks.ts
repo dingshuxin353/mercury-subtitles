@@ -9,7 +9,8 @@ import { cancelBackgroundTask, taskMachineView } from '../background/runtime.js'
 import { readTaskEvents } from '../background/storage.js';
 import { projectMachineTaskToExchangeResult, projectMachineTaskToExchangeTask } from '../exchange/projection.js';
 import type { TaskRecordV5 } from '../contracts/generated/task-record-v5.js';
-import { cancelV5Task, projectV5Result, projectV5Task, readV5Events, readV5Task } from '../exchange/runtime.js';
+import { cancelV5Task, executeV5Retry, pauseV5Task, planV5Retry, projectV5Result, projectV5Task, readV5Events, readV5Task, resumeV5Task } from '../exchange/runtime.js';
+import type { ExchangeRetryPlanV1 } from '../contracts/index.js';
 import { readStableJson } from '../exchange/storage.js';
 import { deliverCurrentV5Review } from '../review-v5.js';
 
@@ -100,6 +101,29 @@ export async function stableCancelTask(workspaceRoot: string, record: Compatible
   }
   const cancelled = await cancelBackgroundTask(workspaceRoot, record as TaskRecordV2);
   return { pending: cancelled.pending, task: await stableTaskView(workspaceRoot, cancelled.task) };
+}
+
+export async function stablePauseTask(workspaceRoot: string, record: CompatibleTask): Promise<{ pending: boolean; task: ExchangeTaskV1 }> {
+  if (!('identity' in record)) throw new MercuryError('CONTRACT_UNSUPPORTED', '此历史任务不支持安全暂停；查询未做任何写入。', { exitCode: 5 });
+  const paused = await pauseV5Task(workspaceRoot, record);
+  return { pending: paused.pending, task: await stableTaskView(workspaceRoot, paused.task) };
+}
+
+export async function stableResumeTask(workspaceRoot: string, record: CompatibleTask): Promise<{ task: ExchangeTaskV1 }> {
+  if (!('identity' in record)) throw new MercuryError('CONTRACT_UNSUPPORTED', '此历史任务不支持安全恢复；查询未做任何写入。', { exitCode: 5 });
+  const resumed = await resumeV5Task(workspaceRoot, record);
+  return { task: await stableTaskView(workspaceRoot, resumed) };
+}
+
+export async function stableRetryPlan(workspaceRoot: string, record: CompatibleTask): Promise<ExchangeRetryPlanV1> {
+  if (!('identity' in record)) throw new MercuryError('CONTRACT_UNSUPPORTED', '此历史任务不支持安全 retry plan；查询未做任何写入。', { exitCode: 5 });
+  return planV5Retry(path.join(workspaceRoot, 'tasks', record.identity.task_directory), record);
+}
+
+export async function stableRetryTask(workspaceRoot: string, record: CompatibleTask, planId: string): Promise<{ task: ExchangeTaskV1 }> {
+  if (!('identity' in record)) throw new MercuryError('CONTRACT_UNSUPPORTED', '此历史任务不支持安全 retry；查询未做任何写入。', { exitCode: 5 });
+  const retried = await executeV5Retry(workspaceRoot, record, planId);
+  return { task: await stableTaskView(workspaceRoot, retried) };
 }
 
 export async function stableDeliverTask(workspaceRoot: string, record: CompatibleTask): Promise<{ task: ExchangeTaskV1; result: ExchangeResultV1 }> {

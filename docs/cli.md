@@ -48,7 +48,7 @@ mercury dictionary entry remove <dictionary-id> --revision <revision> --entry-id
 
 布尔值必须显式写 `true` 或 `false`。`--clear-variants`、`--clear-tags` 和 `--clear-notes` 表达清空意图；所有写操作都要求当前 revision，陈旧编辑会失败而不是覆盖。
 
-## 查询和恢复
+## 查询、暂停与恢复
 
 ```bash
 mercury task list --json
@@ -57,9 +57,15 @@ mercury task result <task-id> --json
 mercury task watch <task-id> --jsonl
 mercury worker status --json
 mercury worker start --json
+mercury task pause <task-id> --json
+mercury task resume <task-id> --json
+mercury task retry-plan <task-id> --json
+mercury task retry <task-id> --plan <plan-id> --json
 ```
 
 `task status/list/result/watch` 与 `worker status` 都是严格只读查询。它们不会启动 Worker，也不会调用 Provider。排队任务没有 Worker 时，显式执行 `worker start`；不要重新 submit 来唤醒。
+
+`pause` 对尚未 dispatch 的任务立即生效；Provider 调用已经在途时只显示“正在等待安全检查点”，不会伪报暂停。`resume` 继续同一 attempt：已固定响应只做本地处理，尚未 dispatch 的调用仍至多执行一次。`retry-plan` 严格只读，并列出复用/废弃产物、固定模型、预计新增 ASR/Chat 次数与风险；只有用户确认后才把当前未过期 plan 交给 `task retry`。retry 创建 append-only 新 attempt，不覆盖旧错误、事件或调用账本。`outcome_unknown` 永远不属于安全 resume/retry。
 
 ## 取消
 

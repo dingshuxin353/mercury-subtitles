@@ -1,6 +1,13 @@
 # Mercury Changelog
 
-## 0.3.0-alpha.1 — Unreleased
+## 0.3.0-alpha.2 — Unreleased
+
+- Added safe queued/running pause checkpoints and same-attempt resume without replaying persisted Provider responses.
+- Added deterministic read-only retry plans and append-only retry attempts with explicit Provider call estimates and unknown-outcome refusal.
+- Migrated the packaged Mercury Skill to stable `mercury.cli/v1` / Exchange v1 for external inputs, dictionaries, task control, review and approved-SRT delivery.
+- Added read-only stable media inspection and non-sensitive model default/readiness discovery for Agent request construction.
+
+## 0.3.0-alpha.1 — 2026-08-17
 
 - Added Exchange Protocol v1 schemas, generated types and stable machine CLI foundations.
 - Added external SRT, VTT and transcript JSON imports with explicit roles, normalized provenance and auditable zero-ASR provided mode.

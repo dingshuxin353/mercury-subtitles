@@ -1,15 +1,14 @@
-# Troubleshooting
+# Structured recovery
 
-- `MODEL_NOT_CONFIGURED`, `MODEL_CHECK_NOT_PASSED`, or model readiness errors: ask the user to open interactive `mercury` and use the model center. Do not request credentials in chat.
-- `REQUEST_ID_CONFLICT`: the ID belongs to different normalized input. Preserve the original task and ask whether the user wants a genuinely new task ID.
-- `REQUEST_RESERVATION_IN_PROGRESS`: retry later with the same request ID only.
-- `WORKER_START_FAILED`: run the read-only `mercury worker status --json`, show its remediation, and do not fall back to synchronous execution. After fixing the local cause, explicitly run `mercury worker start --json`; do not resubmit.
-- Lost derive output: rerun `request id` with exactly the same absolute inputs, model options, mode and intent. Lost submit output: reuse the recorded derived ID. If any of those inputs are uncertain, inspect `task list --json` and ask the user rather than generating a new ID.
-- `TASK_INTERRUPTED_PROVIDER_UNKNOWN`: explain that the request may have reached the Provider and Mercury intentionally will not replay it.
-- `TASK_CANCELLATION_PENDING`: cancellation is persisted but waiting for a safe boundary; query the same task.
-- `MACHINE_CONTRACT_UNAVAILABLE`: this is an older task or incompatible Mercury. Offer read-only status/results or ask the user to upgrade; do not edit its files.
-- `REVIEW_NOT_READY`: AI calibration did not complete or this is a historical task. A transcribed SRT is not an approvable AI result.
-- `REVIEW_CONFIRM_COUNT_STALE`: reload the page/count and reconfirm.
-- `REVIEW_SOURCE_CONFLICT`: source artifacts changed. Stop without rebuilding or overwriting decisions.
+- Model/config readiness: direct the user to interactive `mercury` → 模型中心 and hidden secret input. Never request or inspect credentials.
+- `REQUEST_ID_CONFLICT`: the stable ID is bound to different normalized facts. Preserve the existing task; confirm whether the user intends a genuinely new logical request.
+- Lost submit output: reuse the recorded request file and ID. Lost identity: query/list and ask; never generate a random ID.
+- `TASK_RESUME_UNSAFE`: evidence/checkpoint/outcome cannot prove same-attempt safety. Do not edit records or create a replacement silently.
+- `TASK_INTERRUPTED_PROVIDER_UNKNOWN` or `RETRY_UNSAFE_PROVIDER_OUTCOME`: a Provider side effect may have occurred. Never replay/resume/retry this call.
+- `RETRY_PLAN_STALE`/`RETRY_PLAN_EXPIRED`: rerun read-only retry-plan and show the changed facts; do not reuse the old plan.
+- `TASK_PAUSE_UNAVAILABLE`: report the actual state. `pausing` is not a failure; wait/query the same task.
+- Worker start failure: query `worker status`, fix the local runtime issue, then explicitly start. Never resubmit or fall back to synchronous Provider execution.
+- Delivery failure: workspace approved remains authoritative. Fix only the stated local directory problem, then call `task deliver`; do not rerun ASR/Chat.
+- Review stale/source errors: reload stable review state and reconfirm; never patch review/task JSON.
 
-For any unknown structured error, report the user message and remediation. Do not expose raw Provider details, stack traces, secrets, or internal lock paths.
+For unknown errors, show only the structured Chinese message/remediation. Do not expose technical Provider detail, stack traces, lock paths, Authorization data, or full response bodies.

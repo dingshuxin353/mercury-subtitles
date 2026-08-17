@@ -6,8 +6,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { ensureWorkspace } from '../src/workspace.js';
 import { loadModelRegistryV2 } from '../src/models-v2.js';
 import { runWorker } from '../src/background/worker.js';
-import { appendV5Event, cancelV5Task, persistV5Task, readV5Events, readV5Task, submitExchangeRequest } from '../src/exchange/runtime.js';
-import { findTaskReadOnly, stableTaskResult, stableTaskView } from '../src/stable-cli/tasks.js';
+import { appendV5Event, auditV5Job, cancelV5Task, claimV5Job, executeV5Retry, pauseV5Task, persistV5Task, planV5Retry, readV5Events, readV5Task, resumeV5Task, submitExchangeRequest } from '../src/exchange/runtime.js';
+import { findTaskReadOnly, stablePauseTask, stableTaskResult, stableTaskView } from '../src/stable-cli/tasks.js';
 import { createDictionary, makeDictionaryEntry, mutateDictionary } from '../src/dictionary.js';
 import { runCli } from '../src/cli.js';
 import type { AsrAdapter, AsrHintsCapableAdapter, ExchangeRequestV1 } from '../src/contracts/index.js';
@@ -288,7 +288,7 @@ describe('Exchange v1 external transcript task', () => {
     expect(result.dictionaries).toMatchObject({ match_count: 1, snapshots: [expect.objectContaining({ dictionary_id: dictionary.dictionary_id })] });
     const attempts = (await readFile(path.join(directory, 'attempts.jsonl'), 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
     expect(attempts[0]).toMatchObject({ contract: 'mercury.attempt/v1', transcription_mode: 'provider', asr_call_count: 0 });
-    expect(attempts[1]).toMatchObject({ contract: 'mercury.attempt-result/v1', asr_call_count: 1, chat_call_count: 1 });
+    expect(attempts.find((entry) => entry.contract === 'mercury.attempt-result/v1')).toMatchObject({ asr_call_count: 1, chat_call_count: 1 });
     expect(task.review.status).toMatch(/pending|finalized|not_required/u);
   });
 
@@ -755,6 +755,7 @@ describe('Exchange v1 external transcript task', () => {
     misclassified.status = 'failed';
     misclassified.execution.provider_calls.chat.state = 'terminal';
     misclassified.execution.provider_calls.chat.outcome = 'response_persisted';
+    misclassified.execution.provider_calls.chat.terminal_at = misclassified.updated_at;
     misclassified.error = {
       ...misclassified.error,
       code: 'GEMINI_MODEL_CALL_FAILED',
@@ -1261,7 +1262,7 @@ describe('Exchange v1 external transcript task', () => {
       expect((await stat(path.join(directory, relative))).mode & 0o777).toBe(0o600);
     }
     expect(await readFile(path.join(directory, 'input/transcript-source.srt'), 'utf8')).toBe(await readFile(input.source, 'utf8'));
-    expect(first.task.execution.provider_calls.asr).toEqual({ state: 'not_started', count: 0, outcome: 'not_dispatched', evidence_ref: null, evidence_sha256: null });
+    expect(first.task.execution.provider_calls.asr).toMatchObject({ state: 'not_started', count: 0, outcome: 'not_dispatched', evidence_ref: null, evidence_sha256: null });
 
     await mutateDictionary(input.workspace, dictionary.dictionary_id, dictionaryV2.revision, (current) => { current.entries[0]!.canonical = 'Changed Later'; });
     const calls: string[] = []; const captured: Array<Record<string, any>> = [];
@@ -1291,10 +1292,8 @@ describe('Exchange v1 external transcript task', () => {
     expect(result.artifacts.find((entry) => entry.identity === 'calibrated_srt')).toMatchObject({ exists: true, validation: 'passed' });
     expect(sha(await readFile(path.join(directory, completed.calibration_sources.transcript!.path)))).toBe(bridgeBefore);
     const attempts = (await readFile(path.join(directory, 'attempts.jsonl'), 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
-    expect(attempts).toEqual([
-      expect.objectContaining({ contract: 'mercury.attempt/v1', asr_call_count: 0 }),
-      expect.objectContaining({ contract: 'mercury.attempt-result/v1', status: 'completed', asr_call_count: 0, chat_call_count: 1 }),
-    ]);
+    expect(attempts.find((entry) => entry.contract === 'mercury.attempt/v1')).toMatchObject({ asr_call_count: 0 });
+    expect(attempts.find((entry) => entry.contract === 'mercury.attempt-result/v1')).toMatchObject({ status: 'completed', asr_call_count: 0, chat_call_count: 1 });
 
     await writeFile(path.join(directory, completed.artifacts.report!.path), 'tampered\n');
     const tampered = await stableTaskView(input.workspace, await findTaskReadOnly(input.workspace, completed.identity.task_id));
@@ -1414,12 +1413,16 @@ describe('Exchange v1 external transcript task', () => {
     await persistV5Task(directory, running);
     const stale = structuredClone(await readV5Task(directory));
     const dispatched = structuredClone(stale);
-    dispatched.execution.provider_calls.chat = { state: 'in_flight', count: 1, outcome: 'outcome_unknown', evidence_ref: null, evidence_sha256: null };
+    dispatched.execution.provider_calls.chat = {
+      state: 'in_flight', count: 1, outcome: 'outcome_unknown', evidence_ref: null, evidence_sha256: null,
+      call_id: 'pcl-0123456789abcdef01234567', capability: 'calibration', model_snapshot_entry_ref: `${submitted.task.identity.task_id}-chat`,
+      dispatched_at: started, response_persisted_at: null, terminal_at: null,
+    };
     await persistV5Task(directory, dispatched);
     stale.execution.heartbeat_at = '2026-08-16T15:00:02.000Z'; stale.updated_at = stale.execution.heartbeat_at;
     await persistV5Task(directory, stale);
     await appendV5Event(directory, structuredClone(stale), 'heartbeat_fixture', '旧事件快照不覆盖 dispatch。');
-    expect((await readV5Task(directory)).execution.provider_calls.chat).toEqual({ state: 'in_flight', count: 1, outcome: 'outcome_unknown', evidence_ref: null, evidence_sha256: null });
+    expect((await readV5Task(directory)).execution.provider_calls.chat).toMatchObject({ state: 'in_flight', count: 1, outcome: 'outcome_unknown', evidence_ref: null, evidence_sha256: null });
   });
 
   it('rejects a stale writer that tries to replace one terminal state with another', async () => {
@@ -1504,14 +1507,17 @@ describe('Exchange v1 external transcript task', () => {
     const io = { homeDirectory: input.home, stdout: (value: string) => statusOut.push(value), stderr: () => undefined };
     expect(await runCli(['review', 'status', taskId, '--json'], io), statusOut.join('')).toBe(0);
     const status = JSON.parse(statusOut.at(-1)!);
+    expect(status).toMatchObject({ contract: 'mercury.cli/v1', command: 'review.status', ok: true });
     expect(status.data).toMatchObject({ task_id: taskId, status: 'pending', counts: { pending: 1 } });
     const listOut: string[] = [];
     expect(await runCli(['review', 'list', taskId, '--limit', '10', '--json'], { ...io, stdout: (value) => listOut.push(value) })).toBe(0);
+    expect(JSON.parse(listOut[0]!)).toMatchObject({ contract: 'mercury.cli/v1', command: 'review.list', ok: true });
     const change = JSON.parse(listOut[0]!).data.changes[0];
     const before = parseSrt(await readFile(path.join(input.workspace, 'tasks', submitted.task.identity.task_directory, submitted.task.artifacts.transcribed!.path), 'utf8'));
     expect(await runCli(['review', 'decide', taskId, '--change', change.change_id, '--accept', '--json'], { ...io, stdout: () => undefined })).toBe(0);
     const finalized: string[] = [];
     expect(await runCli(['review', 'finalize', taskId, '--json'], { ...io, stdout: (value) => finalized.push(value) })).toBe(0);
+    expect(JSON.parse(finalized[0]!)).toMatchObject({ contract: 'mercury.cli/v1', command: 'review.finalize', ok: true });
     const approvedPath = JSON.parse(finalized[0]!).data.approved_artifact.absolute_path;
     const after = parseSrt(await readFile(approvedPath, 'utf8'));
     expect(after.map(({ start, end }) => ({ start, end }))).toEqual(before.map(({ start, end }) => ({ start, end })));
@@ -1796,6 +1802,352 @@ describe('Exchange v1 external transcript task', () => {
     await expect(submitExchangeRequest(input.workspace, input.request)).rejects.toMatchObject({ code: 'INPUT_HASH_MISMATCH' });
     const tasks = await (await import('node:fs/promises')).readdir(path.join(input.workspace, 'tasks'));
     expect(tasks).toHaveLength(0);
+  });
+
+  it('pauses a queued Alpha.2 task immediately with zero Provider calls and resumes the same request safely', async () => {
+    const input = await prepared(); input.request.request_id = 'request-alpha2-queued-pause';
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const paused = await pauseV5Task(input.workspace, submitted.task);
+    expect(paused).toMatchObject({ pending: false, task: { status: 'paused', execution: { safe_checkpoint: 'queued', attempt_id: null, attempt_count: 0 } } });
+    expect((await readJob(input.workspace, submitted.task.identity.task_id)).state).toBe('paused');
+    const view = await stableTaskView(input.workspace, await findTaskReadOnly(input.workspace, submitted.task.identity.task_id));
+    expect(view).toMatchObject({ status: 'paused', capabilities: { pause: { supported: true }, resume: { supported: true } }, pause: { allowed: false } });
+    const resumed = await resumeV5Task(input.workspace, paused.task);
+    expect(resumed).toMatchObject({ status: 'queued', execution: { attempt_id: null, attempt_count: 0, control: { resume_count: 1, pause_requested_at: null, paused_at: null } } });
+    const calls: string[] = [];
+    await runWorker(input.workspace, { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    expect((await readV5Task(path.join(input.workspace, 'tasks', submitted.task.identity.task_directory))).status).toBe('completed');
+    expect(calls).toEqual(['chat']);
+  });
+
+  it('serializes one hundred pause/resume requests and a claim/pause race through the task owner lock', async () => {
+    const input = await prepared(); input.request.request_id = 'request-alpha2-control-concurrency';
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const pauses = await Promise.all(Array.from({ length: 100 }, () => pauseV5Task(input.workspace, submitted.task)));
+    expect(pauses.every((entry) => entry.task.status === 'paused')).toBe(true);
+    const paused = await readV5Task(directory);
+    const resumes = await Promise.all(Array.from({ length: 100 }, () => resumeV5Task(input.workspace, paused)));
+    expect(resumes.every((entry) => entry.status === 'queued' && entry.execution.attempt_count === 0)).toBe(true);
+    expect((await readV5Task(directory)).execution.control).toMatchObject({ resume_count: 1 });
+    expect((await readV5Events(directory)).filter((event) => event.type === 'task_paused')).toHaveLength(1);
+    expect((await readV5Events(directory)).filter((event) => event.type === 'task_resumed')).toHaveLength(1);
+
+    const claimJob = await readJob(input.workspace, submitted.task.identity.task_id);
+    const race = await Promise.allSettled([
+      claimV5Job(input.workspace, claimJob, 'worker-race'),
+      ...Array.from({ length: 99 }, () => pauseV5Task(input.workspace, submitted.task)),
+    ]);
+    expect(race.filter((entry) => entry.status === 'rejected').length).toBeLessThanOrEqual(99);
+    const final = await readV5Task(directory);
+    expect(['paused', 'pausing']).toContain(final.status);
+    expect(final.execution.provider_calls).toMatchObject({ asr: { count: 0 }, chat: { count: 0 } });
+    const events = await readV5Events(directory);
+    expect(events.map((event) => event.sequence)).toEqual(events.map((_, index) => index + 1));
+  });
+
+  it('waits for an in-flight Chat response, pauses at response_persisted, and resumes locally in the same attempt', async () => {
+    const input = await prepared(); input.request.request_id = 'request-alpha2-inflight-pause';
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const calls: string[] = [];
+    const baseFetch = fixtureFetch(calls);
+    let signalStarted!: () => void; const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+    let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+    const blockingFetch = vi.fn(async (...args: Parameters<typeof fetch>) => { signalStarted(); await gate; return baseFetch(...args); });
+    const worker = runWorker(input.workspace, { fetch: blockingFetch, readCredential: async () => 'fixture-secret' });
+    await started;
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const requested = await pauseV5Task(input.workspace, await readV5Task(directory));
+    expect(requested).toMatchObject({ pending: true, task: { status: 'pausing', execution: { provider_calls: { chat: { state: 'in_flight', count: 1, outcome: 'outcome_unknown' } } } } });
+    release(); await worker;
+    const paused = await readV5Task(directory);
+    expect(paused).toMatchObject({ status: 'paused', execution: { safe_checkpoint: 'chat_response_persisted', attempt_count: 1, provider_calls: { chat: { state: 'response_persisted', count: 1 } } } });
+    const attemptId = paused.execution.attempt_id;
+    await resumeV5Task(input.workspace, paused);
+    await runWorker(input.workspace, { fetch: blockingFetch, readCredential: async () => 'fixture-secret' });
+    const completed = await readV5Task(directory);
+    expect(completed).toMatchObject({ status: 'completed', execution: { attempt_id: attemptId, attempt_count: 1, provider_calls: { chat: { count: 1 } } } });
+    expect(blockingFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('waits for an in-flight ASR response, then resumes from the pinned response without replaying ASR', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'pause-asr.mp3');
+    const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
+    const registry = await loadModelRegistryV2(input.workspace);
+    const request = {
+      ...input.request, request_id: 'request-alpha2-inflight-asr-pause', transcription_mode: 'provider' as const,
+      inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' as const }, transcript: null },
+      models: { asr: registry.defaults.asr, chat: registry.defaults.chat },
+    };
+    const submitted = await submitExchangeRequest(input.workspace, request);
+    const calls: string[] = []; const base = fixtureAsr(calls);
+    let signalStarted!: () => void; const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+    let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+    const blockingAsr: AsrAdapter = {
+      ...base,
+      async run(asrInput) {
+        const originalDispatch = asrInput.beforeProviderDispatch;
+        return base.run({
+          ...asrInput,
+          beforeProviderDispatch: async (operation, evidence) => {
+            await originalDispatch?.(operation, evidence); signalStarted(); await gate;
+          },
+        });
+      },
+    };
+    const worker = runWorker(input.workspace, { asrAdapter: blockingAsr, fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    await started;
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    expect((await pauseV5Task(input.workspace, await readV5Task(directory))).pending).toBe(true);
+    release(); await worker;
+    const paused = await readV5Task(directory);
+    expect(paused).toMatchObject({ status: 'paused', execution: { safe_checkpoint: 'asr_response_persisted', provider_calls: { asr: { state: 'response_persisted', count: 1 } } } });
+    const attemptId = paused.execution.attempt_id;
+    await resumeV5Task(input.workspace, paused);
+    await runWorker(input.workspace, { asrAdapter: blockingAsr, fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    const completed = await readV5Task(directory);
+    expect(completed).toMatchObject({ status: 'completed', execution: { attempt_id: attemptId, attempt_count: 1, provider_calls: { asr: { count: 1 }, chat: { count: 1 } } } });
+    expect(calls).toEqual(['asr', 'chat']);
+  });
+
+  it('lets cancellation win over an in-flight pause request at the next safe boundary', async () => {
+    const input = await prepared(); input.request.request_id = 'request-alpha2-pause-cancel-race';
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const calls: string[] = []; const baseFetch = fixtureFetch(calls);
+    let signalStarted!: () => void; const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+    let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+    const blockingFetch = vi.fn(async (...args: Parameters<typeof fetch>) => { signalStarted(); await gate; return baseFetch(...args); });
+    const worker = runWorker(input.workspace, { fetch: blockingFetch, readCredential: async () => 'fixture-secret' });
+    await started;
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    await pauseV5Task(input.workspace, await readV5Task(directory));
+    const cancelling = await cancelV5Task(input.workspace, await readV5Task(directory));
+    expect(cancelling).toMatchObject({ pending: true, task: { status: 'pausing' } });
+    release(); await worker;
+    const cancelled = await readV5Task(directory);
+    expect(cancelled).toMatchObject({ status: 'cancelled', execution: { provider_calls: { chat: { count: 1, outcome: 'response_persisted' } } } });
+    expect(cancelled.artifacts.calibrated).toBeNull();
+    expect(blockingFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects resume when pinned response evidence is damaged and leaves the paused task unchanged', async () => {
+    const input = await prepared(); input.request.request_id = 'request-alpha2-resume-damaged';
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const calls: string[] = []; const baseFetch = fixtureFetch(calls);
+    let signalStarted!: () => void; const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+    let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+    const blockingFetch = vi.fn(async (...args: Parameters<typeof fetch>) => { signalStarted(); await gate; return baseFetch(...args); });
+    const worker = runWorker(input.workspace, { fetch: blockingFetch, readCredential: async () => 'fixture-secret' });
+    await started;
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    await pauseV5Task(input.workspace, await readV5Task(directory)); release(); await worker;
+    const paused = await readV5Task(directory);
+    await writeFile(path.join(directory, paused.execution.provider_calls.chat.evidence_ref!), '{}', { mode: 0o600 });
+    await expect(resumeV5Task(input.workspace, paused)).rejects.toMatchObject({ code: 'TASK_RESUME_UNSAFE' });
+    expect((await readV5Task(directory)).status).toBe('paused');
+    expect((await readJob(input.workspace, paused.identity.task_id)).state).toBe('paused');
+    expect(blockingFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects resume when the current attempt ledger is missing without replaying a persisted response', async () => {
+    const input = await prepared(); input.request.request_id = 'request-alpha2-resume-attempt-ledger-damaged';
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const calls: string[] = []; const baseFetch = fixtureFetch(calls);
+    let signalStarted!: () => void; const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+    let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+    const blockingFetch = vi.fn(async (...args: Parameters<typeof fetch>) => { signalStarted(); await gate; return baseFetch(...args); });
+    const worker = runWorker(input.workspace, { fetch: blockingFetch, readCredential: async () => 'fixture-secret' });
+    await started;
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    await pauseV5Task(input.workspace, await readV5Task(directory)); release(); await worker;
+    const paused = await readV5Task(directory);
+    await writeFile(path.join(directory, 'attempts.jsonl'), '', { mode: 0o600 });
+    const before = await directoryManifest(directory);
+    await expect(resumeV5Task(input.workspace, paused)).rejects.toMatchObject({ code: 'TASK_RESUME_UNSAFE' });
+    expect(await directoryManifest(directory)).toEqual(before);
+    expect((await readV5Task(directory)).status).toBe('paused');
+    expect(blockingFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps Alpha.1 v5 tasks without the optional control record readable but control-unsupported', async () => {
+    const input = await prepared(); input.request.request_id = 'request-alpha1-control-compatibility';
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const legacy = await readV5Task(directory); delete legacy.execution.control; await persistV5Task(directory, legacy);
+    const manifest = await directoryManifest(directory);
+    const record = await findTaskReadOnly(input.workspace, legacy.identity.task_id);
+    expect((await stableTaskView(input.workspace, record)).capabilities.resume.supported).toBe(false);
+    await expect(stablePauseTask(input.workspace, record)).rejects.toMatchObject({ code: 'CONTRACT_UNSUPPORTED' });
+    expect(await directoryManifest(directory)).toEqual(manifest);
+  });
+
+  it('builds a deterministic read-only retry plan and executes one append-only Chat retry', async () => {
+    const input = await prepared(); input.request.request_id = 'request-alpha2-retry-known-chat';
+    const submitted = await submitExchangeRequest(input.workspace, input.request); const firstCalls: string[] = [];
+    await runWorker(input.workspace, { chatRuntime: knownFailureChat(firstCalls) });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const failed = await readV5Task(directory); const before = await directoryManifest(directory);
+    const firstPlan = await planV5Retry(directory, failed); const secondPlan = await planV5Retry(directory, failed);
+    expect(firstPlan).toEqual(secondPlan);
+    expect(firstPlan).toMatchObject({ contract: 'mercury.retry-plan/v1', allowed: true, checkpoint: 'chat_not_started', provider_outcome: 'known_terminal', estimated_calls: { asr: 0, chat: 1 }, models: { asr: null, chat: failed.models.chat }, risk: 'new_provider_calls' });
+    expect(await directoryManifest(directory)).toEqual(before);
+    const stdout: string[] = []; const stderr: string[] = [];
+    expect(await runCli(['task', 'retry-plan', failed.identity.task_id, '--json'], { homeDirectory: input.home, stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line) })).toBe(0);
+    expect(stderr).toEqual([]); expect(stdout).toHaveLength(1);
+    expect(JSON.parse(stdout[0]!)).toMatchObject({ contract: 'mercury.cli/v1', command: 'task.retry-plan', ok: true, data: { plan_id: firstPlan.plan_id, allowed: true, estimated_calls: { asr: 0, chat: 1 } } });
+    expect(await directoryManifest(directory)).toEqual(before);
+    const retried = await executeV5Retry(input.workspace, failed, firstPlan.plan_id);
+    expect(retried).toMatchObject({ status: 'queued', execution: { attempt_count: 2, provider_calls: { chat: { state: 'not_started', count: 1, outcome: 'not_dispatched' } }, control: { retry_count: 1 } } });
+    expect(retried.execution.attempt_id).not.toBe(failed.execution.attempt_id);
+    const successCalls: string[] = [];
+    await runWorker(input.workspace, { fetch: fixtureFetch(successCalls), readCredential: async () => 'fixture-secret' });
+    const completed = await readV5Task(directory);
+    expect(completed).toMatchObject({ status: 'completed', execution: { attempt_count: 2, provider_calls: { chat: { count: 2, outcome: 'response_persisted' } } } });
+    expect(firstCalls).toEqual(['chat']); expect(successCalls).toEqual(['chat']);
+    const attempts = (await readFile(path.join(directory, 'attempts.jsonl'), 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    expect(attempts.filter((entry) => entry.contract === 'mercury.retry/v1' && entry.plan_id === firstPlan.plan_id)).toHaveLength(1);
+    expect(attempts.filter((entry) => entry.contract === 'mercury.attempt/v1')).toHaveLength(2);
+    expect(attempts.find((entry) => entry.contract === 'mercury.retry/v1')).toMatchObject({ previous_status: 'failed', previous_error: { code: 'FIXTURE_KNOWN_CHAT' } });
+    const callFacts = attempts.filter((entry) => entry.contract === 'mercury.provider-call/v1');
+    expect(new Set(callFacts.map((entry) => entry.call_id)).size).toBe(2);
+    expect(callFacts.filter((entry) => entry.phase === 'dispatched')).toHaveLength(2);
+    expect(callFacts.filter((entry) => entry.phase === 'response_persisted')).toHaveLength(1);
+    expect(callFacts.filter((entry) => entry.phase === 'terminal')).toHaveLength(2);
+    expect(callFacts.every((entry) => entry.model_snapshot_entry_ref && entry.capability === 'calibration')).toBe(true);
+    expect(attempts.filter((entry) => entry.contract === 'mercury.attempt-result/v1')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: 'failed', new_call_counts: { asr: 0, chat: 1 }, error_code: 'FIXTURE_KNOWN_CHAT' }),
+      expect.objectContaining({ status: 'completed', new_call_counts: { asr: 0, chat: 1 }, error_code: null }),
+    ]));
+  });
+
+  it('allows only one winner for 100 concurrent executions of the same retry plan', async () => {
+    const input = await prepared(); input.request.request_id = 'request-alpha2-retry-concurrent';
+    const submitted = await submitExchangeRequest(input.workspace, input.request); const calls: string[] = [];
+    await runWorker(input.workspace, { chatRuntime: knownFailureChat(calls) });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory); const failed = await readV5Task(directory);
+    const plan = await planV5Retry(directory, failed);
+    const outcomes = await Promise.allSettled(Array.from({ length: 100 }, () => executeV5Retry(input.workspace, failed, plan.plan_id)));
+    expect(outcomes.filter((entry) => entry.status === 'fulfilled')).toHaveLength(1);
+    const task = await readV5Task(directory); expect(task).toMatchObject({ status: 'queued', execution: { attempt_count: 2 } });
+    const attempts = (await readFile(path.join(directory, 'attempts.jsonl'), 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    expect(attempts.filter((entry) => entry.contract === 'mercury.retry/v1')).toHaveLength(1);
+    expect(attempts.filter((entry) => entry.contract === 'mercury.attempt/v1')).toHaveLength(2);
+    expect(calls).toEqual(['chat']);
+  });
+
+  it('keeps outcome_unknown retry plans read-only and rejects execution without replay', async () => {
+    const input = await prepared(); input.request.request_id = 'request-alpha2-retry-unknown';
+    const submitted = await submitExchangeRequest(input.workspace, input.request); const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const task = await readV5Task(directory); const at = '2026-08-17T00:00:00.000Z';
+    task.status = 'running'; task.stage = 'calibrating'; task.execution.started_at = at; task.execution.worker_id = 'worker-unknown'; task.execution.heartbeat_at = at; task.execution.attempt_id = 'att-unknown'; task.execution.attempt_count = 1; task.execution.safe_checkpoint = null;
+    await persistV5Task(directory, task);
+    task.status = 'interrupted'; task.stage = null; task.execution.ended_at = at;
+    task.execution.provider_calls.chat = {
+      state: 'in_flight', count: 1, outcome: 'outcome_unknown', evidence_ref: null, evidence_sha256: null,
+      call_id: 'pcl-fedcba9876543210fedcba98', capability: 'calibration', model_snapshot_entry_ref: `${task.identity.task_id}-chat`,
+      dispatched_at: at, response_persisted_at: null, terminal_at: null,
+    };
+    task.error = { contract: 'mercury.error/v1', code: 'TASK_INTERRUPTED_PROVIDER_UNKNOWN', category: 'provider', message: 'Provider 结果无法确认。', retryability: 'unsafe', provider_outcome: 'outcome_unknown', remediation: ['不要自动重试。'], technical: null, extensions: {} };
+    await persistV5Task(directory, task); const job = await readJob(input.workspace, task.identity.task_id); job.state = 'terminal'; await (await import('../src/background/storage.js')).writeJob(input.workspace, job);
+    const before = await directoryManifest(directory); const plan = await planV5Retry(directory);
+    expect(plan).toMatchObject({ allowed: false, provider_outcome: 'outcome_unknown', risk: 'unsafe_provider_outcome', estimated_calls: { asr: 0, chat: 0 } });
+    expect(await directoryManifest(directory)).toEqual(before);
+    await expect(executeV5Retry(input.workspace, task, plan.plan_id)).rejects.toMatchObject({ code: 'RETRY_UNSAFE_PROVIDER_OUTCOME' });
+    expect(await directoryManifest(directory)).toEqual(before);
+    const stdout: string[] = []; const stderr: string[] = [];
+    expect(await runCli(['task', 'retry', task.identity.task_id, '--plan', plan.plan_id, '--json'], { homeDirectory: input.home, stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line) })).toBe(3);
+    expect(stderr).toEqual([]);
+    expect(JSON.parse(stdout[0]!)).toMatchObject({ contract: 'mercury.cli/v1', command: 'task.retry', ok: false, error: { code: 'RETRY_UNSAFE_PROVIDER_OUTCOME', retryability: 'unsafe', provider_outcome: 'outcome_unknown' } });
+    expect(await directoryManifest(directory)).toEqual(before);
+  });
+
+  it('returns a read-only disallowed retry plan when a promised reuse artifact is damaged', async () => {
+    const input = await prepared(); input.request.request_id = 'request-alpha2-retry-reuse-damaged';
+    const submitted = await submitExchangeRequest(input.workspace, input.request); const calls: string[] = [];
+    await runWorker(input.workspace, { chatRuntime: knownFailureChat(calls) });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const failed = await readV5Task(directory);
+    await writeFile(path.join(directory, failed.artifacts.transcribed!.path), 'tampered', { mode: 0o600 });
+    const before = await directoryManifest(directory);
+    const plan = await planV5Retry(directory, failed);
+    expect(plan).toMatchObject({ allowed: false, estimated_calls: { asr: 0, chat: 0 }, requires_user_action: true, risk: 'none' });
+    expect(plan.reason).toContain('RETRY_EVIDENCE_INVALID');
+    expect(await directoryManifest(directory)).toEqual(before);
+    await expect(executeV5Retry(input.workspace, failed, plan.plan_id)).rejects.toMatchObject({ code: 'RETRY_NOT_ALLOWED' });
+    expect(await directoryManifest(directory)).toEqual(before);
+    expect(calls).toEqual(['chat']);
+  });
+
+  it('rejects a stale or expired retry plan without appending an attempt', async () => {
+    const input = await prepared(); input.request.request_id = 'request-alpha2-retry-stale';
+    const submitted = await submitExchangeRequest(input.workspace, input.request); const calls: string[] = [];
+    await runWorker(input.workspace, { chatRuntime: knownFailureChat(calls) });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory); const failed = await readV5Task(directory); const plan = await planV5Retry(directory, failed);
+    const afterExpiry = new Date(new Date(plan.expires_at).getTime() + 1);
+    await expect(executeV5Retry(input.workspace, failed, plan.plan_id, afterExpiry)).rejects.toMatchObject({ code: 'RETRY_PLAN_EXPIRED' });
+    await appendV5Event(directory, failed, 'fixture_revision_changed', 'fixture revision changed');
+    const before = await directoryManifest(directory);
+    await expect(executeV5Retry(input.workspace, failed, plan.plan_id)).rejects.toMatchObject({ code: 'RETRY_PLAN_STALE' });
+    expect(await directoryManifest(directory)).toEqual(before);
+  });
+
+  it('replays queued pause/resume idempotently and repairs every local control commit window', async () => {
+    for (const point of ['after_pause_task_committed', 'after_pause_job_committed'] as const) {
+      const input = await prepared(); input.request.request_id = `request-alpha2-pause-crash-${point}`;
+      const submitted = await submitExchangeRequest(input.workspace, input.request);
+      const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+      await expect(pauseV5Task(input.workspace, submitted.task, async (seen) => { if (seen === point) throw new Error(point); })).rejects.toThrow(point);
+      await auditV5Job(input.workspace, await readJob(input.workspace, submitted.task.identity.task_id));
+      const paused = await readV5Task(directory);
+      expect(paused).toMatchObject({ status: 'paused', execution: { attempt_id: null, attempt_count: 0, safe_checkpoint: 'queued', provider_calls: { asr: { count: 0 }, chat: { count: 0 } } } });
+      expect((await readJob(input.workspace, paused.identity.task_id)).state).toBe('paused');
+      expect((await readV5Events(directory)).filter((event) => event.type === 'task_paused')).toHaveLength(1);
+      const replayManifest = await directoryManifest(directory);
+      await pauseV5Task(input.workspace, paused);
+      expect(await directoryManifest(directory)).toEqual(replayManifest);
+    }
+
+    for (const point of ['after_resume_task_committed', 'after_resume_job_committed'] as const) {
+      const input = await prepared(); input.request.request_id = `request-alpha2-resume-crash-${point}`;
+      const submitted = await submitExchangeRequest(input.workspace, input.request);
+      const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+      const paused = (await pauseV5Task(input.workspace, submitted.task)).task;
+      await expect(resumeV5Task(input.workspace, paused, async (seen) => { if (seen === point) throw new Error(point); })).rejects.toThrow(point);
+      await auditV5Job(input.workspace, await readJob(input.workspace, submitted.task.identity.task_id));
+      const resumed = await readV5Task(directory);
+      expect(resumed).toMatchObject({ status: 'queued', execution: { attempt_id: null, attempt_count: 0, control: { resume_count: 1 } } });
+      expect((await readJob(input.workspace, resumed.identity.task_id)).state).toBe('queued');
+      expect((await readV5Events(directory)).filter((event) => event.type === 'task_resumed')).toHaveLength(1);
+      const replayManifest = await directoryManifest(directory);
+      await resumeV5Task(input.workspace, resumed);
+      expect(await directoryManifest(directory)).toEqual(replayManifest);
+      const calls: string[] = [];
+      await runWorker(input.workspace, { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+      expect((await readV5Task(directory)).execution).toMatchObject({ attempt_count: 1, provider_calls: { chat: { count: 1 } } });
+      expect(calls).toEqual(['chat']);
+    }
+  });
+
+  it.each(['after_retry_ledger_appended', 'after_retry_task_committed', 'after_retry_job_committed'] as const)('recovers the retry %s window with one append-only attempt and no duplicate call', async (point) => {
+    const input = await prepared(); input.request.request_id = `request-alpha2-retry-crash-${point}`;
+    const submitted = await submitExchangeRequest(input.workspace, input.request); const failedCalls: string[] = [];
+    await runWorker(input.workspace, { chatRuntime: knownFailureChat(failedCalls) });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const failed = await readV5Task(directory); const plan = await planV5Retry(directory, failed);
+    await expect(executeV5Retry(input.workspace, failed, plan.plan_id, new Date(), async (seen) => { if (seen === point) throw new Error(point); })).rejects.toThrow(point);
+    const successCalls: string[] = [];
+    await runWorker(input.workspace, { fetch: fixtureFetch(successCalls), readCredential: async () => 'fixture-secret' });
+    const completed = await readV5Task(directory);
+    expect(completed).toMatchObject({ status: 'completed', execution: { attempt_count: 2, control: { retry_count: 1 }, provider_calls: { chat: { count: 2 } } } });
+    expect(failedCalls).toEqual(['chat']); expect(successCalls).toEqual(['chat']);
+    const events = await readV5Events(directory);
+    expect(events.filter((event) => event.type === 'retry_scheduled')).toHaveLength(1);
+    const attempts = (await readFile(path.join(directory, 'attempts.jsonl'), 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    expect(attempts.filter((entry) => entry.contract === 'mercury.retry/v1')).toHaveLength(1);
+    expect(attempts.filter((entry) => entry.contract === 'mercury.attempt/v1')).toHaveLength(2);
+    expect(attempts.find((entry) => entry.contract === 'mercury.retry/v1')).toMatchObject({ actor: 'user', plan: { plan_id: plan.plan_id } });
+    expect((await stableTaskResult(input.workspace, await findTaskReadOnly(input.workspace, completed.identity.task_id))).calls.find((entry) => entry.capability === 'calibration')).toMatchObject({ count: 2, outcome: 'mixed' });
   });
 });
 

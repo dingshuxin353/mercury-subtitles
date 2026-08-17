@@ -80,12 +80,12 @@ function dictionary(): ExchangeDictionaryV1 {
 }
 
 describe('Exchange Protocol v1 contracts', () => {
-  it('ships all seven stable contract identities and schemas', () => {
+  it('ships all eight stable contract identities and schemas', () => {
     expect(EXCHANGE_CONTRACTS).toEqual({
       request: 'mercury.exchange.request/v1', task: 'mercury.task/v1', event: 'mercury.event/v1',
-      result: 'mercury.result/v1', error: 'mercury.error/v1', transcript: 'mercury.transcript/v1', dictionary: 'mercury.dictionary/v1',
+      result: 'mercury.result/v1', error: 'mercury.error/v1', transcript: 'mercury.transcript/v1', dictionary: 'mercury.dictionary/v1', retryPlan: 'mercury.retry-plan/v1',
     });
-    expect(Object.keys(exchangeSchemaDocuments()).sort()).toEqual(['common', 'dictionary', 'error', 'event', 'request', 'result', 'task', 'transcript']);
+    expect(Object.keys(exchangeSchemaDocuments()).sort()).toEqual(['common', 'dictionary', 'error', 'event', 'request', 'result', 'retryPlan', 'task', 'transcript']);
   });
 
   it('enforces explicit provider/provided transcription roles', () => {
@@ -97,6 +97,19 @@ describe('Exchange Protocol v1 contracts', () => {
     expect(validateExchangeContract('request', provided).valid).toBe(true);
     expect(validateExchangeContract('request', { ...provided, models: { asr: 'asr-default', chat: 'chat-default' } }).valid).toBe(false);
     expect(validateExchangeContract('request', { ...provided, inputs: { ...provided.inputs, transcript: { ...provided.inputs.transcript!, role: 'reference' } } }).valid).toBe(false);
+  });
+
+  it('validates retry-plan safety semantics in the stable contract', () => {
+    const allowed = {
+      contract: 'mercury.retry-plan/v1', plan_id: `rpl-${'a'.repeat(24)}`, task_id: 'tsk-20260816-120000-deadbeef', task_revision: 4,
+      attempt_id: 'att-fixture', created_at: now, expires_at: '2026-08-17T12:00:00.000Z', checkpoint: 'chat_not_started',
+      provider_outcome: 'known_terminal', reuse: ['transcript'], discard: ['chat_response'], estimated_calls: { asr: 0, chat: 1 },
+      models: { asr: null, chat: 'chat-default' }, allowed: true, reason: null, requires_user_action: false, risk: 'new_provider_calls', extensions: {},
+    };
+    expect(validateExchangeContract('retryPlan', allowed).valid).toBe(true);
+    const unknown = { ...allowed, allowed: false, reason: 'Provider 结果不确定。', provider_outcome: 'outcome_unknown', estimated_calls: { asr: 0, chat: 0 }, requires_user_action: true, risk: 'unsafe_provider_outcome' };
+    expect(validateExchangeContract('retryPlan', unknown).valid).toBe(true);
+    expect(validateExchangeContract('retryPlan', { ...unknown, allowed: true, reason: null, estimated_calls: { asr: 0, chat: 1 } }).valid).toBe(false);
   });
 
   it('accepts an optional absolute approved SRT directory without breaking old requests and rejects unsafe directory shapes', () => {
@@ -229,6 +242,20 @@ describe('Exchange Protocol v1 contracts', () => {
     expect(validateV5TaskRecord(delivery).valid).toBe(true);
     delivery.delivery.status = 'delivered';
     expect(validateV5TaskRecord(delivery).valid).toBe(false);
+    const controlled = structuredClone(record);
+    controlled.execution.control = { checkpoint_version: 'mercury.safe-checkpoint/v1', pause_requested_at: null, paused_at: null, resume_count: 0, retry_count: 0 };
+    expect(validateV5TaskRecord(controlled).valid).toBe(true);
+    const missingRetryCount = structuredClone(controlled);
+    delete missingRetryCount.execution.control.retry_count;
+    expect(validateV5TaskRecord(missingRetryCount).valid).toBe(false);
+    const falsePaused = structuredClone(controlled);
+    falsePaused.status = 'paused'; falsePaused.execution.safe_checkpoint = 'chat_response_persisted'; falsePaused.execution.attempt_id = 'att-fixture';
+    falsePaused.execution.control.pause_requested_at = now; falsePaused.execution.control.paused_at = now;
+    falsePaused.execution.provider_calls.chat = { state: 'in_flight', count: 1, outcome: 'outcome_unknown', evidence_ref: null, evidence_sha256: null };
+    expect(validateV5TaskRecord(falsePaused).valid).toBe(false);
+    const impossibleCheckpoint = structuredClone(controlled);
+    impossibleCheckpoint.execution.safe_checkpoint = 'chat_response_persisted';
+    expect(validateV5TaskRecord(impossibleCheckpoint).valid).toBe(false);
   });
 });
 

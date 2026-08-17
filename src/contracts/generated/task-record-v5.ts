@@ -68,6 +68,13 @@ export interface TaskRecordV5 {
       chat: ProviderCall;
     };
     cancel_requested_at: null | string;
+    control?: {
+      checkpoint_version: 'mercury.safe-checkpoint/v1';
+      pause_requested_at: null | string;
+      paused_at: null | string;
+      resume_count: number;
+      retry_count: number;
+    };
   };
   artifacts: {
     transcript: null | InternalArtifact;
@@ -137,6 +144,12 @@ export interface ProviderCall {
   outcome: 'not_dispatched' | 'known_terminal' | 'response_persisted' | 'outcome_unknown' | 'not_applicable';
   evidence_ref: null | string;
   evidence_sha256: null | string;
+  call_id?: string | null;
+  capability?: 'transcription' | 'calibration' | null;
+  model_snapshot_entry_ref?: string | null;
+  dispatched_at?: null | string;
+  response_persisted_at?: null | string;
+  terminal_at?: null | string;
 }
 /**
  * This interface was referenced by `TaskRecordV5`'s JSON-Schema

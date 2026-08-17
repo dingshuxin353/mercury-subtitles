@@ -9,6 +9,7 @@ import resultSchema from '../../schemas/exchange/v1/result.schema.json' with { t
 import errorSchema from '../../schemas/exchange/v1/error.schema.json' with { type: 'json' };
 import transcriptSchema from '../../schemas/exchange/v1/transcript.schema.json' with { type: 'json' };
 import dictionarySchema from '../../schemas/exchange/v1/dictionary.schema.json' with { type: 'json' };
+import retryPlanSchema from '../../schemas/exchange/v1/retry-plan.schema.json' with { type: 'json' };
 import type { ExchangeRequestV1 } from './generated/exchange-request-v1.js';
 import type { ExchangeTaskV1 } from './generated/exchange-task-v1.js';
 import type { ExchangeEventV1 } from './generated/exchange-event-v1.js';
@@ -16,6 +17,7 @@ import type { ExchangeResultV1 } from './generated/exchange-result-v1.js';
 import type { ExchangeErrorV1 } from './generated/exchange-error-v1.js';
 import type { ExchangeTranscriptV1 } from './generated/exchange-transcript-v1.js';
 import type { ExchangeDictionaryV1 } from './generated/exchange-dictionary-v1.js';
+import type { ExchangeRetryPlanV1 } from './generated/exchange-retry-plan-v1.js';
 import { MercuryError } from '../errors.js';
 import { sensitiveInformationIssues } from './validation/security.js';
 
@@ -27,6 +29,7 @@ export const EXCHANGE_CONTRACTS = {
   error: 'mercury.error/v1',
   transcript: 'mercury.transcript/v1',
   dictionary: 'mercury.dictionary/v1',
+  retryPlan: 'mercury.retry-plan/v1',
 } as const;
 
 export type ExchangeContractName = keyof typeof EXCHANGE_CONTRACTS;
@@ -38,6 +41,7 @@ export interface ExchangeContractTypeMap {
   error: ExchangeErrorV1;
   transcript: ExchangeTranscriptV1;
   dictionary: ExchangeDictionaryV1;
+  retryPlan: ExchangeRetryPlanV1;
 }
 export type ExchangeValidationIssue = { path: string; message: string };
 export type ExchangeValidationResult<T> =
@@ -52,12 +56,13 @@ const schemas = {
   error: errorSchema,
   transcript: transcriptSchema,
   dictionary: dictionarySchema,
+  retryPlan: retryPlanSchema,
 } as const;
 
 const ajv = new Ajv2020({ allErrors: true, strict: true, validateFormats: true });
 addFormats(ajv);
 ajv.addSchema(commonSchema);
-for (const schema of [dictionarySchema, errorSchema, transcriptSchema, requestSchema, taskSchema, eventSchema, resultSchema]) {
+for (const schema of [dictionarySchema, errorSchema, transcriptSchema, requestSchema, taskSchema, eventSchema, resultSchema, retryPlanSchema]) {
   ajv.addSchema(schema);
 }
 
@@ -162,6 +167,13 @@ function semanticIssues(name: ExchangeContractName, value: any): ExchangeValidat
         variantOwners.set(normalized, entry.canonical);
       }
     }
+  } else if (name === 'retryPlan') {
+    if (Date.parse(value.expires_at) <= Date.parse(value.created_at)) issues.push(issue('/expires_at', 'retry plan 有效期必须晚于创建时间'));
+    const estimated = value.estimated_calls.asr + value.estimated_calls.chat;
+    if (value.allowed && (value.reason !== null || estimated < 1 || value.risk !== 'new_provider_calls')) issues.push(issue('/', '允许执行的 retry plan 必须说明至少一次新增调用、无拒绝原因且风险为 new_provider_calls'));
+    if (!value.allowed && (value.reason === null || estimated !== 0)) issues.push(issue('/', '拒绝执行的 retry plan 必须提供原因且不得预计新增调用'));
+    if (value.provider_outcome === 'outcome_unknown' && (value.allowed || value.risk !== 'unsafe_provider_outcome' || !value.requires_user_action)) issues.push(issue('/provider_outcome', 'outcome_unknown 必须拒绝安全 retry，并标记 unsafe 与用户动作'));
+    if (value.provider_outcome === 'response_persisted' && value.allowed) issues.push(issue('/provider_outcome', 'response_persisted 必须使用 resume，不能 retry'));
   } else if (name === 'task') {
     const terminal = ['needs_input', 'completed', 'failed', 'cancelled', 'interrupted'].includes(value.status);
     if (value.status === 'completed' && value.error !== null) issues.push(issue('/error', 'completed 任务不能携带错误'));

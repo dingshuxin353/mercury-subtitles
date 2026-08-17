@@ -168,6 +168,7 @@ describe('V02-D002 crash recovery and query safety', () => {
     expect(start).toHaveBeenCalledWith(input.workspace);
     expect(stderr).toEqual([]);
     expect(JSON.parse(stdout[0]!)).toMatchObject({
+      contract: 'mercury.cli/v1',
       ok: true,
       command: 'worker.start',
       data: { queued: true, running: true, started: true, pid: 4242 },

@@ -51,8 +51,19 @@ function semanticIssues(value: TaskRecordV5): V5ValidationIssue[] {
 
   const terminal = ['needs_input', 'completed', 'failed', 'cancelled', 'interrupted'].includes(value.status);
   if (terminal !== (value.execution.ended_at !== null)) add('/execution/ended_at', '必须与终态一致');
-  if (value.status === 'queued' && (value.execution.started_at !== null || value.execution.worker_id !== null || value.execution.heartbeat_at !== null || value.execution.attempt_id !== null)) add('/status', 'queued 任务不能声明当前 Worker/attempt；历史 attempt_count 可以保留');
+  if (value.status === 'queued' && (value.execution.started_at !== null || value.execution.worker_id !== null || value.execution.heartbeat_at !== null || (value.execution.attempt_id !== null && !(value.execution.control && (value.execution.control.resume_count > 0 || (value.execution.control.retry_count ?? 0) > 0 || ['asr_response_persisted', 'chat_response_persisted'].includes(value.execution.safe_checkpoint ?? '')))))) add('/status', 'queued 任务不能声明当前 Worker；仅 Alpha.2 安全恢复、已固定响应或重试可预绑定 attempt');
   if (value.status === 'running' && (value.execution.started_at === null || value.execution.worker_id === null || value.execution.heartbeat_at === null || value.execution.attempt_id === null || value.execution.attempt_count < 1)) add('/status', 'running 必须具有 Worker、心跳和 attempt');
+  if (value.status === 'pausing' && (value.execution.started_at === null || value.execution.worker_id === null || value.execution.heartbeat_at === null || value.execution.attempt_id === null || value.execution.control?.pause_requested_at == null)) add('/status', 'pausing 必须具有活动 Worker、attempt 和暂停请求');
+  if (value.status === 'paused' && (value.execution.worker_id !== null || value.execution.heartbeat_at !== null || (value.execution.safe_checkpoint !== 'queued' && value.execution.attempt_id === null) || value.execution.safe_checkpoint === null || value.execution.control?.paused_at == null)) add('/status', 'paused 必须保留安全检查点；已开始的任务还必须保留同一 attempt，且不能声明活动 Worker');
+  if (value.execution.control?.paused_at !== null && value.execution.control?.pause_requested_at === null) add('/execution/control', 'paused_at 必须对应 pause_requested_at');
+  if (value.execution.control) {
+    if ((value.execution.control.retry_count ?? 0) > value.execution.attempt_count) add('/execution/control/retry_count', 'retry 次数不能超过 attempt 次数');
+    if (value.execution.attempt_id?.startsWith('att-retry-') && (value.execution.control.retry_count ?? 0) < 1) add('/execution/control/retry_count', 'retry attempt 必须具有 append-only retry 计数');
+    if (value.status === 'paused' && Object.values(value.execution.provider_calls).some((call) => call.state === 'in_flight' || call.outcome === 'outcome_unknown')) add('/status', 'Provider 结果未知时不能伪报 paused');
+  }
+  if (value.execution.safe_checkpoint === 'asr_response_persisted' && !['response_persisted', 'terminal'].includes(value.execution.provider_calls.asr.state)) add('/execution/safe_checkpoint', 'ASR response checkpoint 必须具有已固定响应');
+  if (value.execution.safe_checkpoint === 'chat_response_persisted' && !['response_persisted', 'terminal'].includes(value.execution.provider_calls.chat.state)) add('/execution/safe_checkpoint', 'Chat response checkpoint 必须具有已固定响应');
+  if (!['running', 'pausing', 'interrupted'].includes(value.status) && Object.values(value.execution.provider_calls).some((call) => call.state === 'in_flight')) add('/status', '只有 running/pausing 或 interrupted 可保留 Provider in_flight 事实');
   if (value.status === 'completed' && (value.execution.safe_checkpoint !== 'outputs_validated' || value.artifacts.calibrated === null || value.error !== null)) add('/status', 'completed 必须有已校验字幕、outputs_validated 且无错误');
   if (['failed', 'interrupted'].includes(value.status) && value.error === null) add('/error', `${value.status} 必须有稳定错误`);
   if (value.status === 'cancelled' && (value.artifacts.calibrated !== null || value.artifacts.approved !== null)) add('/artifacts', 'cancelled 不能发布 calibrated/approved');
@@ -76,12 +87,22 @@ function semanticIssues(value: TaskRecordV5): V5ValidationIssue[] {
   }
 
   for (const [role, call] of Object.entries(value.execution.provider_calls)) {
-    if (call.state === 'not_started' && (call.count !== 0 || call.outcome !== 'not_dispatched' || call.evidence_ref !== null || call.evidence_sha256 !== null)) add(`/execution/provider_calls/${role}`, 'not_started 必须是零调用且无证据');
+    if (call.state === 'not_started' && (call.outcome !== 'not_dispatched' || call.evidence_ref !== null || call.evidence_sha256 !== null)) add(`/execution/provider_calls/${role}`, 'not_started 表示当前 attempt 尚未调用，历史累计 count 可保留，但不能声明当前响应证据');
     if (call.state === 'in_flight' && (call.count < 1 || call.outcome !== 'outcome_unknown')) add(`/execution/provider_calls/${role}`, 'in_flight 必须保留 outcome_unknown 调用事实');
     if (call.state === 'response_persisted' && (call.count < 1 || call.outcome !== 'response_persisted' || call.evidence_ref === null || call.evidence_sha256 === null)) add(`/execution/provider_calls/${role}`, 'response_persisted 必须具有路径与内容 hash 证据');
     if (call.state === 'terminal' && call.count > 0 && !['known_terminal', 'response_persisted'].includes(call.outcome)) add(`/execution/provider_calls/${role}`, 'terminal 调用必须有确定结果');
     if (call.state === 'terminal' && call.outcome === 'response_persisted' && (call.evidence_ref === null || call.evidence_sha256 === null)) add(`/execution/provider_calls/${role}`, 'response_persisted 终态必须保留路径与内容 hash 证据');
     if ((call.evidence_ref === null) !== (call.evidence_sha256 === null)) add(`/execution/provider_calls/${role}`, 'evidence_ref 与 evidence_sha256 必须同时存在或同时为空');
+    if (value.execution.control) {
+      const metadata = [call.call_id, call.capability, call.model_snapshot_entry_ref, call.dispatched_at];
+      if (call.state === 'not_started' && metadata.some((entry) => entry != null)) add(`/execution/provider_calls/${role}`, 'not_started 当前 attempt 不能保留上一 attempt 的调用 identity 或 dispatch 时间');
+      if (call.state !== 'not_started' && metadata.some((entry) => entry == null)) add(`/execution/provider_calls/${role}`, 'Alpha.2 Provider 调用必须固定 call ID、能力、模型快照与 dispatch 时间');
+      if (call.state === 'response_persisted' && call.response_persisted_at == null) add(`/execution/provider_calls/${role}/response_persisted_at`, 'response_persisted 必须固定响应持久化时间');
+      if (call.state === 'terminal' && call.terminal_at == null) add(`/execution/provider_calls/${role}/terminal_at`, 'terminal 必须固定确定终态时间');
+      if (call.state === 'in_flight' && (call.response_persisted_at != null || call.terminal_at != null)) add(`/execution/provider_calls/${role}`, 'in_flight 不能伪造响应持久化或确定终态时间');
+      if (call.dispatched_at && call.response_persisted_at && call.dispatched_at > call.response_persisted_at) add(`/execution/provider_calls/${role}`, 'response_persisted_at 不能早于 dispatch');
+      if (call.dispatched_at && call.terminal_at && call.dispatched_at > call.terminal_at) add(`/execution/provider_calls/${role}`, 'terminal_at 不能早于 dispatch');
+    }
   }
   return issues;
 }
