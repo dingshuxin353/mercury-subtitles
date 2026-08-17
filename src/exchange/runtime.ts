@@ -527,12 +527,32 @@ function toLegacy(value: CalibrationResultV3): CalibrationResult {
   } as unknown as CalibrationResult;
 }
 
-function exchangeError(code: string, message: string, providerOutcome: 'not_dispatched' | 'known_terminal' | 'response_persisted' | 'outcome_unknown' | 'not_applicable', detail: string | null = null, category: 'input' | 'config' | 'provider' | 'runtime' | 'compatibility' | 'security' | 'conflict' = 'provider'): TaskRecordV5['error'] {
+function exchangeError(code: string, message: string, providerOutcome: 'not_dispatched' | 'known_terminal' | 'response_persisted' | 'outcome_unknown' | 'not_applicable', detail: string | null = null, category: 'input' | 'config' | 'provider' | 'runtime' | 'compatibility' | 'security' | 'conflict' = 'provider'): NonNullable<TaskRecordV5['error']> {
   const publicMessage = message.replace(/\s*(?:Provider detail|provider detail)=.*$/iu, '').trim();
   const safeMessage = sensitiveTextIssues(publicMessage).length > 0 ? 'Provider 或本地处理返回了包含敏感信息的错误；详情已脱敏。' : publicMessage;
   const normalizedDetail = detail?.replace(/[\u0000-\u001f\u007f]/gu, ' ').slice(0, 2000) ?? null;
   const safeDetail = normalizedDetail && sensitiveTextIssues(normalizedDetail).length === 0 ? normalizedDetail : normalizedDetail ? '<redacted sensitive detail>' : null;
   return { contract: 'mercury.error/v1', code, category, message: safeMessage, retryability: providerOutcome === 'outcome_unknown' ? 'unsafe' : category === 'runtime' ? 'not_applicable' : 'after_user_action', provider_outcome: providerOutcome, remediation: [providerOutcome === 'outcome_unknown' ? '不要自动重试；请查看技术证据后由用户决定。' : category === 'runtime' ? '保留当前任务证据并检查本地文件；不要重复调用 Provider。' : '检查模型配置后使用新的 request ID 创建任务。'], technical: safeDetail ? { provider_code: null, log_id: null, detail: safeDetail } : null, extensions: {} };
+}
+
+const REFERENCE_AUDIO_MISMATCH_ACTION = '参考字幕与音频正文不完整对齐；请换用覆盖同一音频范围的完整参考字幕，并使用新的 request ID 创建任务；不要重放当前任务。';
+
+function referenceAudioMismatchError(
+  detail: string,
+  providerOutcome: NonNullable<TaskRecordV5['error']>['provider_outcome'],
+): NonNullable<TaskRecordV5['error']> {
+  const coverage = /ASR coverage ([0-9]+(?:\.[0-9]+)?)% and reference coverage ([0-9]+(?:\.[0-9]+)?)% must both reach ([0-9]+(?:\.[0-9]+)?)%\.?/u.exec(detail);
+  const message = coverage
+    ? `参考字幕与音频正文不完整对齐：ASR 转录覆盖率 ${coverage[1]}%，参考字幕覆盖率 ${coverage[2]}%，两者都需要达到 ${coverage[3]}%。`
+    : '参考字幕与音频正文不完整对齐，两者没有同时达到所需覆盖率。';
+  const error = exchangeError('REFERENCE_AUDIO_MISMATCH', message, providerOutcome, detail, 'input');
+  error.remediation = [REFERENCE_AUDIO_MISMATCH_ACTION];
+  return error;
+}
+
+function projectedTaskError(error: TaskRecordV5['error']): TaskRecordV5['error'] {
+  if (!error || error.code !== 'REFERENCE_AUDIO_MISMATCH') return error;
+  return referenceAudioMismatchError(error.technical?.detail ?? error.message, error.provider_outcome);
 }
 
 async function writeReport(directory: string, task: TaskRecordV5, snapshot: ModelSnapshotV3, calibration: CalibrationResultV3 | null): Promise<void> {
@@ -1129,7 +1149,11 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
     if (unknownRole) {
       task.status = 'interrupted'; task.error = exchangeError('TASK_INTERRUPTED_PROVIDER_UNKNOWN', `${unknownRole} 请求已发送，但结果无法确认。`, 'outcome_unknown', error instanceof Error ? error.message : String(error));
     } else {
-      task.status = 'failed'; task.error = exchangeError(error instanceof MercuryError ? error.code : 'TASK_PIPELINE_FAILED', error instanceof Error ? error.message : '本地处理失败。', task.execution.provider_calls.chat.outcome, error instanceof Error ? error.message : null, 'runtime');
+      const code = error instanceof MercuryError ? error.code : 'TASK_PIPELINE_FAILED';
+      const detail = error instanceof Error ? error.message : '本地处理失败。';
+      task.status = 'failed'; task.error = code === 'REFERENCE_AUDIO_MISMATCH'
+        ? referenceAudioMismatchError(detail, task.execution.provider_calls.chat.outcome)
+        : exchangeError(code, detail, task.execution.provider_calls.chat.outcome, error instanceof Error ? error.message : null, 'runtime');
     }
     task.stage = null; task.execution.ended_at = new Date().toISOString(); return commitTerminalThenDerive(directory, task, snapshot, calibration, fault);
   }
@@ -1195,6 +1219,7 @@ export async function projectV5Task(directory: string, input?: TaskRecordV5): Pr
     artifact(directory, 'calibrated_srt', task.artifacts.calibrated), artifact(directory, 'approved_srt', approved),
     artifact(directory, 'calibration_report', task.artifacts.report),
   ]);
+  const visibleError = projectedTaskError(task.error);
   return assertExchangeContract('task', {
     contract: 'mercury.task/v1', task_id: task.identity.task_id, request_id: task.identity.request_id, revision: task.identity.revision, created_at: task.created_at, updated_at: task.updated_at,
     status: task.status, stage: task.stage, progress: null,
@@ -1202,8 +1227,8 @@ export async function projectV5Task(directory: string, input?: TaskRecordV5): Pr
     pause: { allowed: false, reason: '0.3.0-alpha.1 尚未提供暂停。' }, cancel: { allowed: ['queued', 'running'].includes(task.status), reason: ['queued', 'running'].includes(task.status) ? null : '当前状态不能取消。' }, retry: { allowed: false, reason: '0.3.0-alpha.1 尚未提供安全重试。' },
     attempt: { attempt_id: task.execution.attempt_id, count: task.execution.attempt_count },
     artifacts,
-    review, error: task.error,
-    next_action: task.status === 'queued' ? '任务已入队；查询不会启动 Worker。若 Worker 未运行，请显式执行 worker start。' : task.status === 'running' ? '任务正在后台处理，请稍后查询。' : task.status === 'completed' && ['finalized', 'not_required'].includes(review.status) ? '人工批准稿已生成，可以直接打开批准后字幕。' : task.status === 'completed' ? `校验后字幕已生成，还有 ${review.pending_count ?? 0} 项修改待人工审阅。` : task.status === 'interrupted' ? 'Provider 结果不确定；不要自动重试。' : task.status === 'cancelled' ? (artifacts.find((entry) => entry.identity === 'transcribed_srt')?.exists ? '任务已取消；纯转写字幕仍可使用。' : '任务已取消；尚未产生字幕文件。') : '按错误提示检查输入或模型配置。',
+    review, error: visibleError,
+    next_action: task.status === 'queued' ? '任务已入队；查询不会启动 Worker。若 Worker 未运行，请显式执行 worker start。' : task.status === 'running' ? '任务正在后台处理，请稍后查询。' : task.status === 'completed' && ['finalized', 'not_required'].includes(review.status) ? '人工批准稿已生成，可以直接打开批准后字幕。' : task.status === 'completed' ? `校验后字幕已生成，还有 ${review.pending_count ?? 0} 项修改待人工审阅。` : task.status === 'interrupted' ? 'Provider 结果不确定；不要自动重试。' : task.status === 'cancelled' ? (artifacts.find((entry) => entry.identity === 'transcribed_srt')?.exists ? '任务已取消；纯转写字幕仍可使用。' : '任务已取消；尚未产生字幕文件。') : visibleError?.code === 'REFERENCE_AUDIO_MISMATCH' ? REFERENCE_AUDIO_MISMATCH_ACTION : '按错误提示检查输入或模型配置。',
     source_schema_version: '5.0.0', capabilities: { pause: { supported: false, reason: 'Alpha.2 capability' }, resume: { supported: false, reason: 'Alpha.2 capability' }, retry: { supported: false, reason: 'Alpha.2 capability' }, review: { supported: true, reason: null }, dictionary_snapshot: { supported: true, reason: null }, provided_transcript: { supported: true, reason: null } }, extensions: {},
   });
 }
@@ -1223,7 +1248,7 @@ export async function projectV5Result(directory: string, taskInput?: TaskRecordV
     })(), artifacts: view.artifacts,
     review: { status: view.review.status, pending_count: view.review.pending_count, approved: ['finalized', 'not_required'].includes(view.review.status) },
     calls: [{ provider: modelSnapshot.models.asr?.plugin_id ?? 'asr', capability: 'transcription', count: task.execution.provider_calls.asr.count, outcome: task.execution.provider_calls.asr.outcome }, { provider: modelSnapshot.models.chat.plugin_id, capability: 'calibration', count: task.execution.provider_calls.chat.count, outcome: task.execution.provider_calls.chat.outcome }],
-    warnings: task.warnings, error: task.error, next_action: view.next_action, extensions: {},
+    warnings: task.warnings, error: view.error, next_action: view.next_action, extensions: {},
   });
 }
 

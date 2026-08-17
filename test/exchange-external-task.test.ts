@@ -261,6 +261,53 @@ describe('Exchange v1 external transcript task', () => {
     expect(task.review.status).toMatch(/pending|finalized|not_required/u);
   });
 
+  it('localizes a provider reference coverage mismatch and keeps stable status/result read-only', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'provider-reference-mismatch.mp3');
+    const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
+    const reference = path.join(input.home, 'incomplete-reference.srt');
+    const referenceText = '1\n00:00:00,000 --> 00:00:00,040\n您好\n';
+    await writeFile(reference, referenceText);
+    const registry = await loadModelRegistryV2(input.workspace);
+    const submitted = await submitExchangeRequest(input.workspace, {
+      ...input.request,
+      request_id: 'request-provider-reference-mismatch',
+      inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: { path: reference, sha256: sha(referenceText), format: 'srt', role: 'reference' } },
+      transcription_mode: 'provider',
+      calibration: { mode: 'text-and-segmentation', source_language: 'zh-CN' },
+      models: { asr: registry.defaults.asr, chat: registry.defaults.chat },
+    });
+    const calls: string[] = [];
+    await runWorker(input.workspace, { asrAdapter: fixtureAsr(calls), fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const task = await readV5Task(directory);
+    expect(calls).toEqual(['asr']);
+    expect(task.status).toBe('failed');
+    expect(task.execution.provider_calls).toMatchObject({
+      asr: { state: 'terminal', count: 1, outcome: 'response_persisted' },
+      chat: { state: 'not_started', count: 0, outcome: 'not_dispatched' },
+    });
+    expect(task.error).toMatchObject({
+      code: 'REFERENCE_AUDIO_MISMATCH',
+      category: 'input',
+      message: expect.stringMatching(/^参考字幕与音频正文不完整对齐：ASR 转录覆盖率 [0-9.]+%，参考字幕覆盖率 [0-9.]+%，两者都需要达到 80%。$/u),
+      remediation: ['参考字幕与音频正文不完整对齐；请换用覆盖同一音频范围的完整参考字幕，并使用新的 request ID 创建任务；不要重放当前任务。'],
+    });
+    expect(task.error?.technical?.detail).toMatch(/^ASR coverage [0-9.]+% and reference coverage [0-9.]+% must both reach 80%\.$/u);
+    const before = await directoryManifest(directory);
+    const view = await stableTaskView(input.workspace, await findTaskReadOnly(input.workspace, task.identity.task_id));
+    const result = await stableTaskResult(input.workspace, await findTaskReadOnly(input.workspace, task.identity.task_id));
+    for (const projected of [view, result]) {
+      expect(projected.error).toMatchObject({ code: 'REFERENCE_AUDIO_MISMATCH', category: 'input' });
+      expect(projected.error?.message).toContain('ASR 转录覆盖率');
+      expect(projected.error?.message).toContain('参考字幕覆盖率');
+      expect(projected.error?.message).toContain('80%');
+      expect(projected.next_action).toBe('参考字幕与音频正文不完整对齐；请换用覆盖同一音频范围的完整参考字幕，并使用新的 request ID 创建任务；不要重放当前任务。');
+      expect(projected.next_action).not.toContain('模型配置');
+    }
+    expect(await directoryManifest(directory)).toEqual(before);
+  });
+
   it('declares both built-in Volcengine ASR adapters as not supporting per-task dynamic hints', () => {
     expect(new VolcengineAsrAdapter({ resolveCredential: async () => ({ mode: 'api_key', uid: 'fixture', value: 'fixture' }) }).asrHintsCapability.status).toBe('not_supported');
     expect(new VolcengineSubtitleAsrAdapter({ readCredential: async () => 'fixture' }).asrHintsCapability.status).toBe('not_supported');
