@@ -36,7 +36,7 @@ function semanticIssues(value: TaskRecordV5): V5ValidationIssue[] {
   if (value.inputs.reference && value.inputs.reference.role !== 'reference') add('/inputs/reference/role', 'reference 输入必须声明 reference 角色');
   if ((value.inputs.reference === null) !== (value.inputs.reference_normalized === null)) add('/inputs/reference_normalized', 'reference 原件与规范化证据必须同时存在或同时为空');
   if (value.input_config.evidence_mode === 'audio_multimodal' && !value.inputs.media) add('/input_config/evidence_mode', '强校验必须具有媒体输入');
-  const expectedReference = value.input_config.transcription_mode === 'provided' || value.inputs.reference !== null;
+  const expectedReference = value.inputs.reference !== null;
   if (expectedReference !== (value.calibration_sources.reference !== null)) add('/calibration_sources/reference', '校准 reference 来源必须与任务模式一致');
   if (value.input_config.transcription_mode === 'provided' && value.calibration_sources.transcript === null) add('/calibration_sources/transcript', 'provided 模式必须固定兼容 transcript 来源');
   if (value.execution.provider_calls.asr.outcome === 'response_persisted'

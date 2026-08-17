@@ -395,10 +395,9 @@ async function createTaskDirectory(workspace: string, request: ExchangeRequestV1
         throw new MercuryError('TRANSCRIPT_IMPORT_INVALID', '外部转录无法安全转换为内部校准输入；任务未提交。', { exitCode: 2 });
       }
       await writeStableJsonAtomic(path.join(staging, 'work/transcript.raw.json'), bridgeContract.value);
-      await writeFile0600(path.join(staging, 'input/reference.srt'), srtFromSegments(bridge.segments));
       taskCandidate.calibration_sources = {
         transcript: { path: 'work/transcript.raw.json', sha256: await sha256File(path.join(staging, 'work/transcript.raw.json')), validation: 'passed' },
-        reference: { path: 'input/reference.srt', sha256: await sha256File(path.join(staging, 'input/reference.srt')), validation: 'passed' },
+        reference: null,
       };
     }
     const task = assertV5TaskRecord(taskCandidate);
@@ -514,6 +513,7 @@ function preflight(task: TaskRecordV5, transcript: TranscriptRaw, snapshot: Mode
     transcript,
     calibrationResult: checked.value,
     referenceSrtText: referenceSrt, requestedMode: referenceSrt ? task.input_config.calibration_mode : null,
+    transcriptSourceMode: task.input_config.transcription_mode === 'provided' ? task.input_config.calibration_mode : null,
   });
 }
 
@@ -742,7 +742,10 @@ export async function verifyV5CalibrationSources(directory: string, taskInput?: 
   }
   let referenceText: string | null = null;
   if (task.input_config.transcription_mode === 'provided') {
-    referenceText = srtFromSegments(legacy.segments);
+    // Early Alpha.1 development tasks materialized the provided transcript a
+    // second time as a synthetic reference. Keep those task-local sources
+    // readable, while new stable requests correctly leave reference absent.
+    referenceText = task.calibration_sources.reference ? srtFromSegments(legacy.segments) : null;
   } else if (task.inputs.reference) {
     if (!task.inputs.reference_normalized
       || await sha256File(managed(directory, task.inputs.reference.workspace_path)).catch(() => null) !== task.inputs.reference.sha256
@@ -951,10 +954,10 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
   }
   let calibration: CalibrationResultV3 | null = null;
   try {
-    const normalizedSrt = task.input_config.transcription_mode === 'provided'
-      ? srtFromSegments(legacy.segments)
-      : srtFromTranscript(transcript);
-    const referenceText = normalizedReferenceText ?? (task.input_config.transcription_mode === 'provided' ? normalizedSrt : null);
+    const referenceText = normalizedReferenceText
+      ?? (task.input_config.transcription_mode === 'provided' && task.calibration_sources.reference
+        ? srtFromSegments(legacy.segments)
+        : null);
     await assertCalibrationSourceEvidence(directory, task, legacy, referenceText);
     const initial = preflight(task, legacy, snapshot, referenceText);
     if (initial.status !== 'completed' || initial.alignment === null) throw new MercuryError(initial.issues[0]?.code ?? 'ALIGNMENT_FAILED', initial.issues[0]?.message ?? '外部转录无法形成合法校验单元。');
@@ -1023,7 +1026,13 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
     task = await readV5Task(directory);
     if (task.execution.cancel_requested_at) return cancelV5AtBoundary(directory, task);
     if (!calibration || calibration.status !== 'completed') throw new MercuryError('CALIBRATION_RESULT_INVALID', 'Chat 未形成完整可用的校验正文。');
-    const subtitle = runSubtitleCore({ transcript: legacy, calibrationResult: toLegacy(calibration), referenceSrtText: referenceText, requestedMode: referenceText ? task.input_config.calibration_mode : null });
+    const subtitle = runSubtitleCore({
+      transcript: legacy,
+      calibrationResult: toLegacy(calibration),
+      referenceSrtText: referenceText,
+      requestedMode: referenceText ? task.input_config.calibration_mode : null,
+      transcriptSourceMode: task.input_config.transcription_mode === 'provided' ? task.input_config.calibration_mode : null,
+    });
     if (subtitle.status !== 'completed') throw new MercuryError(subtitle.issues[0]?.code ?? 'SUBTITLE_CORE_FAILED', subtitle.issues[0]?.message ?? '字幕规则应用失败。');
     for (const modification of subtitle.artifact.modifications.filter((entry) => entry.applied)) {
       const reference = modification.evidence.calibration_suggestion_ref;
@@ -1042,7 +1051,12 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
     await writeFile0600(path.join(directory, calibratedRelative), serializeCalibratedSrt(subtitle.artifact));
     const audioDuration = task.inputs.media ? await readMp3DurationMs(managed(directory, task.inputs.media.workspace_path)) : (transcript.duration_ms ?? transcript.segments.at(-1)!.end_ms);
     const parsedBaseline = referenceText ? parseReferenceSrt(referenceText) : null;
-    const validation = await validateSrtFile(path.join(directory, calibratedRelative), { audioDurationMs: audioDuration, expectedSegments: subtitle.artifact.segments, mode: subtitle.artifact.mode, referenceSegments: parsedBaseline?.ok ? parsedBaseline.segments : null });
+    const textOnlyTimeline = parsedBaseline?.ok
+      ? parsedBaseline.segments
+      : task.input_config.transcription_mode === 'provided' && subtitle.artifact.mode === 'text-only'
+        ? legacy.segments.map((segment, index) => ({ reference_segment_id: segment.segment_id, sequence: index + 1, start_ms: segment.start_ms, end_ms: segment.end_ms, text: segment.text }))
+        : null;
+    const validation = await validateSrtFile(path.join(directory, calibratedRelative), { audioDurationMs: audioDuration, expectedSegments: subtitle.artifact.segments, mode: subtitle.artifact.mode, referenceSegments: textOnlyTimeline });
     if (!validation.valid) throw new MercuryError('OUTPUT_VALIDATION_FAILED', validation.checks.filter((item) => item.status === 'failed').map((item) => item.message).join('; '));
     task = await readV5Task(directory);
     task.artifacts.calibrated = { path: calibratedRelative, sha256: await sha256File(path.join(directory, calibratedRelative)), validation: 'passed' };

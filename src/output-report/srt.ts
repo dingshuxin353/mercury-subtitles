@@ -288,7 +288,7 @@ export function validateSrtText(source: string, context: SrtValidationContext): 
     checks.push(quality(
       'SRT_TEXT_ONLY_TIMELINE',
       modeFailed ? 'failed' : 'passed',
-      modeFailed ? 'text-only 输出未逐毫秒保持参考时间轴。' : 'text-only 片段数、顺序和时间戳逐毫秒保持不变。'
+      modeFailed ? 'text-only 输出未逐毫秒保持来源时间轴。' : 'text-only 片段数、顺序和时间戳逐毫秒保持不变。'
     ));
   }
 

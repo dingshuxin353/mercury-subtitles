@@ -151,14 +151,15 @@ describe('Exchange v1 external transcript task', () => {
   it.each(['srt', 'vtt', 'transcript_json'] as const)('normalizes multiline %s cues only in the frozen v1 bridge and completes with zero ASR', async (format) => {
     const input = await prepared();
     const source = path.join(input.home, `multiline.${format === 'transcript_json' ? 'json' : format}`);
+    const multilineText = '第一行内容\n第二行内容';
     let sourceText: string;
     if (format === 'srt') {
-      sourceText = '1\n00:00:00,000 --> 00:00:01,000\n第一行\n第二行\n';
+      sourceText = `1\n00:00:00,000 --> 00:00:01,000\n${multilineText}\n`;
     } else if (format === 'vtt') {
-      sourceText = 'WEBVTT\n\n1\n00:00.000 --> 00:01.000\n第一行\n第二行\n';
+      sourceText = `WEBVTT\n\n1\n00:00.000 --> 00:01.000\n${multilineText}\n`;
     } else {
       const inspected = await inspectTranscriptInput({ filePath: input.source, format: 'srt', role: 'transcript_source' });
-      inspected.transcript.segments[0]!.text = '第一行\n第二行';
+      inspected.transcript.segments[0]!.text = multilineText;
       inspected.transcript.text = inspected.transcript.segments.map((segment) => segment.text).join('\n');
       sourceText = `${JSON.stringify(inspected.transcript, null, 2)}\n`;
     }
@@ -179,11 +180,32 @@ describe('Exchange v1 external transcript task', () => {
     expect(task.execution.provider_calls.asr).toMatchObject({ count: 0, outcome: 'not_dispatched' });
     expect(task.execution.provider_calls.chat.count).toBe(1);
     expect(calls).toEqual(['chat']);
-    expect(normalized.segments[0].text).toBe('第一行\n第二行');
-    expect(bridge.segments[0].text).toBe('第一行 第二行');
+    expect(task.calibration_sources.reference).toBeNull();
+    expect(normalized.segments[0].text).toBe(multilineText);
+    expect(bridge.segments[0].text).toBe(multilineText.replace('\n', ' '));
     expect(bridge.full_text).toBe(bridge.segments.map((segment: { text: string }) => segment.text).join('\n'));
     expect(validateContract('transcript.raw', bridge).valid).toBe(true);
-    expect(transcribed).toContain('第一行\n第二行');
+    expect(transcribed).toContain(multilineText);
+  });
+
+  it('reports the transcript timing hard limit instead of a fabricated reference limit and dispatches no Provider', async () => {
+    const input = await prepared();
+    const sourceText = 'WEBVTT\n\n00:00.000 --> 00:01.000\n这是一个超过二十四字符且没有词粒度时间证据的合法外部转录片段\n';
+    const source = path.join(input.home, 'long-provided.vtt');
+    await writeFile(source, sourceText);
+    input.request.request_id = 'request-long-provided-without-reference';
+    input.request.inputs.transcript = { path: source, sha256: sha(sourceText), format: 'vtt', role: 'transcript_source' };
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const calls: string[] = [];
+    await runWorker(input.workspace, { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    const task = await readV5Task(path.join(input.workspace, 'tasks', submitted.task.identity.task_directory));
+    expect(task.status).toBe('failed');
+    expect(task.error?.code).toBe('CALIBRATED_HARD_LIMIT_INVALID_FOR_TEXT_ONLY');
+    expect(task.error?.code).not.toContain('REFERENCE');
+    expect(task.calibration_sources.reference).toBeNull();
+    expect(task.execution.provider_calls).toMatchObject({ asr: { count: 0 }, chat: { count: 0, state: 'not_started' } });
+    expect(task.artifacts.transcribed?.validation).toBe('passed');
+    expect(calls).toEqual([]);
   });
 
   it('runs provider plus reference through the same v5 request, dictionary, result, and review semantics', async () => {
@@ -539,13 +561,13 @@ describe('Exchange v1 external transcript task', () => {
     expect(sent).toEqual(bytes);
   });
 
-  it.each(['transcript', 'reference'] as const)('rejects a tampered provided calibration %s bridge before Chat dispatch', async (source) => {
+  it('rejects a tampered provided calibration transcript bridge before Chat dispatch', async () => {
     const input = await prepared();
-    input.request.request_id = `request-provided-bridge-${source}-tamper`;
+    input.request.request_id = 'request-provided-bridge-transcript-tamper';
     const submitted = await submitExchangeRequest(input.workspace, input.request);
     const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
-    const pointer = submitted.task.calibration_sources[source]!;
-    await writeFile(path.join(directory, pointer.path), source === 'transcript' ? canonicalJson({ tampered: true }) : '1\n00:00:00,000 --> 00:00:01,000\nTAMPERED\n', { mode: 0o600 });
+    const pointer = submitted.task.calibration_sources.transcript!;
+    await writeFile(path.join(directory, pointer.path), canonicalJson({ tampered: true }), { mode: 0o600 });
     const calls: string[] = [];
     await runWorker(input.workspace, { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
     const task = await readV5Task(directory);
@@ -954,9 +976,9 @@ describe('Exchange v1 external transcript task', () => {
     const directory = path.join(input.workspace, 'tasks', first.task.identity.task_directory);
     expect(first.task.calibration_sources).toMatchObject({
       transcript: { path: 'work/transcript.raw.json', validation: 'passed' },
-      reference: { path: 'input/reference.srt', validation: 'passed' },
+      reference: null,
     });
-    for (const relative of ['request.json', 'task.json', 'events.jsonl', 'attempts.jsonl', 'input/transcript-source.srt', 'input/reference.srt', 'work/transcript.normalized.json', 'work/transcript.raw.json', first.task.artifacts.transcribed!.path]) {
+    for (const relative of ['request.json', 'task.json', 'events.jsonl', 'attempts.jsonl', 'input/transcript-source.srt', 'work/transcript.normalized.json', 'work/transcript.raw.json', first.task.artifacts.transcribed!.path]) {
       if (relative === 'attempts.jsonl') continue;
       expect((await stat(path.join(directory, relative))).mode & 0o777).toBe(0o600);
     }
@@ -975,28 +997,21 @@ describe('Exchange v1 external transcript task', () => {
     const promptData = JSON.parse(prompt.slice(prompt.lastIndexOf('\n') + 1));
     expect(promptData.dictionary_context.entries).toEqual([expect.objectContaining({ entry_id: 'entry-mercury-name', canonical: 'Mercury' })]);
     const found = await findTaskReadOnly(input.workspace, completed.identity.task_id);
-    const bridgeBefore = {
-      transcript: sha(await readFile(path.join(directory, completed.calibration_sources.transcript!.path))),
-      reference: sha(await readFile(path.join(directory, completed.calibration_sources.reference!.path))),
-    };
+    const bridgeBefore = sha(await readFile(path.join(directory, completed.calibration_sources.transcript!.path)));
     const view = await stableTaskView(input.workspace, found);
     const result = await stableTaskResult(input.workspace, found);
     const response = JSON.parse(await readFile(path.join(directory, 'work/calibration-response.json'), 'utf8'));
     const calibratedTranscript = JSON.parse(await readFile(path.join(directory, 'work/transcript.calibrated.json'), 'utf8'));
-    expect(response.request).toMatchObject({ transcript_ref: 'work/transcript.raw.json', reference_srt_ref: 'input/reference.srt' });
-    expect(calibratedTranscript.source_refs).toMatchObject({ transcript_ref: 'work/transcript.raw.json', reference_srt_ref: 'input/reference.srt' });
+    expect(response.request).toMatchObject({ transcript_ref: 'work/transcript.raw.json', reference_srt_ref: null });
+    expect(calibratedTranscript.source_refs).toMatchObject({ transcript_ref: 'work/transcript.raw.json', reference_srt_ref: null });
     expect(sha(await readFile(path.join(directory, completed.calibration_sources.transcript!.path)))).toBe(completed.calibration_sources.transcript!.sha256);
-    expect(sha(await readFile(path.join(directory, completed.calibration_sources.reference!.path)))).toBe(completed.calibration_sources.reference!.sha256);
     expect(view.source_schema_version).toBe('5.0.0');
     expect(view.capabilities.provided_transcript.supported).toBe(true);
     expect(result.transcription).toMatchObject({ mode: 'provided', asr_call_count: 0 });
     expect(result.dictionaries).toMatchObject({ match_count: 1, conflict_count: 0, snapshots: [expect.objectContaining({ revision: dictionaryV2.revision })] });
     expect(result.artifacts.find((entry) => entry.identity === 'transcribed_srt')).toMatchObject({ exists: true, validation: 'passed' });
     expect(result.artifacts.find((entry) => entry.identity === 'calibrated_srt')).toMatchObject({ exists: true, validation: 'passed' });
-    expect({
-      transcript: sha(await readFile(path.join(directory, completed.calibration_sources.transcript!.path))),
-      reference: sha(await readFile(path.join(directory, completed.calibration_sources.reference!.path))),
-    }).toEqual(bridgeBefore);
+    expect(sha(await readFile(path.join(directory, completed.calibration_sources.transcript!.path)))).toBe(bridgeBefore);
     const attempts = (await readFile(path.join(directory, 'attempts.jsonl'), 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
     expect(attempts).toEqual([
       expect.objectContaining({ contract: 'mercury.attempt/v1', asr_call_count: 0 }),

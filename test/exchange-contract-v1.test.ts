@@ -169,7 +169,7 @@ describe('Exchange Protocol v1 contracts', () => {
       },
       calibration_sources: {
         transcript: { path: 'work/transcript.raw.json', sha256: hash, validation: 'passed' },
-        reference: { path: 'input/reference.srt', sha256: hash, validation: 'passed' },
+        reference: null,
       },
       models: { asr: null, chat: 'chat-default', snapshot_path: 'work/model-snapshot.json', snapshot_sha256: hash },
       dictionary_snapshot: { path: 'work/dictionary-snapshot.json', sha256: hash, resolved: [] },
@@ -185,6 +185,9 @@ describe('Exchange Protocol v1 contracts', () => {
       review: { status: 'not_ready', pending_count: null }, warnings: [], error: null,
     };
     expect(validateV5TaskRecord(record).valid).toBe(true);
+    const syntheticReference = structuredClone(record);
+    syntheticReference.calibration_sources.reference = { path: 'input/reference.srt', sha256: hash, validation: 'passed' };
+    expect(validateV5TaskRecord(syntheticReference).valid).toBe(false);
     const missing = structuredClone(record);
     delete missing.inputs;
     expect(validateV5TaskRecord(missing).valid).toBe(false);
