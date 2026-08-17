@@ -1908,6 +1908,42 @@ describe('Exchange v1 external transcript task', () => {
     expect(tasks).toHaveLength(0);
   });
 
+  it('keeps active task actions, review readiness, delivery guidance, and retry reasons consistent', async () => {
+    const input = await prepared();
+    input.request.request_id = 'request-alpha2-active-projection-matrix';
+    input.request.output.approved_srt_directory = path.join(input.home, 'business-output');
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const cases = [
+      ['queued', '任务已入队', '当前 attempt 的队列中'],
+      ['running', '正在后台处理', '当前 attempt 中处理'],
+      ['pausing', '等待安全检查点', '正在等待安全暂停'],
+      ['paused', 'task resume', '请使用 task resume 继续同一 attempt'],
+      ['needs_input', '等待用户处理输入问题', '等待用户处理输入问题'],
+    ] as const;
+
+    for (const [status, deliveryText, retryText] of cases) {
+      const task = structuredClone(submitted.task);
+      task.status = status;
+      task.execution.safe_checkpoint = status === 'paused' ? 'queued' : task.execution.safe_checkpoint;
+      const view = await stableTaskView(input.workspace, task);
+      expect(view.review).toEqual({ status: 'not_ready', pending_count: null });
+      expect(view.delivery).toBeDefined();
+      const delivery = view.delivery!;
+      expect(delivery.status).toBe(status === 'needs_input' ? 'failed' : 'pending_review');
+      expect(delivery.next_action).toContain(deliveryText);
+      expect(delivery.next_action).not.toMatch(/完成人工审阅|finalize|task deliver/iu);
+      expect(view.retry).toMatchObject({ allowed: false, reason: expect.stringContaining(retryText) });
+      expect(view.retry.reason).not.toContain('RETRY_LEDGER_INVALID');
+      const result = await stableTaskResult(input.workspace, task);
+      expect(result.delivery).toEqual(view.delivery);
+      expect(result.next_action).toBe(view.next_action);
+      if (status === 'paused') {
+        expect(view.resume).toEqual({ allowed: true, reason: null });
+        expect(view.next_action).toContain('task resume');
+      }
+    }
+  });
+
   it('pauses a queued Alpha.2 task immediately with zero Provider calls and resumes the same request safely', async () => {
     const input = await prepared(); input.request.request_id = 'request-alpha2-queued-pause';
     const submitted = await submitExchangeRequest(input.workspace, input.request);

@@ -38,11 +38,13 @@ Provider ASR request (an external `reference` is optional):
   "transcription_mode": "provider",
   "calibration": { "mode": "text-only", "source_language": "zh-CN" },
   "models": { "asr": "<ready default/selected ASR>", "chat": "<ready default/selected Chat>" },
-  "dictionaries": { "project_key": null, "selected": [], "task_overrides": [] },
+  "dictionaries": { "project_key": null, "selected": ["dict-project-terms"], "task_overrides": [] },
   "output": { "formats": ["srt", "report"], "workspace_policy": "managed" },
   "extensions": {}
 }
 ```
+
+`dictionaries.selected` is an array of `dictionary_id` strings, never dictionary objects. For example, use `"selected": ["dict-project-terms"]`. Mercury pins each selected dictionary's revision and content hash in the task snapshot; do not put revision objects into `selected[]`.
 
 For external SRT/VTT/transcript JSON that replaces ASR, set `transcription_mode` to `provided`, set `models.asr` to null, and set `inputs.transcript` to its absolute path, inspected hash, `srt|vtt|transcript_json`, and role `transcript_source`. For a reference, keep provider mode/ASR and use role `reference`. Never infer role from extension.
 

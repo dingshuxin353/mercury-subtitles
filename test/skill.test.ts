@@ -223,6 +223,9 @@ describe('V02-D004 packaged Mercury skill', () => {
     expect(commands).toContain('Never use `provider`, `name`, or `category` as a model ID');
     expect(commands).toContain('derive a new stable request ID');
     expect(commands).toContain('`resume.allowed`');
+    expect(commands).toContain('`dictionaries.selected` is an array of `dictionary_id` strings');
+    expect(commands).toContain('"selected": ["dict-project-terms"]');
+    expect(commands).toContain('do not put revision objects into `selected[]`');
     const troubleshooting = await readFile(path.join(source, 'references', 'troubleshooting.md'), 'utf8');
     expect(troubleshooting).toContain('If `approved_srt.exists` is false, do not call `task deliver`');
     expect(troubleshooting).toContain('never reuse the conflicting ID or choose a random replacement');

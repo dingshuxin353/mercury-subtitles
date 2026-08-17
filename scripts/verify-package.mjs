@@ -394,9 +394,12 @@ try {
     !packagedCommands.includes('Never use `provider`, `name`, or `category` as a model ID') ||
     !packagedCommands.includes('derive a new stable request ID') ||
     !packagedCommands.includes('`resume.allowed`') ||
+    !packagedCommands.includes('`dictionaries.selected` is an array of `dictionary_id` strings') ||
+    !packagedCommands.includes('"selected": ["dict-project-terms"]') ||
+    !packagedCommands.includes('do not put revision objects into `selected[]`') ||
     !packagedTroubleshooting.includes('If `approved_srt.exists` is false, do not call `task deliver`')
   ) {
-    throw new Error('Installed package Skill is missing the rc2 model/action/delivery safety guidance');
+    throw new Error('Installed package Skill is missing the rc3 model/action/delivery/dictionary safety guidance');
   }
   const { stdout: skillInstallOutput } = await runCli(['skill', 'install', '--json']);
   const skillInstall = JSON.parse(skillInstallOutput);

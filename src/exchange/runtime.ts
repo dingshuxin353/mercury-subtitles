@@ -1591,7 +1591,9 @@ export async function projectV5Task(directory: string, input?: TaskRecordV5): Pr
   const visibleError = projectedTaskError(task.error);
   const delivery = await (await import('../delivery.js')).projectDeliveryReadOnly(task);
   const taskControl = hasTaskControl(task);
-  const retryPlan = taskControl ? await planV5Retry(directory, task) : null;
+  const retryPlan = taskControl && ['failed', 'interrupted'].includes(task.status)
+    ? await planV5Retry(directory, task)
+    : null;
   const pauseAllowed = taskControl && ['queued', 'running'].includes(task.status);
   const resumeAllowed = taskControl
     && ['paused', 'interrupted'].includes(task.status)
@@ -1600,6 +1602,15 @@ export async function projectV5Task(directory: string, input?: TaskRecordV5): Pr
       || entry.outcome === 'outcome_unknown'
       || (entry.state === 'terminal' && entry.outcome === 'known_terminal'));
   const cancelAllowed = ['queued', 'running', 'pausing', 'paused'].includes(task.status);
+  const retryReason = retryPlan?.allowed ? null
+    : task.status === 'queued' ? '任务仍在当前 attempt 的队列中；当前不能创建 retry attempt。'
+      : task.status === 'running' ? '任务正在当前 attempt 中处理；当前不能创建 retry attempt。'
+        : task.status === 'pausing' ? '任务正在等待安全暂停；当前不能创建 retry attempt。'
+          : task.status === 'paused' ? '任务已暂停；请使用 task resume 继续同一 attempt，当前不能 retry。'
+            : task.status === 'completed' ? '任务已经完成，不需要 retry。'
+              : task.status === 'cancelled' ? '任务已经取消；如需重新处理，请创建新的逻辑 request。'
+                : task.status === 'needs_input' ? '任务正在等待用户处理输入问题；请先按主错误修复，当前不能 retry。'
+                  : retryPlan?.reason ?? '安全重试不可用。';
   const nextAction = task.status === 'queued' ? '任务已入队；查询不会启动 Worker。若 Worker 未运行，请显式执行 worker start。'
     : task.status === 'running' ? '任务正在后台处理，请稍后查询。'
       : task.status === 'pausing' ? '暂停请求已记录；Provider 调用若正在进行会先等待结果固定，再在安全检查点暂停。'
@@ -1621,7 +1632,7 @@ export async function projectV5Task(directory: string, input?: TaskRecordV5): Pr
     pause: { allowed: pauseAllowed, reason: pauseAllowed ? null : task.status === 'pausing' ? '暂停请求已经记录。' : task.status === 'paused' ? '任务已经暂停；如需继续请查看 resume 动作。' : `任务状态 ${task.status} 不能暂停。` },
     resume: { allowed: resumeAllowed, reason: resumeAllowed ? null : !taskControl ? '此历史任务没有 Alpha.2 安全检查点。' : task.status === 'pausing' ? '暂停尚未到达安全检查点；请继续查询当前任务。' : task.status === 'paused' || task.status === 'interrupted' ? '当前检查点或 Provider 结果不能证明安全恢复。' : `任务状态 ${task.status} 不能恢复。` },
     cancel: { allowed: cancelAllowed, reason: cancelAllowed ? null : `任务状态 ${task.status} 不能取消。` },
-    retry: { allowed: retryPlan?.allowed ?? false, reason: retryPlan?.allowed ? null : retryPlan?.reason ?? '安全重试不可用。' },
+    retry: { allowed: retryPlan?.allowed ?? false, reason: retryReason },
     attempt: { attempt_id: task.execution.attempt_id, count: task.execution.attempt_count },
     artifacts,
     review, delivery, error: visibleError,
