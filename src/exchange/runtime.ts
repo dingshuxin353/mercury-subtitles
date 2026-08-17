@@ -28,6 +28,7 @@ import { sensitiveTextIssues } from '../contracts/validation/security.js';
 type ProviderCall = TaskRecordV5['execution']['provider_calls']['chat'];
 export type V5FaultPoint =
   | 'after_dispatch_persisted'
+  | 'after_asr_query_checkpointed'
   | 'after_response_persisted'
   | 'after_hints_snapshot_written'
   | 'after_dictionary_matches_snapshot_written'
@@ -1157,6 +1158,31 @@ async function beginV5ProviderDispatch(
   });
 }
 
+async function checkpointV5AsrQuery(
+  directory: string,
+  modelSnapshotEntryRef: string,
+): Promise<TaskRecordV5> {
+  return withTaskTransitionLock(directory, async () => {
+    const current = await readV5Task(directory);
+    const call = current.execution.provider_calls.asr;
+    if (
+      !['running', 'pausing'].includes(current.status)
+      || call.state !== 'in_flight'
+      || call.outcome !== 'outcome_unknown'
+      || call.count < 1
+      || call.model_snapshot_entry_ref !== modelSnapshotEntryRef
+      || call.call_id === null
+      || call.dispatched_at === null
+    ) {
+      throw new MercuryError(
+        'PROVIDER_QUERY_CHECKPOINT_INVALID',
+        'ASR query 只能继续同一条已持久化的 in-flight Provider 调用。',
+      );
+    }
+    return current;
+  });
+}
+
 async function prepareProviderTranscript(
   directory: string,
   taskInput: TaskRecordV5,
@@ -1211,7 +1237,23 @@ async function prepareProviderTranscript(
         taskId: task.identity.task_id, modelSnapshotRef: snapshot.snapshot_id, model: legacyAsrEntry(snapshot.models.asr) as any,
         audio: { sourcePath: audioPath, verifiedBytes: verifiedAudioBytes, pathRef: media.workspace_path, sha256: media.sha256, durationMs: duration, mimeType: 'audio/mpeg', language: 'zh-CN' },
         asrHints: { entries: hintEntries },
-        beforeProviderDispatch: async (_operation, dispatchEvidence) => {
+        beforeProviderDispatch: async (operation, dispatchEvidence) => {
+          if (operation === 'volcengine_subtitle_query') {
+            task = await checkpointV5AsrQuery(directory, snapshot.models.asr!.snapshot_entry_id);
+            await appendV5Event(
+              directory,
+              task,
+              'provider_subrequest_checkpointed',
+              '新字幕 ASR submit 已返回；blocking query 将继续同一条逻辑调用。',
+              {
+                capability: 'transcription',
+                operation: 'volcengine_subtitle_query',
+                count: task.execution.provider_calls.asr.count,
+              },
+            );
+            await crashFault(fault, 'after_asr_query_checkpointed', task);
+            return;
+          }
           task = await beginV5ProviderDispatch(directory, 'asr', snapshot.models.asr!.snapshot_entry_id, async (current) => {
             if (hintEntries.length > 0) {
               const confirmed = hintsDispatchEvidence(hintEntries, dispatchEvidence?.asrHints);

@@ -716,6 +716,159 @@ describe('Exchange v1 external transcript task', () => {
     expect(task.calibration_sources).toMatchObject({ transcript: { path: 'work/transcript.raw.json', validation: 'passed' }, reference: null });
   });
 
+  it('checkpoints subtitle submit and query as one logical ASR call', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'subtitle-two-stage.mp3');
+    const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
+    const registry = await loadModelRegistryV2(input.workspace);
+    const submitted = await submitExchangeRequest(input.workspace, {
+      ...input.request,
+      request_id: 'request-subtitle-two-stage-checkpoint',
+      inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: null },
+      transcription_mode: 'provider',
+      models: { asr: registry.defaults.asr, chat: registry.defaults.chat },
+    });
+    const calls: string[] = [];
+    const twoStageAsr: AsrAdapter = {
+      adapterId: 'volcengine_subtitle_asr',
+      async run(adapterInput) {
+        await adapterInput.beforeProviderDispatch?.('volcengine_subtitle_submit');
+        calls.push('subtitle-submit');
+        await adapterInput.beforeProviderDispatch?.('volcengine_subtitle_query');
+        calls.push('subtitle-query');
+        const { beforeProviderDispatch: _checkpoint, ...withoutCheckpoint } = adapterInput;
+        return fixtureAsr([]).run(withoutCheckpoint);
+      },
+    };
+    await runWorker(input.workspace, {
+      asrAdapter: twoStageAsr,
+      fetch: fixtureFetch(calls),
+      readCredential: async () => 'fixture-secret',
+    });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const task = await readV5Task(directory);
+    expect(task.status, JSON.stringify(task.error)).toBe('completed');
+    expect(task.execution.provider_calls.asr).toMatchObject({ state: 'terminal', count: 1, outcome: 'response_persisted' });
+    expect(calls).toEqual(['subtitle-submit', 'subtitle-query', 'chat']);
+    const events = await readV5Events(directory);
+    expect(events.filter((event) => event.type === 'provider_dispatched' && event.data.capability === 'transcription')).toHaveLength(1);
+    expect(events.filter((event) => event.type === 'provider_subrequest_checkpointed')).toEqual([
+      expect.objectContaining({
+        data: expect.objectContaining({ operation: 'volcengine_subtitle_query', count: 1 }),
+      }),
+    ]);
+    const providerFacts = (await readFile(path.join(directory, 'attempts.jsonl'), 'utf8'))
+      .trim().split('\n').map((line) => JSON.parse(line))
+      .filter((entry) => entry.contract === 'mercury.provider-call/v1' && entry.role === 'asr');
+    expect(new Set(providerFacts.map((entry) => entry.call_id)).size).toBe(1);
+    expect(new Set(providerFacts.map((entry) => entry.call_number))).toEqual(new Set([1]));
+  });
+
+  it('does not send subtitle query or replay submit when its local checkpoint crashes', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'subtitle-query-checkpoint-crash.mp3');
+    const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
+    const registry = await loadModelRegistryV2(input.workspace);
+    const submitted = await submitExchangeRequest(input.workspace, {
+      ...input.request,
+      request_id: 'request-subtitle-query-checkpoint-crash',
+      inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: null },
+      transcription_mode: 'provider',
+      models: { asr: registry.defaults.asr, chat: registry.defaults.chat },
+    });
+    const calls: string[] = [];
+    const twoStageAsr: AsrAdapter = {
+      adapterId: 'volcengine_subtitle_asr',
+      async run(adapterInput) {
+        await adapterInput.beforeProviderDispatch?.('volcengine_subtitle_submit');
+        calls.push('subtitle-submit');
+        await adapterInput.beforeProviderDispatch?.('volcengine_subtitle_query');
+        calls.push('subtitle-query');
+        const { beforeProviderDispatch: _checkpoint, ...withoutCheckpoint } = adapterInput;
+        return fixtureAsr([]).run(withoutCheckpoint);
+      },
+    };
+    let crashed = false;
+    await expect(runWorker(
+      input.workspace,
+      { asrAdapter: twoStageAsr, fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' },
+      {
+        v5Fault: async (point) => {
+          if (!crashed && point === 'after_asr_query_checkpointed') {
+            crashed = true;
+            throw new Error('crash:after_asr_query_checkpointed');
+          }
+        },
+      },
+    )).rejects.toThrow('crash:after_asr_query_checkpointed');
+    await runWorker(input.workspace, {
+      asrAdapter: twoStageAsr,
+      fetch: fixtureFetch(calls),
+      readCredential: async () => 'fixture-secret',
+    });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const task = await readV5Task(directory);
+    expect(task.status).toBe('interrupted');
+    expect(task.execution.provider_calls.asr).toMatchObject({ state: 'in_flight', count: 1, outcome: 'outcome_unknown' });
+    expect(task.execution.provider_calls.chat).toMatchObject({ state: 'not_started', count: 0, outcome: 'not_dispatched' });
+    expect(task.error).toMatchObject({ code: 'TASK_INTERRUPTED_PROVIDER_UNKNOWN', retryability: 'unsafe' });
+    expect(calls).toEqual(['subtitle-submit']);
+    expect((await readV5Events(directory)).filter((event) => event.type === 'provider_subrequest_checkpointed')).toHaveLength(1);
+  });
+
+  it('finishes the in-flight subtitle query before honoring pause or cancel', async () => {
+    for (const action of ['pause', 'cancel'] as const) {
+      const input = await prepared();
+      const audio = path.join(input.home, `subtitle-query-${action}.mp3`);
+      const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
+      const registry = await loadModelRegistryV2(input.workspace);
+      const submitted = await submitExchangeRequest(input.workspace, {
+        ...input.request,
+        request_id: `request-subtitle-query-${action}`,
+        inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: null },
+        transcription_mode: 'provider',
+        models: { asr: registry.defaults.asr, chat: registry.defaults.chat },
+      });
+      const calls: string[] = [];
+      let signalSubmitted!: () => void;
+      const submittedResponse = new Promise<void>((resolve) => { signalSubmitted = resolve; });
+      let continueQuery!: () => void;
+      const queryGate = new Promise<void>((resolve) => { continueQuery = resolve; });
+      const twoStageAsr: AsrAdapter = {
+        adapterId: 'volcengine_subtitle_asr',
+        async run(adapterInput) {
+          await adapterInput.beforeProviderDispatch?.('volcengine_subtitle_submit');
+          calls.push('subtitle-submit');
+          signalSubmitted();
+          await queryGate;
+          await adapterInput.beforeProviderDispatch?.('volcengine_subtitle_query');
+          calls.push('subtitle-query');
+          const { beforeProviderDispatch: _checkpoint, ...withoutCheckpoint } = adapterInput;
+          return fixtureAsr([]).run(withoutCheckpoint);
+        },
+      };
+      const worker = runWorker(input.workspace, {
+        asrAdapter: twoStageAsr,
+        fetch: fixtureFetch(calls),
+        readCredential: async () => 'fixture-secret',
+      });
+      await submittedResponse;
+      const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+      if (action === 'pause') {
+        expect((await pauseV5Task(input.workspace, await readV5Task(directory))).pending).toBe(true);
+      } else {
+        expect((await cancelV5Task(input.workspace, await readV5Task(directory))).pending).toBe(true);
+      }
+      continueQuery();
+      await worker;
+      const task = await readV5Task(directory);
+      expect(task.status).toBe(action === 'pause' ? 'paused' : 'cancelled');
+      expect(task.execution.provider_calls.asr).toMatchObject({ state: 'response_persisted', count: 1, outcome: 'response_persisted' });
+      expect(task.execution.provider_calls.chat).toMatchObject({ state: 'not_started', count: 0, outcome: 'not_dispatched' });
+      expect(calls).toEqual(['subtitle-submit', 'subtitle-query']);
+    }
+  });
+
   it('rejects non-MP3 media at stable request preflight without creating a task or Provider call', async () => {
     const input = await prepared();
     const audio = path.join(input.home, 'declared-wav.mp3');
