@@ -11,6 +11,7 @@ import { projectMachineTaskToExchangeResult, projectMachineTaskToExchangeTask } 
 import type { TaskRecordV5 } from '../contracts/generated/task-record-v5.js';
 import { cancelV5Task, projectV5Result, projectV5Task, readV5Events, readV5Task } from '../exchange/runtime.js';
 import { readStableJson } from '../exchange/storage.js';
+import { deliverCurrentV5Review } from '../review-v5.js';
 
 const TASK_ID = /^tsk-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}$/u;
 
@@ -99,6 +100,13 @@ export async function stableCancelTask(workspaceRoot: string, record: Compatible
   }
   const cancelled = await cancelBackgroundTask(workspaceRoot, record as TaskRecordV2);
   return { pending: cancelled.pending, task: await stableTaskView(workspaceRoot, cancelled.task) };
+}
+
+export async function stableDeliverTask(workspaceRoot: string, record: CompatibleTask): Promise<{ task: ExchangeTaskV1; result: ExchangeResultV1 }> {
+  if (!('identity' in record)) throw new MercuryError('CONTRACT_UNSUPPORTED', '此历史任务不支持业务目录交付；查询未做任何写入。', { exitCode: 5 });
+  const directory = path.join(workspaceRoot, 'tasks', record.identity.task_directory);
+  const delivered = await deliverCurrentV5Review(directory);
+  return { task: await projectV5Task(directory, delivered), result: await projectV5Result(directory, delivered) };
 }
 
 export async function stableEventsAfter(workspaceRoot: string, record: CompatibleTask, after: number): Promise<ExchangeEventV1[]> {

@@ -81,6 +81,7 @@ export interface TaskRecordV5 {
       'unsupported' | 'not_ready' | 'pending' | 'in_progress' | 'ready' | 'not_required' | 'finalized' | 'invalid';
     pending_count: number | null;
   };
+  delivery?: Delivery;
   /**
    * @maxItems 1000
    */
@@ -136,6 +137,29 @@ export interface ProviderCall {
   outcome: 'not_dispatched' | 'known_terminal' | 'response_persisted' | 'outcome_unknown' | 'not_applicable';
   evidence_ref: null | string;
   evidence_sha256: null | string;
+}
+/**
+ * This interface was referenced by `TaskRecordV5`'s JSON-Schema
+ * via the `definition` "delivery".
+ */
+export interface Delivery {
+  requested_directory: null | string;
+  status: 'not_requested' | 'pending_review' | 'ready' | 'delivered' | 'failed';
+  final_path: null | string;
+  sha256: null | string;
+  validation: 'passed' | 'unavailable';
+  delivered_at: null | string;
+  review_revision: string | null;
+  /**
+   * @maxItems 1000
+   */
+  history: {
+    path: string;
+    sha256: string;
+    review_revision: string;
+    delivered_at: string;
+  }[];
+  error: null | ExchangeErrorV1;
 }
 export interface ExchangeErrorV1 {
   contract: 'mercury.error/v1';

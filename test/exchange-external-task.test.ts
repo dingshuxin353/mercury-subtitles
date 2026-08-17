@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -10,15 +10,16 @@ import { appendV5Event, cancelV5Task, persistV5Task, readV5Events, readV5Task, s
 import { findTaskReadOnly, stableTaskResult, stableTaskView } from '../src/stable-cli/tasks.js';
 import { createDictionary, makeDictionaryEntry, mutateDictionary } from '../src/dictionary.js';
 import { runCli } from '../src/cli.js';
-import type { AsrAdapter, AsrHintsCapableAdapter } from '../src/contracts/index.js';
+import type { AsrAdapter, AsrHintsCapableAdapter, ExchangeRequestV1 } from '../src/contracts/index.js';
 import { VolcengineAsrAdapter } from '../src/adapters/volcengine-asr.js';
 import { VolcengineSubtitleAsrAdapter } from '../src/adapters/volcengine-subtitle-asr.js';
 import { canonicalJson } from '../src/exchange/storage.js';
 import { readJob } from '../src/background/storage.js';
 import { createChatCalibrationRuntimeV2, type ChatCalibrationRuntimeV2 } from '../src/adapters/chat-calibration-v2.js';
-import { readVerifiedV5Review } from '../src/review-v5.js';
+import { decideV5ReviewChange, finalizeV5Review, readVerifiedV5Review } from '../src/review-v5.js';
 import { inspectTranscriptInput } from '../src/external-input.js';
 import { validateContract } from '../src/contracts/index.js';
+import { deliverApprovedSrt, SimulatedDeliveryCrash } from '../src/delivery.js';
 
 function sha(value: Buffer | string) { return createHash('sha256').update(value).digest('hex'); }
 
@@ -47,7 +48,7 @@ async function prepared() {
   const source = path.join(home, 'provided.srt');
   const sourceText = '1\n00:00:00,000 --> 00:00:01,000\n您好 Mercury\n\n2\n00:00:01,000 --> 00:00:02,000\n字幕测试\n';
   await writeFile(source, sourceText);
-  const request = {
+  const request: ExchangeRequestV1 = {
     contract: 'mercury.exchange.request/v1', request_id: 'request-external-test', created_at: '2026-08-16T15:00:00.000Z', operation: 'subtitle_calibration',
     inputs: { media: null, transcript: { path: source, sha256: sha(sourceText), format: 'srt', role: 'transcript_source' } },
     transcription_mode: 'provided', calibration: { mode: 'text-only', source_language: 'zh-CN' },
@@ -407,6 +408,7 @@ describe('Exchange v1 external transcript task', () => {
 
   it('cancels a queued provider task with no transcript as a zero-call terminal result', async () => {
     const input = await prepared();
+    const business = path.join(await realpath(input.home), 'cancelled-delivery');
     const audio = path.join(input.home, 'queued-cancel.mp3');
     const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
     const registry = await loadModelRegistryV2(input.workspace);
@@ -414,6 +416,7 @@ describe('Exchange v1 external transcript task', () => {
       ...input.request, request_id: 'request-provider-queued-cancel',
       inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: null },
       transcription_mode: 'provider', models: { asr: registry.defaults.asr, chat: registry.defaults.chat },
+      output: { ...input.request.output, approved_srt_directory: business },
     });
     const cancelled = await cancelV5Task(input.workspace, submitted.task);
     const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
@@ -425,7 +428,8 @@ describe('Exchange v1 external transcript task', () => {
       expect.objectContaining({ data: expect.objectContaining({ asr_call_count: 0, chat_call_count: 0, transcribed_available: false }) }),
     ]);
     const result = await stableTaskResult(input.workspace, await findTaskReadOnly(input.workspace, submitted.task.identity.task_id));
-    expect(result).toMatchObject({ status: 'cancelled', next_action: '任务已取消；尚未产生字幕文件。' });
+    expect(result).toMatchObject({ status: 'cancelled', next_action: '任务已取消；尚未产生字幕文件。', delivery: { status: 'failed', final_path: null, error: { code: 'DELIVERY_NOT_READY' } } });
+    expect(await lstat(business).catch(() => null)).toBeNull();
   });
 
   it('reports an existing verified provided transcript consistently when cancelled while queued', async () => {
@@ -1366,7 +1370,9 @@ describe('Exchange v1 external transcript task', () => {
 
   it('retains transcribed output and never publishes calibrated output when Chat fails deterministically', async () => {
     const input = await prepared();
+    const business = path.join(await realpath(input.home), 'failed-delivery');
     input.request.request_id = 'request-external-failure';
+    input.request.output.approved_srt_directory = business;
     const submitted = await submitExchangeRequest(input.workspace, input.request);
     await runWorker(input.workspace, { fetch: vi.fn(async () => new Response('{"error":"bad"}', { status: 400 })), readCredential: async () => 'fixture-secret' });
     const task = await readV5Task(path.join(input.workspace, 'tasks', submitted.task.identity.task_directory));
@@ -1378,6 +1384,8 @@ describe('Exchange v1 external transcript task', () => {
     const result = JSON.parse(await readFile(path.join(input.workspace, 'tasks', submitted.task.identity.task_directory, 'result.json'), 'utf8'));
     expect(result.status).toBe('failed');
     expect(result.artifacts.find((entry: { identity: string }) => entry.identity === 'transcribed_srt')).toMatchObject({ exists: true, validation: 'passed' });
+    expect(result.delivery).toMatchObject({ status: 'failed', final_path: null, error: { code: 'DELIVERY_NOT_READY' } });
+    expect(await lstat(business).catch(() => null)).toBeNull();
   });
 
   it('serializes concurrent event appends with continuous sequence and task revision', async () => {
@@ -1464,7 +1472,9 @@ describe('Exchange v1 external transcript task', () => {
 
   it('contains a crash after durable dispatch as Provider-unknown and never replays it', async () => {
     const input = await prepared();
+    const business = path.join(await realpath(input.home), 'interrupted-delivery');
     input.request.request_id = 'request-v5-crash-after-dispatch';
+    input.request.output.approved_srt_directory = business;
     const submitted = await submitExchangeRequest(input.workspace, input.request);
     const calls: string[] = [];
     await expect(runWorker(
@@ -1479,6 +1489,9 @@ describe('Exchange v1 external transcript task', () => {
     expect(task.execution.provider_calls.chat).toMatchObject({ state: 'in_flight', count: 1, outcome: 'outcome_unknown' });
     expect(task.error?.code).toBe('TASK_INTERRUPTED_PROVIDER_UNKNOWN');
     expect(calls).toHaveLength(0);
+    const result = await stableTaskResult(input.workspace, await findTaskReadOnly(input.workspace, task.identity.task_id));
+    expect(result.delivery).toMatchObject({ status: 'failed', final_path: null, error: { code: 'DELIVERY_NOT_READY' } });
+    expect(await lstat(business).catch(() => null)).toBeNull();
   });
 
   it('keeps v5 tasks on the existing review flow and finalizes an approved SRT without changing time', async () => {
@@ -1505,9 +1518,276 @@ describe('Exchange v1 external transcript task', () => {
     expect((await readV5Task(path.dirname(path.dirname(approvedPath)))).review.status).toBe('finalized');
   });
 
+  it('auto-delivers a no-change approved SRT once, preserves 0600 bytes, and replays the request 100 times without another file', async () => {
+    const input = await prepared();
+    const business = path.join(await realpath(input.home), 'business-output');
+    input.request.request_id = 'request-approved-delivery-no-change';
+    input.request.output.approved_srt_directory = business;
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const calls: string[] = [];
+    await runWorker(input.workspace, { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const task = await readV5Task(directory);
+    expect(task.status, JSON.stringify(task.error)).toBe('completed');
+    expect(task.review.status).toBe('not_required');
+    expect(task.delivery).toMatchObject({ status: 'delivered', validation: 'passed' });
+    const external = task.delivery!.final_path!;
+    expect(path.dirname(external)).toBe(business);
+    expect((await stat(business)).mode & 0o777).toBe(0o700);
+    expect((await stat(external)).mode & 0o777).toBe(0o600);
+    expect(sha(await readFile(external))).toBe(task.artifacts.approved!.sha256);
+    expect(await readFile(external)).toEqual(await readFile(path.join(directory, task.artifacts.approved!.path)));
+    for (let index = 0; index < 100; index += 1) {
+      const replay = await submitExchangeRequest(input.workspace, input.request);
+      expect(replay.replayed).toBe(true);
+      expect(replay.task.identity.task_id).toBe(task.identity.task_id);
+    }
+    const before = await directoryManifest(directory); const outsideBefore = await directoryManifest(business);
+    const record = await findTaskReadOnly(input.workspace, task.identity.task_id);
+    const view = await stableTaskView(input.workspace, record); const result = await stableTaskResult(input.workspace, record);
+    expect(view.delivery).toMatchObject({ status: 'delivered', final_path: external, sha256: task.artifacts.approved!.sha256 });
+    expect(result.delivery).toEqual(view.delivery);
+    const io = { homeDirectory: input.home, stdout: (_value: string) => undefined, stderr: (_value: string) => undefined };
+    expect(await runCli(['task', 'list', '--json'], io)).toBe(0);
+    expect(await runCli(['task', 'status', task.identity.task_id, '--json'], io)).toBe(0);
+    expect(await runCli(['task', 'result', task.identity.task_id, '--json'], io)).toBe(0);
+    const lastSequence = (await readV5Events(directory)).at(-1)!.sequence;
+    expect(await runCli(['task', 'watch', task.identity.task_id, '--after', String(lastSequence), '--jsonl'], io)).toBe(0);
+    expect(await directoryManifest(directory)).toEqual(before);
+    expect(await directoryManifest(business)).toEqual(outsideBefore);
+    await chmod(external, 0o644); const unsafeManifest = await directoryManifest(business);
+    const unsafeView = await stableTaskView(input.workspace, await findTaskReadOnly(input.workspace, task.identity.task_id));
+    expect(unsafeView.delivery).toMatchObject({ status: 'failed', validation: 'unavailable', error: { code: 'DELIVERY_HISTORY_INVALID' } });
+    expect(await directoryManifest(business)).toEqual(unsafeManifest);
+    await chmod(external, 0o600);
+    expect(calls).toEqual(['chat']);
+  });
+
+  it('projects an older schema5 task without a delivery field as not_requested without writing it back', async () => {
+    const input = await prepared(); input.request.request_id = 'request-old-v5-without-delivery';
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const raw = JSON.parse(await readFile(path.join(directory, 'task.json'), 'utf8')); delete raw.delivery;
+    await writeFile(path.join(directory, 'task.json'), canonicalJson(raw), { mode: 0o600 });
+    const before = await directoryManifest(directory);
+    const record = await findTaskReadOnly(input.workspace, submitted.task.identity.task_id);
+    expect((await stableTaskView(input.workspace, record)).delivery).toMatchObject({ status: 'not_requested', requested_directory: null, history: [] });
+    expect((await stableTaskResult(input.workspace, record)).delivery).toMatchObject({ status: 'not_requested', requested_directory: null, history: [] });
+    expect(await directoryManifest(directory)).toEqual(before);
+  });
+
+  it('treats the requested business directory as part of the stable request fingerprint', async () => {
+    const input = await prepared();
+    input.request.request_id = 'request-approved-delivery-fingerprint';
+    input.request.output.approved_srt_directory = path.join(await realpath(input.home), 'output-a');
+    await submitExchangeRequest(input.workspace, input.request);
+    const changed = structuredClone(input.request);
+    changed.output.approved_srt_directory = path.join(await realpath(input.home), 'output-b');
+    await expect(submitExchangeRequest(input.workspace, changed)).rejects.toMatchObject({ code: 'REQUEST_ID_CONFLICT' });
+    expect(await readdir(path.join(input.workspace, 'tasks'))).toHaveLength(1);
+  });
+
+  it('keeps immutable versioned deliveries while the same task is edited, finalized, and returned to historical content', async () => {
+    const input = await prepared();
+    const business = path.join(await realpath(input.home), 'versioned-output');
+    input.request.request_id = 'request-approved-delivery-versioned';
+    input.request.output.approved_srt_directory = business;
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const calls: string[] = [];
+    await runWorker(input.workspace, { fetch: fixtureFetch(calls, [], (text, index) => index === 0 ? text.replace('您好', '你好') : text), readCredential: async () => 'fixture-secret' });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    let review = await readVerifiedV5Review(directory);
+    const change = review.changes[0]!;
+    expect((await lstat(business).catch(() => null))).toBeNull();
+    review = await decideV5ReviewChange(directory, { changeId: change.change_id, decision: 'accepted', actor: 'user_via_cli', now: () => new Date('2026-08-17T10:00:00.000Z') });
+    await finalizeV5Review(directory, () => new Date('2026-08-17T10:00:01.000Z'));
+    let task = await readV5Task(directory); const fileA = task.delivery!.final_path!; const hashA = task.delivery!.sha256!;
+    expect(task.delivery!.history).toHaveLength(1);
+    const bytesA = await readFile(fileA);
+
+    await decideV5ReviewChange(directory, { changeId: change.change_id, decision: 'edited', text: '您好 Mercury 新版本', actor: 'user_via_cli', now: () => new Date('2026-08-17T10:01:00.000Z') });
+    task = await readV5Task(directory);
+    expect(task.delivery).toMatchObject({ status: 'pending_review', final_path: null, sha256: null });
+    expect(task.delivery!.history).toHaveLength(1);
+    expect(await readFile(fileA)).toEqual(bytesA);
+    await Promise.all([finalizeV5Review(directory, () => new Date('2026-08-17T10:01:01.000Z')), finalizeV5Review(directory, () => new Date('2026-08-17T10:01:01.000Z'))]);
+    task = await readV5Task(directory); const fileB = task.delivery!.final_path!;
+    expect(fileB).not.toBe(fileA); expect(task.delivery!.history).toHaveLength(2);
+    expect(await readFile(fileA)).toEqual(bytesA);
+
+    await decideV5ReviewChange(directory, { changeId: change.change_id, decision: 'edited', text: change.proposed_text, actor: 'user_via_cli', now: () => new Date('2026-08-17T10:02:00.000Z') });
+    await finalizeV5Review(directory, () => new Date('2026-08-17T10:02:01.000Z'));
+    task = await readV5Task(directory);
+    expect(task.delivery).toMatchObject({ status: 'delivered', final_path: fileA, sha256: hashA });
+    expect(task.delivery!.history).toHaveLength(3);
+    expect((await readdir(business)).filter((name) => name.endsWith('.srt'))).toHaveLength(2);
+    const eventsBefore = (await readV5Events(directory)).filter((event) => event.type === 'approved_srt_delivered').length;
+    const manifestBefore = await directoryManifest(business);
+    await finalizeV5Review(directory); await deliverApprovedSrt(directory, await readVerifiedV5Review(directory));
+    expect((await readV5Task(directory)).delivery!.history).toHaveLength(3);
+    expect((await readV5Events(directory)).filter((event) => event.type === 'approved_srt_delivered')).toHaveLength(eventsBefore);
+    expect(await directoryManifest(business)).toEqual(manifestBefore);
+    expect(calls).toEqual(['chat']);
+  });
+
+  it('waits for accepted, rejected, and edited review decisions before publishing the final SRT with the exact calibrated timeline', async () => {
+    const input = await prepared();
+    const sourceText = '1\n00:00:00,000 --> 00:00:01,000\n甲原文\n\n2\n00:00:01,000 --> 00:00:02,000\n乙原文\n\n3\n00:00:02,000 --> 00:00:03,000\n丙原文\n';
+    await writeFile(input.source, sourceText); input.request.inputs.transcript!.sha256 = sha(sourceText);
+    const business = path.join(await realpath(input.home), 'three-decisions-output');
+    input.request.request_id = 'request-approved-delivery-three-decisions'; input.request.output.approved_srt_directory = business;
+    const submitted = await submitExchangeRequest(input.workspace, input.request); const calls: string[] = [];
+    await runWorker(input.workspace, { fetch: fixtureFetch(calls, [], (text) => `${text}校`), readCredential: async () => 'fixture-secret' });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    let review = await readVerifiedV5Review(directory);
+    expect(review.counts.pending).toBe(3); expect(await lstat(business).catch(() => null)).toBeNull();
+    review = await decideV5ReviewChange(directory, { changeId: review.changes[0]!.change_id, decision: 'accepted', actor: 'user_via_cli' });
+    review = await decideV5ReviewChange(directory, { changeId: review.changes[1]!.change_id, decision: 'rejected', actor: 'user_via_cli' });
+    review = await decideV5ReviewChange(directory, { changeId: review.changes[2]!.change_id, decision: 'edited', text: '丙人工确认', actor: 'user_via_cli' });
+    expect(review.counts).toMatchObject({ accepted: 1, rejected: 1, edited: 1, pending: 0 });
+    expect(await lstat(business).catch(() => null)).toBeNull();
+    const finalized = await finalizeV5Review(directory);
+    const task = await readV5Task(directory); const delivered = await readFile(task.delivery!.final_path!, 'utf8');
+    const calibrated = await readFile(path.join(directory, task.artifacts.calibrated!.path), 'utf8');
+    expect(parseSrt(delivered)).toEqual(parseSrt(calibrated));
+    expect(delivered).toContain('甲原文校'); expect(delivered).toContain('乙原文'); expect(delivered).toContain('丙人工确认');
+    expect(task.delivery).toMatchObject({ status: 'delivered', sha256: finalized.approved_artifact!.sha256 });
+    expect(calls).toEqual(['chat']);
+  });
+
+  it('recovers a local-only delivery commit crash without another Provider call and rejects symlink directories without changing the target', async () => {
+    const input = await prepared();
+    const missingParent = path.join(await realpath(input.home), 'later-parent');
+    const business = path.join(missingParent, 'delivery');
+    input.request.request_id = 'request-approved-delivery-recovery';
+    input.request.output.approved_srt_directory = business;
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const calls: string[] = [];
+    await runWorker(input.workspace, { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    let task = await readV5Task(directory);
+    expect(task.delivery).toMatchObject({ status: 'failed', validation: 'unavailable' });
+    expect(task.artifacts.approved?.validation).toBe('passed');
+    const failedOutput: string[] = [];
+    expect(await runCli(['task', 'deliver', task.identity.task_id, '--json'], { homeDirectory: input.home, stdout: (value) => failedOutput.push(value), stderr: () => undefined })).toBe(2);
+    expect(JSON.parse(failedOutput[0]!).error).toMatchObject({ code: 'DELIVERY_DIRECTORY_INVALID', category: 'input', retryability: 'after_user_action', provider_outcome: 'not_applicable' });
+    expect(calls).toEqual(['chat']);
+    await mkdir(missingParent, { mode: 0o700 });
+    const review = await readVerifiedV5Review(directory);
+    await expect(deliverApprovedSrt(directory, review, { fault: (point) => { if (point === 'after_final_committed') throw new Error('crash:delivery-final'); } })).rejects.toBeInstanceOf(SimulatedDeliveryCrash);
+    task = await readV5Task(directory);
+    expect(task.delivery?.status).toBe('ready');
+    expect(calls).toEqual(['chat']);
+    const output: string[] = [];
+    expect(await runCli(['task', 'deliver', task.identity.task_id, '--json'], { homeDirectory: input.home, stdout: (value) => output.push(value), stderr: () => undefined }), output.join('')).toBe(0);
+    expect(JSON.parse(output[0]!).data.task.delivery).toMatchObject({ status: 'delivered', validation: 'passed' });
+    task = await readV5Task(directory);
+    expect(task.delivery).toMatchObject({ status: 'delivered', validation: 'passed' });
+    expect(calls).toEqual(['chat']);
+
+    const unsafeInput = await prepared();
+    const unsafeHome = await realpath(unsafeInput.home);
+    const outside = path.join(unsafeHome, 'outside'); await mkdir(outside, { mode: 0o700 });
+    const marker = path.join(outside, 'keep.txt'); await writeFile(marker, 'unchanged', { mode: 0o600 });
+    const linked = path.join(unsafeHome, 'linked-output'); await symlink(outside, linked);
+    unsafeInput.request.request_id = 'request-approved-delivery-symlink'; unsafeInput.request.output.approved_srt_directory = linked;
+    const unsafeSubmitted = await submitExchangeRequest(unsafeInput.workspace, unsafeInput.request);
+    const unsafeCalls: string[] = [];
+    await runWorker(unsafeInput.workspace, { fetch: fixtureFetch(unsafeCalls), readCredential: async () => 'fixture-secret' });
+    const unsafeTask = await readV5Task(path.join(unsafeInput.workspace, 'tasks', unsafeSubmitted.task.identity.task_directory));
+    expect(unsafeTask.delivery?.error?.code).toBe('DELIVERY_PATH_UNSAFE');
+    expect(await readFile(marker, 'utf8')).toBe('unchanged');
+    expect((await readdir(outside))).toEqual(['keep.txt']);
+    expect(unsafeCalls).toEqual(['chat']);
+  });
+
+  it.each(['after_ready_persisted', 'after_temp_synced', 'after_final_committed', 'after_task_committed', 'after_event_committed'] as const)('recovers the delivery %s crash window locally with one immutable fact', async (point) => {
+    const input = await prepared();
+    const realHome = await realpath(input.home);
+    const parent = path.join(realHome, `recovery-${point}`); const business = path.join(parent, 'output');
+    input.request.request_id = `request-delivery-window-${point.replaceAll('_', '-')}`;
+    input.request.output.approved_srt_directory = business;
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const calls: string[] = [];
+    await runWorker(input.workspace, { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    await mkdir(parent, { mode: 0o700 });
+    const review = await readVerifiedV5Review(directory);
+    await expect(deliverApprovedSrt(directory, review, { fault: (current) => { if (current === point) throw new Error(`crash:${point}`); } })).rejects.toBeInstanceOf(SimulatedDeliveryCrash);
+    await deliverApprovedSrt(directory, review);
+    const task = await readV5Task(directory);
+    expect(task.delivery).toMatchObject({ status: 'delivered', validation: 'passed' });
+    expect(task.delivery!.history).toHaveLength(1);
+    expect((await readV5Events(directory)).filter((event) => event.type === 'approved_srt_delivered')).toHaveLength(1);
+    expect((await readdir(business)).filter((name) => name.endsWith('.srt'))).toHaveLength(1);
+    const result = JSON.parse(await readFile(path.join(directory, 'result.json'), 'utf8'));
+    expect(result.delivery).toMatchObject({ status: 'delivered', final_path: task.delivery!.final_path, sha256: task.delivery!.sha256 });
+    expect(calls).toEqual(['chat']);
+  });
+
+  it('never overwrites an existing deterministic target with different bytes or unsafe permissions', async () => {
+    const input = await prepared();
+    const parent = path.join(await realpath(input.home), 'conflict-parent'); const business = path.join(parent, 'output');
+    input.request.request_id = 'request-delivery-target-conflict'; input.request.output.approved_srt_directory = business;
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const calls: string[] = [];
+    await runWorker(input.workspace, { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    await mkdir(parent, { mode: 0o700 }); await mkdir(business, { mode: 0o700 });
+    const task = await readV5Task(directory); const target = task.delivery!.final_path!;
+    await writeFile(target, 'external-content', { mode: 0o600 });
+    const before = await readFile(target);
+    await expect(deliverApprovedSrt(directory, await readVerifiedV5Review(directory))).rejects.toMatchObject({ code: 'DELIVERY_CONFLICT' });
+    expect(await readFile(target)).toEqual(before);
+    expect(calls).toEqual(['chat']);
+
+    await rm(target); const approved = await readFile(path.join(directory, task.artifacts.approved!.path)); await writeFile(target, approved, { mode: 0o644 });
+    await expect(deliverApprovedSrt(directory, await readVerifiedV5Review(directory))).rejects.toMatchObject({ code: 'DELIVERY_CONFLICT' });
+    expect((await stat(target)).mode & 0o777).toBe(0o644);
+    expect(await readFile(target)).toEqual(approved);
+    expect(calls).toEqual(['chat']);
+  });
+
+  it('keeps the workspace approved artifact passed when the existing business directory is not writable', async () => {
+    const input = await prepared(); const business = path.join(await realpath(input.home), 'readonly-output');
+    await mkdir(business, { mode: 0o500 });
+    input.request.request_id = 'request-delivery-directory-not-writable'; input.request.output.approved_srt_directory = business;
+    const submitted = await submitExchangeRequest(input.workspace, input.request); const calls: string[] = [];
+    try {
+      await runWorker(input.workspace, { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+      const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory); const task = await readV5Task(directory);
+      expect(task.artifacts.approved?.validation).toBe('passed');
+      expect(task.delivery).toMatchObject({ status: 'failed', error: { code: 'DELIVERY_DIRECTORY_NOT_WRITABLE' } });
+      expect(await readdir(business)).toEqual([]);
+      expect(calls).toEqual(['chat']);
+    } finally { await chmod(business, 0o700); }
+  });
+
+  it('detects a business directory replacement between temp sync and commit, touches no outside file, and recovers locally', async () => {
+    const input = await prepared(); const realHome = await realpath(input.home);
+    const parent = path.join(realHome, 'toctou-parent'); const business = path.join(parent, 'output');
+    input.request.request_id = 'request-delivery-directory-toctou'; input.request.output.approved_srt_directory = business;
+    const submitted = await submitExchangeRequest(input.workspace, input.request); const calls: string[] = [];
+    await runWorker(input.workspace, { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    await mkdir(parent, { mode: 0o700 });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory); const review = await readVerifiedV5Review(directory);
+    const outside = path.join(realHome, 'toctou-outside'); await mkdir(outside, { mode: 0o700 });
+    const marker = path.join(outside, 'keep.txt'); await writeFile(marker, 'outside-unchanged', { mode: 0o600 });
+    const moved = path.join(parent, 'output-original');
+    await expect(deliverApprovedSrt(directory, review, { fault: async (point) => {
+      if (point === 'after_temp_synced') { await rename(business, moved); await symlink(outside, business); }
+    } })).rejects.toMatchObject({ code: 'DELIVERY_PATH_UNSAFE' });
+    let task = await readV5Task(directory);
+    expect(task.artifacts.approved?.validation).toBe('passed'); expect(task.delivery?.error?.code).toBe('DELIVERY_PATH_UNSAFE');
+    expect(await readFile(marker, 'utf8')).toBe('outside-unchanged'); expect(await readdir(outside)).toEqual(['keep.txt']); expect(calls).toEqual(['chat']);
+    await rm(business); await rename(moved, business);
+    await deliverApprovedSrt(directory, review); task = await readV5Task(directory);
+    expect(task.delivery).toMatchObject({ status: 'delivered', validation: 'passed' }); expect(calls).toEqual(['chat']);
+  });
+
   it('rejects request hash mismatch before creating a task or dispatching a provider', async () => {
     const input = await prepared();
-    input.request.inputs.transcript.sha256 = '0'.repeat(64);
+    input.request.inputs.transcript!.sha256 = '0'.repeat(64);
     await expect(submitExchangeRequest(input.workspace, input.request)).rejects.toMatchObject({ code: 'INPUT_HASH_MISMATCH' });
     const tasks = await (await import('node:fs/promises')).readdir(path.join(input.workspace, 'tasks'));
     expect(tasks).toHaveLength(0);

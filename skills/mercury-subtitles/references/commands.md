@@ -70,3 +70,13 @@ mercury review finalize <task-id> --json
 ```
 
 Do not invoke `accept-all` until the user confirms the exact task and currently displayed pending count.
+
+## V0.3 stable delivery boundary
+
+Exchange request v1 can optionally carry `output.approved_srt_directory` after the user confirms a normalized absolute directory. The current Skill workflow has not migrated its submit flow to Exchange v1 yet, so do not invent this field or claim natural-language delivery support. A future migrated workflow may use it, then inspect `task/result.delivery` and recover a local-only delivery failure with:
+
+```sh
+mercury task deliver <task-id> --json
+```
+
+This action never calls a Provider. Do not copy calibrated/transcribed files as a substitute for approved delivery, change the directory on an existing request ID, overwrite an existing business file, or guess a destination.

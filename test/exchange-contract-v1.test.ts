@@ -99,6 +99,15 @@ describe('Exchange Protocol v1 contracts', () => {
     expect(validateExchangeContract('request', { ...provided, inputs: { ...provided.inputs, transcript: { ...provided.inputs.transcript!, role: 'reference' } } }).valid).toBe(false);
   });
 
+  it('accepts an optional absolute approved SRT directory without breaking old requests and rejects unsafe directory shapes', () => {
+    expect(validateExchangeContract('request', request()).valid).toBe(true);
+    expect(validateExchangeContract('request', request({ output: { formats: ['srt'], workspace_policy: 'managed', approved_srt_directory: '/absolute/business/output' } })).valid).toBe(true);
+    expect(validateExchangeContract('request', request({ output: { formats: ['report'], workspace_policy: 'managed', approved_srt_directory: '/absolute/business/output' } })).valid).toBe(false);
+    expect(validateExchangeContract('request', request({ output: { formats: ['srt'], workspace_policy: 'managed', approved_srt_directory: 'relative/output' } })).valid).toBe(false);
+    expect(validateExchangeContract('request', request({ output: { formats: ['srt'], workspace_policy: 'managed', approved_srt_directory: '~/output' } })).valid).toBe(false);
+    expect(validateExchangeContract('request', request({ output: { formats: ['srt'], workspace_policy: 'managed', approved_srt_directory: '/absolute/~/output' } })).valid).toBe(false);
+  });
+
   it('rejects transcript gaps in identity, order, overlap, full text and word bounds', () => {
     expect(validateExchangeContract('transcript', transcript()).valid).toBe(true);
     const bad = transcript();
@@ -215,6 +224,11 @@ describe('Exchange Protocol v1 contracts', () => {
     const secretTask = structuredClone(record);
     secretTask.warnings = [`${'Author'}ization: ${'Bear'}er ${'x'.repeat(40)}`];
     expect(validateV5TaskRecord(secretTask).valid).toBe(false);
+    const delivery = structuredClone(record);
+    delivery.delivery = { requested_directory: '/absolute/business/output', status: 'pending_review', final_path: null, sha256: null, validation: 'unavailable', delivered_at: null, review_revision: null, history: [], error: null };
+    expect(validateV5TaskRecord(delivery).valid).toBe(true);
+    delivery.delivery.status = 'delivered';
+    expect(validateV5TaskRecord(delivery).valid).toBe(false);
   });
 });
 
@@ -267,5 +281,7 @@ describe('stable storage and history projection', () => {
     expect(task.capabilities.dictionary_snapshot.supported).toBe(false);
     expect(result.transcription.asr_call_count).toBeNull();
     expect(result.dictionaries.snapshots).toEqual([]);
+    expect(task.delivery).toMatchObject({ status: 'unsupported', requested_directory: null, history: [] });
+    expect(result.delivery).toEqual(task.delivery);
   });
 });

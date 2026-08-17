@@ -23,6 +23,8 @@ mercury task submit --request "/绝对路径/request.json" --json
 
 保存返回的 `task_id`。`request.json` 必须包含稳定逻辑身份派生的 `request_id`；同一次用户请求丢失输出后的重试复用它，用户明确要求重新跑时才创建新的逻辑身份。
 
+需要把最终批准稿交付到业务目录时，在 request 的 `output` 中加入可选字段 `approved_srt_directory`，值必须是用户确认的规范化绝对目录。目录属于 request 指纹；同 request ID 改目录会冲突。Mercury 不会交付 transcribed/calibrated，也不会把 task、review、报告或 Provider evidence 搬出 managed workspace。
+
 旧 `calibrate --background --json` 仅作为过渡兼容入口；机器调用必须显式提供稳定 request ID，不能依赖随机 ID：
 
 ```bash
@@ -80,6 +82,14 @@ mercury review finalize <task-id> --json
 ```
 
 只有 pending 为零时才能 finalize。生成的 `approved.srt` 与 `calibrated.srt` 时间段数和毫秒边界一致。
+
+请求了业务目录时，finalize 会尝试交付同一 approved Buffer。目录故障不会破坏工作区批准稿；修复目录后只执行本地动作：
+
+```bash
+mercury task deliver <task-id> --json
+```
+
+该命令不启动 Worker、不调用 ASR/Chat。每个批准内容使用包含 task ID 与内容 hash 的确定文件名；后续修改审阅会生成新版本，旧交付文件不覆盖、不删除。
 
 ## 完整命令表
 

@@ -507,6 +507,7 @@ export interface ExchangeResultV1 {
     pending_count: number | null;
     approved: boolean;
   };
+  delivery?: Delivery;
   /**
    * @maxItems 100
    */
@@ -536,6 +537,30 @@ export interface Artifact {
   path: null | string;
   sha256: null | string;
   validation: 'passed' | 'pending' | 'unavailable';
+}
+/**
+ * This interface was referenced by `ExchangeResultV1`'s JSON-Schema
+ * via the `definition` "delivery".
+ */
+export interface Delivery {
+  requested_directory: null | string;
+  status: 'not_requested' | 'unsupported' | 'pending_review' | 'ready' | 'delivered' | 'failed';
+  final_path: null | string;
+  sha256: null | string;
+  validation: 'passed' | 'unavailable';
+  delivered_at: null | string;
+  review_revision: string | null;
+  /**
+   * @maxItems 1000
+   */
+  history: {
+    path: string;
+    sha256: string;
+    review_revision: string;
+    delivered_at: string;
+  }[];
+  error: null | ExchangeErrorV1;
+  next_action: string;
 }
 export interface ExchangeErrorV1 {
   contract: 'mercury.error/v1';

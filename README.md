@@ -94,12 +94,17 @@ mercury task submit --request "/绝对路径/request.json" --json
 mercury task status <task-id> --json
 mercury task result <task-id> --json
 
+# 业务目录暂时不可用时，只重试本地批准稿交付（不会调用 Provider）
+mercury task deliver <task-id> --json
+
 # Worker 停止且任务仍在排队时，显式恢复
 mercury worker status --json
 mercury worker start --json
 ```
 
 `request.json` 使用 Exchange Protocol v1，并必须包含一个稳定 `request_id`：同一次逻辑请求丢失输出后重试时复用它，用户明确要求重新处理时才生成新的 ID。外部字幕先用 `mercury input inspect ... --json` 检查，并在 request 中显式声明 `transcript_source` 或 `reference`；完整 request 字段见下方 CLI 文档。
+
+如需把最终批准字幕交付到业务目录，可在 request 的 `output` 中增加 `"approved_srt_directory": "/规范化绝对路径"`。Mercury 只在 approved.srt 形成后发布内容寻址的 0600 副本；工作区仍是事实源。目录属于 request 指纹，不能用同一 request ID 改目录；交付失败后使用上面的 `task deliver`，无需重跑 ASR 或 Chat。
 
 查询状态不会偷偷启动 Worker，也不会重复提交任务。Provider 结果不确定时，Mercury 会停下来阻止自动重放，避免重复调用或计费。
 
@@ -148,6 +153,8 @@ Skill 只使用 Mercury 的机器命令。它不会向你索要 Key，不会自�
 - 编辑：使用你亲自确认的文字。
 
 所有项目决定完毕后才会生成 `approved.srt`。批准稿沿用校验字幕的完整时间轴，不通过删段或合段来掩盖正文分配问题。
+
+稳定 request 可选指定批准稿业务目录。再次修改同一任务的审阅决定时，旧业务文件保持不可变；下一次 finalize 按新批准稿 hash 生成新路径，任务结果会区分 latest 与 history。
 
 ## 你的数据会去哪里
 

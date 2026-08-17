@@ -211,6 +211,7 @@ export interface ExchangeTaskV1 {
       'unsupported' | 'not_ready' | 'pending' | 'in_progress' | 'ready' | 'not_required' | 'finalized' | 'invalid';
     pending_count: number | null;
   };
+  delivery?: Delivery;
   error: null | ExchangeErrorV1;
   next_action: string;
   source_schema_version: string;
@@ -238,6 +239,30 @@ export interface Artifact {
   path: null | string;
   sha256: null | string;
   validation: 'passed' | 'pending' | 'unavailable';
+}
+/**
+ * This interface was referenced by `ExchangeTaskV1`'s JSON-Schema
+ * via the `definition` "delivery".
+ */
+export interface Delivery {
+  requested_directory: null | string;
+  status: 'not_requested' | 'unsupported' | 'pending_review' | 'ready' | 'delivered' | 'failed';
+  final_path: null | string;
+  sha256: null | string;
+  validation: 'passed' | 'unavailable';
+  delivered_at: null | string;
+  review_revision: string | null;
+  /**
+   * @maxItems 1000
+   */
+  history: {
+    path: string;
+    sha256: string;
+    review_revision: string;
+    delivered_at: string;
+  }[];
+  error: null | ExchangeErrorV1;
+  next_action: string;
 }
 export interface ExchangeErrorV1 {
   contract: 'mercury.error/v1';

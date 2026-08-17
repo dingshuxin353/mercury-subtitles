@@ -4,7 +4,7 @@ import { MercuryError } from '../errors.js';
 import { readProductVersion } from '../version.js';
 import { applyConfigMigration, inspectConfigMigration } from './config.js';
 import { stableFailure, stableSuccess } from './envelope.js';
-import { createdAtOf, decodeTaskCursor, findTaskReadOnly, listTasksReadOnly, stableCancelTask, stableEventsAfter, stableTaskResult, stableTaskView, taskCursor, taskIdOf } from './tasks.js';
+import { createdAtOf, decodeTaskCursor, findTaskReadOnly, listTasksReadOnly, stableCancelTask, stableDeliverTask, stableEventsAfter, stableTaskResult, stableTaskView, taskCursor, taskIdOf } from './tasks.js';
 import { readStableJson, writeStableJsonAtomic } from '../exchange/storage.js';
 import { projectV5Task, submitExchangeRequest } from '../exchange/runtime.js';
 import { startDetachedWorker, workerStatus } from '../background/worker.js';
@@ -59,7 +59,7 @@ export async function tryRunStableCli(args: string[], context: StableCliContext)
         alpha: '0.3.0-alpha.1',
         commands: {
           protocol: true, config_migration: true, external_srt: true, external_vtt: true, external_transcript_json: true,
-          dictionary: true, dictionary_skill_management: false, pause: false, resume: false, retry: false, venus_adapter: false,
+          dictionary: true, approved_srt_delivery: true, dictionary_skill_management: false, pause: false, resume: false, retry: false, venus_adapter: false,
         },
         task_control: { cancel: true, pause: { supported: false, planned_for: '0.3.0-alpha.2' }, resume: { supported: false, planned_for: '0.3.0-alpha.2' }, retry: { supported: false, planned_for: '0.3.0-alpha.2' } },
         machine_contract: 'mercury.cli/v1', input_formats: ['srt', 'vtt', 'transcript_json'], query_commands_are_read_only: true,
@@ -202,6 +202,7 @@ export async function tryRunStableCli(args: string[], context: StableCliContext)
         if (operation === 'status') data = await stableTaskView(context.workspaceRoot, record);
         else if (operation === 'result') data = await stableTaskResult(context.workspaceRoot, record);
         else if (operation === 'cancel') data = await stableCancelTask(context.workspaceRoot, record);
+        else if (operation === 'deliver') data = await stableDeliverTask(context.workspaceRoot, record);
         else throw new MercuryError('CLI_COMMAND_INVALID', `不支持的稳定任务命令：${operation}`, { exitCode: 2 });
       }
     }

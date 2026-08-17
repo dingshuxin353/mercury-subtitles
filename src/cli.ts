@@ -100,6 +100,7 @@ Mercury 0.3 Alpha.1
   mercury task status|result <task-id> --json
   mercury task list --limit <n> --json
   mercury task watch <task-id> --after <sequence> --jsonl
+  mercury task deliver <task-id> --json
   mercury dictionary create|list|show ... --json
   mercury dictionary entry add|edit|remove <dictionary-id> ... --json
   mercury dictionary validate|import|export ... --json

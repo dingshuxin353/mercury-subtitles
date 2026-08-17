@@ -23,6 +23,9 @@ export function stableSuccess<T>(command: string, data: T, version: string): Sta
 }
 
 function category(code: string): ExchangeErrorV1['category'] {
+  if (/^DELIVERY_PATH_UNSAFE$/u.test(code)) return 'security';
+  if (/^(?:DELIVERY_CONFLICT|DELIVERY_NOT_READY)$/u.test(code)) return 'conflict';
+  if (/^(?:DELIVERY_DIRECTORY_INVALID|DELIVERY_DIRECTORY_NOT_WRITABLE|DELIVERY_NOT_REQUESTED)$/u.test(code)) return 'input';
   if (/^(?:INPUT|TRANSCRIPT|SRT|VTT|REQUEST_INVALID|CLI_|DICTIONARY_IMPORT_INVALID)/u.test(code)) return 'input';
   if (/^(?:MODEL|CONFIG|MIGRATION)/u.test(code)) return 'config';
   if (/^(?:CONTRACT|MACHINE_CONTRACT)/u.test(code)) return 'compatibility';
@@ -49,7 +52,7 @@ export function stableErrorFrom(error: unknown): { error: ExchangeErrorV1; exitC
         const message = mercury.message.replace(/\s*(?:Provider detail|provider detail)=.*$/iu, '').trim();
         return sensitiveTextIssues(message).length > 0 ? '操作失败，原始错误包含敏感信息，已脱敏。' : message;
       })(),
-      retryability: 'not_applicable', provider_outcome: 'not_applicable',
+      retryability: /^DELIVERY_/u.test(mercury.code) ? 'after_user_action' : 'not_applicable', provider_outcome: 'not_applicable',
       remediation: [mercury.remediation ?? '请核对命令、合同版本与本地状态后重试。'],
       technical: null, extensions: {},
     },

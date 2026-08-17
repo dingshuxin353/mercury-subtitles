@@ -155,6 +155,17 @@ export async function persistV5Task(directory: string, task: TaskRecordV5): Prom
           throw new MercuryError('CALIBRATION_SOURCE_IMMUTABLE', `已固定的校准 ${source} 来源不可替换或清空。`);
         }
       }
+      if (current.delivery) {
+        if (!checked.delivery || checked.delivery.requested_directory !== current.delivery.requested_directory) {
+          throw new MercuryError('DELIVERY_STATE_INVALID', '已固定的业务交付目录和状态对象不可移除或替换。');
+        }
+        for (const prior of current.delivery.history) {
+          const retained = checked.delivery.history.find((entry) => entry.review_revision === prior.review_revision);
+          if (!retained || canonicalJson(retained) !== canonicalJson(prior)) {
+            throw new MercuryError('DELIVERY_HISTORY_IMMUTABLE', '已记录的业务交付历史不可删除或改写。');
+          }
+        }
+      }
       checked.identity.revision = Math.max(checked.identity.revision, current.identity.revision + 1);
       checked.execution.cancel_requested_at ??= current.execution.cancel_requested_at;
       if (current.status === 'running' && checked.status === 'running' && current.execution.worker_id === checked.execution.worker_id
@@ -386,7 +397,11 @@ async function createTaskDirectory(workspace: string, request: ExchangeRequestV1
       artifacts: {
         transcript: provided ? { path: 'work/transcript.normalized.json', sha256: await sha256File(path.join(staging, 'work/transcript.normalized.json')), validation: 'passed' as const } : null,
         transcribed: provided ? { path: transcribedRelative, sha256: await sha256File(path.join(staging, transcribedRelative)), validation: 'passed' as const } : null, calibrated: null, approved: null, report: null,
-      }, review: { status: 'not_ready', pending_count: null }, warnings: [...(inspected?.warnings ?? []), ...(decision.reason ? [`Chat 使用 text-only：${decision.reason}`] : [])], error: null,
+      },
+      delivery: request.output.approved_srt_directory
+        ? { requested_directory: request.output.approved_srt_directory, status: 'pending_review' as const, final_path: null, sha256: null, validation: 'unavailable' as const, delivered_at: null, review_revision: null, history: [], error: null }
+        : { requested_directory: null, status: 'not_requested' as const, final_path: null, sha256: null, validation: 'unavailable' as const, delivered_at: null, review_revision: null, history: [], error: null },
+      review: { status: 'not_ready', pending_count: null }, warnings: [...(inspected?.warnings ?? []), ...(decision.reason ? [`Chat 使用 text-only：${decision.reason}`] : [])], error: null,
     } as TaskRecordV5;
     if (provided) {
       const bridge = legacyTranscript(taskCandidate, inspected!.transcript, snapshot);
@@ -1252,6 +1267,17 @@ export async function projectV5Task(directory: string, input?: TaskRecordV5): Pr
     artifact(directory, 'calibration_report', task.artifacts.report),
   ]);
   const visibleError = projectedTaskError(task.error);
+  const delivery = await (await import('../delivery.js')).projectDeliveryReadOnly(task);
+  const nextAction = task.status === 'queued' ? '任务已入队；查询不会启动 Worker。若 Worker 未运行，请显式执行 worker start。'
+    : task.status === 'running' ? '任务正在后台处理，请稍后查询。'
+      : task.status === 'completed' && ['finalized', 'not_required'].includes(review.status) && ['ready', 'failed', 'delivered'].includes(delivery.status) ? delivery.next_action
+        : task.status === 'completed' && ['finalized', 'not_required'].includes(review.status) ? '人工批准稿已生成，可以直接打开批准后字幕。'
+          : task.status === 'completed' ? `校验后字幕已生成，还有 ${review.pending_count ?? 0} 项修改待人工审阅。`
+            : task.status === 'interrupted' ? 'Provider 结果不确定；不要自动重试。'
+              : task.status === 'cancelled' ? (artifacts.find((entry) => entry.identity === 'transcribed_srt')?.exists ? '任务已取消；纯转写字幕仍可使用。' : '任务已取消；尚未产生字幕文件。')
+                : visibleError?.code === 'REFERENCE_AUDIO_MISMATCH' ? REFERENCE_AUDIO_MISMATCH_ACTION
+                  : visibleError && TEXT_ONLY_HARD_LIMIT_CODES.has(visibleError.code) ? TEXT_ONLY_HARD_LIMIT_ACTION
+                    : '按错误提示检查输入或模型配置。';
   return assertExchangeContract('task', {
     contract: 'mercury.task/v1', task_id: task.identity.task_id, request_id: task.identity.request_id, revision: task.identity.revision, created_at: task.created_at, updated_at: task.updated_at,
     status: task.status, stage: task.stage, progress: null,
@@ -1259,8 +1285,8 @@ export async function projectV5Task(directory: string, input?: TaskRecordV5): Pr
     pause: { allowed: false, reason: '0.3.0-alpha.1 尚未提供暂停。' }, cancel: { allowed: ['queued', 'running'].includes(task.status), reason: ['queued', 'running'].includes(task.status) ? null : '当前状态不能取消。' }, retry: { allowed: false, reason: '0.3.0-alpha.1 尚未提供安全重试。' },
     attempt: { attempt_id: task.execution.attempt_id, count: task.execution.attempt_count },
     artifacts,
-    review, error: visibleError,
-    next_action: task.status === 'queued' ? '任务已入队；查询不会启动 Worker。若 Worker 未运行，请显式执行 worker start。' : task.status === 'running' ? '任务正在后台处理，请稍后查询。' : task.status === 'completed' && ['finalized', 'not_required'].includes(review.status) ? '人工批准稿已生成，可以直接打开批准后字幕。' : task.status === 'completed' ? `校验后字幕已生成，还有 ${review.pending_count ?? 0} 项修改待人工审阅。` : task.status === 'interrupted' ? 'Provider 结果不确定；不要自动重试。' : task.status === 'cancelled' ? (artifacts.find((entry) => entry.identity === 'transcribed_srt')?.exists ? '任务已取消；纯转写字幕仍可使用。' : '任务已取消；尚未产生字幕文件。') : visibleError?.code === 'REFERENCE_AUDIO_MISMATCH' ? REFERENCE_AUDIO_MISMATCH_ACTION : visibleError && TEXT_ONLY_HARD_LIMIT_CODES.has(visibleError.code) ? TEXT_ONLY_HARD_LIMIT_ACTION : '按错误提示检查输入或模型配置。',
+    review, delivery, error: visibleError,
+    next_action: nextAction,
     source_schema_version: '5.0.0', capabilities: { pause: { supported: false, reason: 'Alpha.2 capability' }, resume: { supported: false, reason: 'Alpha.2 capability' }, retry: { supported: false, reason: 'Alpha.2 capability' }, review: { supported: true, reason: null }, dictionary_snapshot: { supported: true, reason: null }, provided_transcript: { supported: true, reason: null } }, extensions: {},
   });
 }
@@ -1278,7 +1304,7 @@ export async function projectV5Result(directory: string, taskInput?: TaskRecordV
       const snapshot = await readStableJson(managed(directory, task.dictionary_snapshot.path), 'DICTIONARY_RECORD_INVALID') as ResolvedDictionarySnapshot;
       return { snapshots: task.dictionary_snapshot.resolved, conflict_count: snapshot.conflicts.length, match_count: snapshot.matched_entry_ids.length };
     })(), artifacts: view.artifacts,
-    review: { status: view.review.status, pending_count: view.review.pending_count, approved: ['finalized', 'not_required'].includes(view.review.status) },
+    review: { status: view.review.status, pending_count: view.review.pending_count, approved: ['finalized', 'not_required'].includes(view.review.status) }, delivery: view.delivery,
     calls: [{ provider: modelSnapshot.models.asr?.plugin_id ?? 'asr', capability: 'transcription', count: task.execution.provider_calls.asr.count, outcome: task.execution.provider_calls.asr.outcome }, { provider: modelSnapshot.models.chat.plugin_id, capability: 'calibration', count: task.execution.provider_calls.chat.count, outcome: task.execution.provider_calls.chat.outcome }],
     warnings: task.warnings, error: view.error, next_action: view.next_action, extensions: {},
   });

@@ -77,7 +77,8 @@
       "required": ["formats", "workspace_policy"],
       "properties": {
         "formats": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["srt", "report"] } },
-        "workspace_policy": { "const": "managed" }
+        "workspace_policy": { "const": "managed" },
+        "approved_srt_directory": { "$ref": "common.schema.json#/$defs/absolutePath" }
       }
     },
     "extensions": { "$ref": "common.schema.json#/$defs/extensions" }

@@ -21,6 +21,7 @@ import { parseReferenceSrt, type CalibratedSubtitleSegment, type CalibratedTrans
 import { sha256File } from './tasks.js';
 import { withOwnedLock } from './background/owned-lock.js';
 import { persistV5Task, readV5Task, verifyV5CalibrationSources, writeV5Result } from './exchange/runtime.js';
+import { deliverApprovedSrt, markDeliveryPendingReview } from './delivery.js';
 
 function managed(root: string, relative: string): string {
   const target = path.resolve(root, relative);
@@ -66,6 +67,7 @@ async function persistReviewState(root: string, review: ReviewRecordV1): Promise
   const task = await readV5Task(root);
   task.review = { status: mappedStatus(review), pending_count: review.counts.pending };
   task.artifacts.approved = review.approved_artifact ? { path: review.approved_artifact.path, sha256: review.approved_artifact.sha256, validation: 'passed' } : null;
+  if (!review.approved_artifact) markDeliveryPendingReview(task);
   await persistV5Task(root, task);
   await writeV5Result(root, task);
 }
@@ -127,6 +129,11 @@ export async function readVerifiedV5Review(root: string): Promise<ReviewRecordV1
   return review;
 }
 
+export async function deliverCurrentV5Review(rootInput: string): Promise<Awaited<ReturnType<typeof readV5Task>>> {
+  const root = path.resolve(rootInput);
+  return withLock(root, async () => deliverApprovedSrt(root, await readVerifiedV5Review(root)));
+}
+
 export async function decideV5ReviewChange(rootInput: string, input: { changeId: string; decision: ReviewDecision; text?: string; actor: ReviewActor; now?: () => Date }): Promise<ReviewRecordV1> {
   const root = path.resolve(rootInput);
   return withLock(root, async () => {
@@ -166,7 +173,11 @@ export async function finalizeV5Review(rootInput: string, now = () => new Date()
   const root = path.resolve(rootInput);
   return withLock(root, async () => {
     const task = await readV5Task(root); const review = await readVerifiedV5Review(root);
-    if (review.approved_artifact) return review;
+    if (review.approved_artifact) {
+      const latest = await readV5Task(root);
+      if (latest.delivery?.requested_directory) await deliverApprovedSrt(root, review, { throwOnFailure: false });
+      return review;
+    }
     if (review.counts.pending > 0) throw new MercuryError('REVIEW_PENDING_CHANGES', `还有 ${review.counts.pending} 项修改未决定，不能生成批准稿。`);
     const parsed = parseReferenceSrt(await readFile(managed(root, review.sources.calibrated_srt.path), 'utf8'));
     if (!parsed.ok) throw new MercuryError('REVIEW_SOURCE_INVALID', 'AI 校验字幕无法解析。');
@@ -179,6 +190,9 @@ export async function finalizeV5Review(rootInput: string, now = () => new Date()
     const validation = await validateSrtFile(target, { audioDurationMs: transcript.duration_ms ?? transcript.segments.at(-1)!.end_ms, expectedSegments: expected, mode: null, referenceSegments: null });
     if (!validation.valid) { await rm(target, { force: true }); throw new MercuryError('APPROVED_OUTPUT_VALIDATION_FAILED', validation.checks.filter((entry) => entry.status === 'failed').map((entry) => entry.message).join('；')); }
     const at = now().toISOString(); review.approved_artifact = { path: relative, sha256: await sha256File(target), segment_count: expected.length, generated_at: at, validation: 'passed' }; review.updated_at = at; review.status = review.changes.length ? 'approved' : 'not_required';
-    await writeReviewRecord(root, review); await persistReviewState(root, review); return review;
+    await writeReviewRecord(root, review); await persistReviewState(root, review);
+    const latest = await readV5Task(root);
+    if (latest.delivery?.requested_directory) await deliverApprovedSrt(root, review, { throwOnFailure: false });
+    return review;
   });
 }

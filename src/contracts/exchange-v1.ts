@@ -1,5 +1,6 @@
 import Ajv2020, { type ErrorObject, type ValidateFunction } from 'ajv/dist/2020.js';
 import addFormats from 'ajv-formats';
+import path from 'node:path';
 import commonSchema from '../../schemas/exchange/v1/common.schema.json' with { type: 'json' };
 import requestSchema from '../../schemas/exchange/v1/request.schema.json' with { type: 'json' };
 import taskSchema from '../../schemas/exchange/v1/task.schema.json' with { type: 'json' };
@@ -112,6 +113,13 @@ function semanticIssues(name: ExchangeContractName, value: any): ExchangeValidat
     if (value.inputs.media === null && value.calibration.mode === 'text-and-segmentation') {
       issues.push(issue('/calibration/mode', '无媒体时只能使用 text-only'));
     }
+    const deliveryDirectory = value.output.approved_srt_directory;
+    if (deliveryDirectory !== undefined) {
+      if (!path.isAbsolute(deliveryDirectory) || path.resolve(deliveryDirectory) !== deliveryDirectory || deliveryDirectory.split(path.sep).includes('~') || /[\u0000-\u001f\u007f]/u.test(deliveryDirectory)) {
+        issues.push(issue('/output/approved_srt_directory', '业务输出目录必须是规范化绝对路径，不能使用相对路径、~、控制字符或路径逃逸'));
+      }
+      if (!value.output.formats.includes('srt')) issues.push(issue('/output/formats', '请求业务 SRT 交付时 formats 必须包含 srt'));
+    }
   } else if (name === 'transcript') {
     let previousEnd = -1;
     const ids = new Set<string>();
@@ -161,6 +169,7 @@ function semanticIssues(name: ExchangeContractName, value: any): ExchangeValidat
     if (!terminal && value.worker.status === 'inactive' && value.status === 'running') issues.push(issue('/worker/status', 'running 任务不能确定声明 Worker inactive'));
     if (value.pause.allowed && !value.capabilities.pause.supported) issues.push(issue('/pause/allowed', '不支持 pause 时不能允许该动作'));
     if (value.retry.allowed && !value.capabilities.retry.supported) issues.push(issue('/retry/allowed', '不支持 retry 时不能允许该动作'));
+    if (value.delivery) issues.push(...deliveryIssues('/delivery', value.delivery));
   } else if (name === 'result') {
     if (value.transcription.mode === 'provided' && value.transcription.asr_call_count !== 0) {
       issues.push(issue('/transcription/asr_call_count', 'provided 转录的 ASR 调用数必须为 0'));
@@ -170,7 +179,28 @@ function semanticIssues(name: ExchangeContractName, value: any): ExchangeValidat
       if (artifact.exists !== (artifact.path !== null)) issues.push(issue(`/artifacts/${index}/path`, 'exists 必须与 path 是否存在一致'));
       if (!artifact.exists && artifact.sha256 !== null) issues.push(issue(`/artifacts/${index}/sha256`, '不存在的产物不能声明 hash'));
     }
+    if (value.delivery) issues.push(...deliveryIssues('/delivery', value.delivery));
   }
+  return issues;
+}
+
+function deliveryIssues(base: string, delivery: any): ExchangeValidationIssue[] {
+  const issues: ExchangeValidationIssue[] = [];
+  const add = (suffix: string, message: string) => issues.push(issue(`${base}${suffix}`, message));
+  const emptyCurrent = delivery.final_path === null && delivery.sha256 === null && delivery.delivered_at === null && delivery.review_revision === null;
+  if (['not_requested', 'unsupported'].includes(delivery.status)) {
+    if (delivery.requested_directory !== null || !emptyCurrent || delivery.validation !== 'unavailable' || delivery.error !== null || delivery.history.length !== 0) add('', `${delivery.status} 不能声明目录、当前交付、错误或历史`);
+  } else if (delivery.requested_directory === null) add('/requested_directory', `${delivery.status} 必须声明请求目录`);
+  if (delivery.status === 'pending_review' && (!emptyCurrent || delivery.validation !== 'unavailable' || delivery.error !== null)) add('', 'pending_review 不能把历史交付冒充当前 final');
+  if (delivery.status === 'ready' && (delivery.final_path === null || delivery.sha256 === null || delivery.review_revision === null || delivery.delivered_at !== null || delivery.validation !== 'unavailable' || delivery.error !== null)) add('', 'ready 必须固定当前 approved 的路径/hash/revision，且尚未声明交付成功');
+  if (delivery.status === 'delivered' && (delivery.final_path === null || delivery.sha256 === null || delivery.review_revision === null || delivery.delivered_at === null || delivery.validation !== 'passed' || delivery.error !== null)) add('', 'delivered 必须具有通过验证的当前路径/hash/revision/time 且无错误');
+  if (delivery.status === 'failed' && (delivery.validation !== 'unavailable' || delivery.error === null)) add('', 'failed 必须保留稳定交付错误且不能声明 passed');
+  const revisions = new Set<string>();
+  for (const [index, entry] of delivery.history.entries()) {
+    if (revisions.has(entry.review_revision)) add(`/history/${index}/review_revision`, '同一 review revision 只能记录一次交付事实');
+    revisions.add(entry.review_revision);
+  }
+  if (delivery.status === 'delivered' && !delivery.history.some((entry: any) => entry.path === delivery.final_path && entry.sha256 === delivery.sha256 && entry.review_revision === delivery.review_revision && entry.delivered_at === delivery.delivered_at)) add('/history', 'delivered 当前指针必须对应一条 history 事实');
   return issues;
 }
 

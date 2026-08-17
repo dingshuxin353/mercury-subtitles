@@ -126,6 +126,9 @@ describe('stable CLI v1 protocol and configuration', () => {
     const secretError = stableErrorFrom(new MercuryError('REQUEST_INVALID', `bad ${'Author'}ization: ${'Bear'}er ${'x'.repeat(40)}`, { exitCode: 2 })).error;
     expect(secretError.message).toContain('已脱敏');
     expect(JSON.stringify(secretError)).not.toContain('Bearer');
+    expect(stableErrorFrom(new MercuryError('DELIVERY_DIRECTORY_NOT_WRITABLE', '目录不可写', { exitCode: 2 })).error).toMatchObject({ category: 'input', retryability: 'after_user_action' });
+    expect(stableErrorFrom(new MercuryError('DELIVERY_PATH_UNSAFE', '目录不安全', { exitCode: 4 })).error).toMatchObject({ category: 'security', retryability: 'after_user_action' });
+    expect(stableErrorFrom(new MercuryError('DELIVERY_CONFLICT', '文件冲突', { exitCode: 3 })).error).toMatchObject({ category: 'conflict', retryability: 'after_user_action' });
   });
 
   it('uses a strict stable error envelope for bad machine arguments', async () => {

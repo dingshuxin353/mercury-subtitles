@@ -46,6 +46,7 @@ export interface ExchangeRequestV1 {
      */
     formats: ['srt' | 'report', ...('srt' | 'report')[]];
     workspace_policy: 'managed';
+    approved_srt_directory?: string;
   };
   extensions: Extensions;
 }

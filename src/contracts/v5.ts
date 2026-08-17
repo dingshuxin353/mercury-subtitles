@@ -57,6 +57,23 @@ function semanticIssues(value: TaskRecordV5): V5ValidationIssue[] {
   if (['failed', 'interrupted'].includes(value.status) && value.error === null) add('/error', `${value.status} 必须有稳定错误`);
   if (value.status === 'cancelled' && (value.artifacts.calibrated !== null || value.artifacts.approved !== null)) add('/artifacts', 'cancelled 不能发布 calibrated/approved');
   if (value.review.status === 'finalized' && value.artifacts.approved === null) add('/review/status', 'finalized 必须具有 approved 产物');
+  if (value.delivery) {
+    const delivery = value.delivery;
+    const emptyCurrent = delivery.final_path === null && delivery.sha256 === null && delivery.delivered_at === null && delivery.review_revision === null;
+    if (delivery.status === 'not_requested') {
+      if (delivery.requested_directory !== null || !emptyCurrent || delivery.validation !== 'unavailable' || delivery.error !== null || delivery.history.length !== 0) add('/delivery', 'not_requested 不能声明目录、当前交付、错误或历史');
+    } else if (delivery.requested_directory === null) add('/delivery/requested_directory', `${delivery.status} 必须声明请求目录`);
+    if (delivery.status === 'pending_review' && (!emptyCurrent || delivery.validation !== 'unavailable' || delivery.error !== null)) add('/delivery', 'pending_review 不能把历史交付冒充当前 final');
+    if (delivery.status === 'ready' && (delivery.final_path === null || delivery.sha256 === null || delivery.review_revision === null || delivery.delivered_at !== null || delivery.validation !== 'unavailable' || delivery.error !== null)) add('/delivery', 'ready 必须固定 approved 路径/hash/revision 且尚未交付');
+    if (delivery.status === 'delivered' && (delivery.final_path === null || delivery.sha256 === null || delivery.review_revision === null || delivery.delivered_at === null || delivery.validation !== 'passed' || delivery.error !== null)) add('/delivery', 'delivered 必须具有通过验证的当前路径/hash/revision/time');
+    if (delivery.status === 'failed' && (delivery.validation !== 'unavailable' || delivery.error === null)) add('/delivery', 'failed 必须保留稳定错误且不能声明 passed');
+    const revisions = new Set<string>();
+    for (const [index, entry] of delivery.history.entries()) {
+      if (revisions.has(entry.review_revision)) add(`/delivery/history/${index}/review_revision`, '同一 review revision 只能记录一次');
+      revisions.add(entry.review_revision);
+    }
+    if (delivery.status === 'delivered' && !delivery.history.some((entry) => entry.path === delivery.final_path && entry.sha256 === delivery.sha256 && entry.review_revision === delivery.review_revision && entry.delivered_at === delivery.delivered_at)) add('/delivery/history', '当前 delivered 指针必须对应 history 事实');
+  }
 
   for (const [role, call] of Object.entries(value.execution.provider_calls)) {
     if (call.state === 'not_started' && (call.count !== 0 || call.outcome !== 'not_dispatched' || call.evidence_ref !== null || call.evidence_sha256 !== null)) add(`/execution/provider_calls/${role}`, 'not_started 必须是零调用且无证据');
