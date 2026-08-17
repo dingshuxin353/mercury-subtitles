@@ -60,7 +60,7 @@ function semanticIssues(value: TaskRecordV5): V5ValidationIssue[] {
 
   for (const [role, call] of Object.entries(value.execution.provider_calls)) {
     if (call.state === 'not_started' && (call.count !== 0 || call.outcome !== 'not_dispatched' || call.evidence_ref !== null || call.evidence_sha256 !== null)) add(`/execution/provider_calls/${role}`, 'not_started 必须是零调用且无证据');
-    if (call.state === 'in_flight' && (call.count < 1 || call.outcome !== 'outcome_unknown' || call.evidence_ref !== null || call.evidence_sha256 !== null)) add(`/execution/provider_calls/${role}`, 'in_flight 必须保留 outcome_unknown 调用事实且不能伪造响应证据');
+    if (call.state === 'in_flight' && (call.count < 1 || call.outcome !== 'outcome_unknown')) add(`/execution/provider_calls/${role}`, 'in_flight 必须保留 outcome_unknown 调用事实');
     if (call.state === 'response_persisted' && (call.count < 1 || call.outcome !== 'response_persisted' || call.evidence_ref === null || call.evidence_sha256 === null)) add(`/execution/provider_calls/${role}`, 'response_persisted 必须具有路径与内容 hash 证据');
     if (call.state === 'terminal' && call.count > 0 && !['known_terminal', 'response_persisted'].includes(call.outcome)) add(`/execution/provider_calls/${role}`, 'terminal 调用必须有确定结果');
     if (call.state === 'terminal' && call.outcome === 'response_persisted' && (call.evidence_ref === null || call.evidence_sha256 === null)) add(`/execution/provider_calls/${role}`, 'response_persisted 终态必须保留路径与内容 hash 证据');

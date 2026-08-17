@@ -1040,6 +1040,31 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
       await writeStableJsonAtomic(path.join(directory, 'work/calibration-response.json'), calibration);
       const evidenceSha256 = await sha256File(path.join(directory, 'work/calibration-response.json'));
       task = await readV5Task(directory);
+      if (calibration.status === 'failed' && calibration.provider_outcome_certainty === 'outcome_unknown') {
+        const issue = calibration.errors[0]! as { message: string };
+        // A durable local failure artifact proves what Mercury observed, not
+        // what the Provider ultimately did. Preserve both facts: pin the audit
+        // evidence while the Provider call remains in_flight/outcome_unknown,
+        // and terminate the task as unsafe to replay.
+        task.execution.provider_calls.chat = {
+          state: 'in_flight',
+          count: 1,
+          outcome: 'outcome_unknown',
+          evidence_ref: 'work/calibration-response.json',
+          evidence_sha256: evidenceSha256,
+        };
+        task.execution.safe_checkpoint = null;
+        task.status = 'interrupted';
+        task.stage = null;
+        task.execution.ended_at = new Date().toISOString();
+        task.error = exchangeError(
+          'TASK_INTERRUPTED_PROVIDER_UNKNOWN',
+          'Chat 请求已发送，但结果无法确认。',
+          'outcome_unknown',
+          issue.message,
+        );
+        return commitTerminalThenDerive(directory, task, snapshot, calibration, fault);
+      }
       task.execution.provider_calls.chat = { state: 'response_persisted', count: 1, outcome: 'response_persisted', evidence_ref: 'work/calibration-response.json', evidence_sha256: evidenceSha256 };
       task.execution.safe_checkpoint = 'chat_response_persisted'; await persistV5Task(directory, task);
       await crashFault(fault, 'after_response_persisted', task);
@@ -1204,6 +1229,56 @@ export async function projectV5Result(directory: string, taskInput?: TaskRecordV
 
 export async function writeV5Result(directory: string, task: TaskRecordV5): Promise<void> { await writeStableJsonAtomic(path.join(directory, 'result.json'), await projectV5Result(directory, task)); }
 
+async function reconcileMisclassifiedChatOutcomeUnknown(
+  directory: string,
+  task: TaskRecordV5,
+): Promise<TaskRecordV5> {
+  const call = task.execution.provider_calls.chat;
+  if (task.status !== 'failed'
+    || call.state !== 'terminal'
+    || call.outcome !== 'response_persisted'
+    || !call.evidence_ref
+    || !call.evidence_sha256) return task;
+  try {
+    const snapshot = await readVerifiedV5ModelSnapshot(directory, task);
+    const calibration = assertChatEvidenceIdentity(
+      await readPinnedEvidence(directory, call, 'CALIBRATION_RESULT_INVALID'),
+      task,
+      snapshot,
+    );
+    if (calibration.status !== 'failed'
+      || calibration.provider_outcome_certainty !== 'outcome_unknown') return task;
+    const repaired = structuredClone(task);
+    repaired.status = 'interrupted';
+    repaired.stage = null;
+    repaired.execution.safe_checkpoint = null;
+    repaired.execution.provider_calls.chat = {
+      state: 'in_flight',
+      count: call.count,
+      outcome: 'outcome_unknown',
+      evidence_ref: call.evidence_ref,
+      evidence_sha256: call.evidence_sha256,
+    };
+    const issue = calibration.errors[0] as { message?: unknown } | undefined;
+    repaired.error = exchangeError(
+      'TASK_INTERRUPTED_PROVIDER_UNKNOWN',
+      'Chat 请求已发送，但结果无法确认。',
+      'outcome_unknown',
+      typeof issue?.message === 'string' ? issue.message : null,
+    );
+    repaired.artifacts.report = null;
+    repaired.identity.revision += 1;
+    repaired.updated_at = new Date().toISOString();
+    // This is an evidence-backed repair of an Alpha.1 development
+    // misclassification. Normal task transitions still go through
+    // persistV5Task and cannot replace one terminal state with another.
+    await writeStableJsonAtomic(path.join(directory, 'task.json'), assertV5TaskRecord(repaired));
+    return repaired;
+  } catch {
+    return task;
+  }
+}
+
 export async function claimV5Job(workspace: string, job: BackgroundJobV1, workerId: string): Promise<TaskRecordV5 | null> {
   const directory = taskRoot(workspace, job.task_directory);
   return withTaskTransitionLock(directory, async () => {
@@ -1264,12 +1339,13 @@ export async function readV5Events(directory: string, after = 0): Promise<Exchan
 export async function auditV5Job(workspace: string, listed: BackgroundJobV1): Promise<void> {
   const directory = taskRoot(workspace, listed.task_directory);
   await withTaskTransitionLock(directory, async () => {
-    const task = await readV5Task(directory); const job = await readJob(workspace, listed.task_id);
+    let task = await readV5Task(directory); const job = await readJob(workspace, listed.task_id);
     const eventRevision = (await stableEvents(directory)).at(-1)?.task_revision ?? 0;
     if (eventRevision > task.identity.revision) { task.identity.revision = eventRevision; task.updated_at = new Date().toISOString(); await persistV5Task(directory, task); }
     if (TERMINAL.has(task.status)) {
+      task = await reconcileMisclassifiedChatOutcomeUnknown(directory, task);
       let current = await ensureV5TerminalReport(directory, await readV5Task(directory));
-      if (task.status === 'completed') {
+      if (current.status === 'completed') {
         const reviewRuntime = await import('../review-v5.js');
         const review = await reviewRuntime.initializeV5Review(directory);
         if (review.status === 'not_required') await reviewRuntime.finalizeV5Review(directory);

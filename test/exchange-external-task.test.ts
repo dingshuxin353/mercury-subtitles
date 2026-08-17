@@ -628,6 +628,106 @@ describe('Exchange v1 external transcript task', () => {
     expect(sent).toEqual(bytes);
   });
 
+  it('keeps a persisted Gemini outcome-unknown artifact interrupted and never replays it', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'provided-strong-unknown.mp3');
+    const bytes = Buffer.alloc(417 * 80);
+    for (let offset = 0; offset < bytes.length; offset += 417) bytes.set([0xff, 0xfb, 0x90, 0x64], offset);
+    await writeFile(audio, bytes);
+    const submitted = await submitExchangeRequest(input.workspace, {
+      ...input.request,
+      request_id: 'request-provided-strong-outcome-unknown',
+      inputs: { ...input.request.inputs, media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' } },
+    });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    await forceStrongEvidence(directory, true);
+    let providerCalls = 0;
+    const dependencies = {
+      createVertexClient: () => ({
+        interactions: { create: async () => { throw new Error('unexpected'); } },
+        models: { generateContent: async () => {
+          providerCalls += 1;
+          throw new Error('fetch failed', { cause: new Error('other side closed') });
+        } },
+      }),
+    };
+    await runWorker(input.workspace, dependencies);
+    const task = await readV5Task(directory);
+    expect(task.status).toBe('interrupted');
+    expect(task.execution.provider_calls.chat).toMatchObject({
+      state: 'in_flight', count: 1, outcome: 'outcome_unknown',
+      evidence_ref: 'work/calibration-response.json',
+    });
+    expect(task.execution.provider_calls.chat.evidence_sha256).toBe(sha(await readFile(path.join(directory, 'work/calibration-response.json'))));
+    expect((await stat(path.join(directory, 'work/calibration-response.json'))).mode & 0o777).toBe(0o600);
+    expect(task.error).toMatchObject({ code: 'TASK_INTERRUPTED_PROVIDER_UNKNOWN', retryability: 'unsafe' });
+    const view = await stableTaskView(input.workspace, await findTaskReadOnly(input.workspace, task.identity.task_id));
+    const result = await stableTaskResult(input.workspace, await findTaskReadOnly(input.workspace, task.identity.task_id));
+    expect(view).toMatchObject({ status: 'interrupted', retry: { allowed: false }, error: { retryability: 'unsafe' } });
+    expect(result).toMatchObject({ status: 'interrupted', error: { retryability: 'unsafe' } });
+    expect(await runWorker(input.workspace, dependencies)).toBe('acquired');
+    expect(providerCalls).toBe(1);
+
+    // Reproduce the pre-fix on-disk classification and prove a later Worker
+    // audit corrects only the certainty metadata from the pinned artifact.
+    const misclassified = JSON.parse(await readFile(path.join(directory, 'task.json'), 'utf8'));
+    misclassified.status = 'failed';
+    misclassified.execution.provider_calls.chat.state = 'terminal';
+    misclassified.execution.provider_calls.chat.outcome = 'response_persisted';
+    misclassified.error = {
+      ...misclassified.error,
+      code: 'GEMINI_MODEL_CALL_FAILED',
+      provider_outcome: 'response_persisted',
+      retryability: 'after_user_action',
+      remediation: ['检查模型配置后使用新的 request ID 创建任务。'],
+    };
+    misclassified.identity.revision += 1;
+    await writeFile(path.join(directory, 'task.json'), canonicalJson(misclassified), { mode: 0o600 });
+    await runWorker(input.workspace, dependencies);
+    const repaired = await readV5Task(directory);
+    expect(repaired).toMatchObject({
+      status: 'interrupted',
+      execution: { provider_calls: { chat: { state: 'in_flight', count: 1, outcome: 'outcome_unknown', evidence_ref: 'work/calibration-response.json' } } },
+      error: { code: 'TASK_INTERRUPTED_PROVIDER_UNKNOWN', retryability: 'unsafe' },
+    });
+    expect(providerCalls).toBe(1);
+  });
+
+  it('keeps a persisted Gemini known response terminal while outcome-unknown semantics stay separate', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'provided-strong-known.mp3');
+    const bytes = Buffer.alloc(417 * 80);
+    for (let offset = 0; offset < bytes.length; offset += 417) bytes.set([0xff, 0xfb, 0x90, 0x64], offset);
+    await writeFile(audio, bytes);
+    const submitted = await submitExchangeRequest(input.workspace, {
+      ...input.request,
+      request_id: 'request-provided-strong-known-terminal',
+      inputs: { ...input.request.inputs, media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' } },
+    });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    await forceStrongEvidence(directory, true);
+    let providerCalls = 0;
+    const dependencies = {
+      createVertexClient: () => ({
+        interactions: { create: async () => { throw new Error('unexpected'); } },
+        models: { generateContent: async () => {
+          providerCalls += 1;
+          throw new Error('400 INVALID_ARGUMENT');
+        } },
+      }),
+    };
+    await runWorker(input.workspace, dependencies);
+    const task = await readV5Task(directory);
+    expect(task.status).toBe('failed');
+    expect(task.execution.provider_calls.chat).toMatchObject({
+      state: 'terminal', count: 1, outcome: 'response_persisted',
+      evidence_ref: 'work/calibration-response.json',
+    });
+    expect(task.error).toMatchObject({ code: 'GEMINI_VERTEX_REQUEST_INVALID', provider_outcome: 'response_persisted' });
+    expect(await runWorker(input.workspace, dependencies)).toBe('acquired');
+    expect(providerCalls).toBe(1);
+  });
+
   it('rejects a tampered provided calibration transcript bridge before Chat dispatch', async () => {
     const input = await prepared();
     input.request.request_id = 'request-provided-bridge-transcript-tamper';
