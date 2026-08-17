@@ -1921,10 +1921,10 @@ async function validateV5ResumeCheckpoint(directory: string, task: TaskRecordV5)
   }
   if (task.artifacts.transcribed) await verifyInternalArtifact(directory, task.artifacts.transcribed, 'TASK_RESUME_UNSAFE');
   if (task.execution.attempt_id !== null) {
-    const records = await readRetryLedger(directory);
-    const attempt = records.find((entry) => entry.contract === 'mercury.attempt/v1' && entry.attempt_id === task.execution.attempt_id);
-    if (!attempt || attempt.task_id !== task.identity.task_id || attempt.number !== task.execution.attempt_count) {
-      throw new MercuryError('TASK_RESUME_UNSAFE', 'attempt 账本与当前安全检查点不一致。', { exitCode: 3 });
+    try { await readVerifiedRetryLedger(directory, task); }
+    catch (error) {
+      if (error instanceof MercuryError) throw new MercuryError('TASK_RESUME_UNSAFE', `attempt/Provider 账本未通过完整历史校验：${error.code}。`, { exitCode: 3 });
+      throw error;
     }
   }
 }
@@ -2185,14 +2185,16 @@ async function readRetryLedgerReadOnly(directory: string): Promise<RetryLedgerRe
   } finally { await handle?.close().catch(() => undefined); }
 }
 
-function assertRetryLedgerIdentity(records: RetryLedgerRecord[], task: TaskRecordV5): void {
+function assertRetryLedgerIdentity(records: RetryLedgerRecord[], task: TaskRecordV5, snapshot: ModelSnapshotV3): void {
   const invalid = (message: string): never => { throw new MercuryError('RETRY_LEDGER_INVALID', `${message}；未执行 retry 或 Provider 调用。`); };
   const number = (value: unknown, label: string): number => {
     if (!Number.isInteger(value) || Number(value) < 0) invalid(`${label} 不是非负整数`);
     return Number(value);
   };
   const same = (left: unknown, right: unknown): boolean => canonicalJson(left) === canonicalJson(right);
-  if (!task.execution.attempt_id || task.execution.attempt_count < 1) invalid('当前终态任务缺少 attempt identity');
+  if (!task.execution.attempt_id || task.execution.attempt_count < 1) invalid('当前任务缺少 attempt identity');
+  const activeCurrent = !TERMINAL.has(task.status);
+  const completedAttemptCount = task.execution.attempt_count - (activeCurrent ? 1 : 0);
   if (records.length === 0) invalid('当前任务缺少 append-only attempt 账本');
   const knownContracts = new Set([
     'mercury.attempt/v1', 'mercury.attempt-result/v1', 'mercury.attempt-result-correction/v1',
@@ -2215,7 +2217,7 @@ function assertRetryLedgerIdentity(records: RetryLedgerRecord[], task: TaskRecor
     if (index > 0 && (start.source !== 'retry' || typeof start.retry_plan_id !== 'string')) invalid('后续 attempt 缺少 retry plan 引用');
   }
   const pendingStarts = starts.length - task.execution.attempt_count;
-  if (pendingStarts < 0 || pendingStarts > 1) invalid('attempt 数量与 task attempt_count 不一致');
+  if (pendingStarts < 0 || pendingStarts > (activeCurrent ? 0 : 1)) invalid('attempt 数量与 task attempt_count 不一致');
   const currentStart = starts[task.execution.attempt_count - 1];
   if (!currentStart || currentStart.attempt_id !== task.execution.attempt_id) invalid('当前 task attempt 与 append-only 起点不一致');
   if (retries.length !== Math.max(0, starts.length - 1)) invalid('retry 计划事实数量与 retry attempt 不一致');
@@ -2239,14 +2241,18 @@ function assertRetryLedgerIdentity(records: RetryLedgerRecord[], task: TaskRecor
       || !same(retry.estimated_calls, plan!.estimated_calls)) invalid('retry 计划 ID、revision、checkpoint 或执行内容不闭合');
   }
   if (retries.some((retry) => typeof retry.plan_id !== 'string' || !matchedRetryIds.has(retry.plan_id))) invalid('retry 账本包含重复或孤儿计划事实');
-  for (let number = 1; number <= task.execution.attempt_count; number += 1) {
+  for (let number = 1; number <= completedAttemptCount; number += 1) {
     const start = starts[number - 1]!;
     const matching = results.filter((record) => record.attempt_id === start.attempt_id);
     if (matching.length !== 1 || matching[0]!.number !== number) invalid('attempt 终态结果缺失、重复或序号不一致');
   }
-  if (results.length !== task.execution.attempt_count || results.some((record) => !startIds.has(String(record.attempt_id)))) invalid('attempt result 包含重复或孤儿事实');
+  if (results.length !== completedAttemptCount || results.some((record) => !startIds.has(String(record.attempt_id)))) invalid('attempt result 包含重复或孤儿事实');
   if (corrections.some((record) => !startIds.has(String(record.attempt_id)))) invalid('attempt correction 引用了未知 attempt');
-  const attemptFacts = starts.slice(0, task.execution.attempt_count).map((start, index) => {
+  const startCounts = (start: RetryLedgerRecord, index: number) => ({
+    asr: number(start.starting_asr_call_count ?? start.asr_call_count, `attempt ${index + 1} ASR 起始计数`),
+    chat: number(start.starting_chat_call_count ?? start.chat_call_count, `attempt ${index + 1} Chat 起始计数`),
+  });
+  const attemptFacts = starts.slice(0, completedAttemptCount).map((start, index) => {
     const result = results.find((record) => record.attempt_id === start.attempt_id)!;
     const attemptCorrections = corrections.filter((record) => record.attempt_id === start.attempt_id);
     if (attemptCorrections.length > 1) invalid('attempt correction 重复');
@@ -2254,10 +2260,7 @@ function assertRetryLedgerIdentity(records: RetryLedgerRecord[], task: TaskRecor
     if (correction && correction.supersedes_status !== result.status) invalid('attempt correction 未指向原始终态');
     const status = correction?.status ?? result.status;
     const errorCode = correction?.reason_code ?? result.error_code ?? null;
-    const starting = {
-      asr: number(start.starting_asr_call_count ?? start.asr_call_count, `attempt ${index + 1} ASR 起始计数`),
-      chat: number(start.starting_chat_call_count ?? start.chat_call_count, `attempt ${index + 1} Chat 起始计数`),
-    };
+    const starting = startCounts(start, index);
     const resultStarting = result.starting_call_counts as { asr?: unknown; chat?: unknown } | undefined;
     const endingSource = result.ending_call_counts as { asr?: unknown; chat?: unknown } | undefined;
     const deltas = result.new_call_counts as { asr?: unknown; chat?: unknown } | undefined;
@@ -2278,13 +2281,26 @@ function assertRetryLedgerIdentity(records: RetryLedgerRecord[], task: TaskRecor
       const previousError = retry.previous_error as { code?: unknown } | null | undefined;
       if (retry.previous_status !== status || (previousError?.code ?? null) !== errorCode) invalid('retry 事实未固定前一 attempt 的有效终态/错误');
     }
-    return { start, result, status, errorCode, starting, ending };
+    return { start, result, status, errorCode, starting, ending, active: false as const };
   });
-  const currentFacts = attemptFacts.at(-1)!;
-  if (currentFacts.status !== task.status || currentFacts.errorCode !== (task.error?.code ?? null)) invalid('当前 attempt 有效终态/错误与 task 不一致');
-  if (currentFacts.ending.asr !== task.execution.provider_calls.asr.count || currentFacts.ending.chat !== task.execution.provider_calls.chat.count) invalid('当前 attempt Provider 计数与 task 不一致');
-  const currentOutcomes = currentFacts.result.provider_outcomes as { asr?: unknown; chat?: unknown } | undefined;
-  if (!currentOutcomes || currentOutcomes.asr !== task.execution.provider_calls.asr.outcome || currentOutcomes.chat !== task.execution.provider_calls.chat.outcome) invalid('当前 attempt Provider outcome 与 task 不一致');
+  const activeFacts = activeCurrent ? (() => {
+    const start = starts[task.execution.attempt_count - 1]!; const starting = startCounts(start, task.execution.attempt_count - 1);
+    if (attemptFacts.length > 0) {
+      const prior = attemptFacts.at(-1)!;
+      if (starting.asr !== prior.ending.asr || starting.chat !== prior.ending.chat) invalid('active attempt 与历史 Provider 计数不连续');
+    }
+    const ending = { asr: task.execution.provider_calls.asr.count, chat: task.execution.provider_calls.chat.count };
+    if (ending.asr < starting.asr || ending.chat < starting.chat) invalid('active attempt Provider 计数回退');
+    return { start, result: null, status: null, errorCode: null, starting, ending, active: true as const };
+  })() : null;
+  const allAttemptFacts = activeFacts ? [...attemptFacts, activeFacts] : attemptFacts;
+  if (!activeCurrent) {
+    const currentFacts = attemptFacts.at(-1)!;
+    if (currentFacts.status !== task.status || currentFacts.errorCode !== (task.error?.code ?? null)) invalid('当前 attempt 有效终态/错误与 task 不一致');
+    if (currentFacts.ending.asr !== task.execution.provider_calls.asr.count || currentFacts.ending.chat !== task.execution.provider_calls.chat.count) invalid('当前 attempt Provider 计数与 task 不一致');
+    const currentOutcomes = currentFacts.result.provider_outcomes as { asr?: unknown; chat?: unknown } | undefined;
+    if (!currentOutcomes || currentOutcomes.asr !== task.execution.provider_calls.asr.outcome || currentOutcomes.chat !== task.execution.provider_calls.chat.outcome) invalid('当前 attempt Provider outcome 与 task 不一致');
+  }
   if (calls.some((record) => !startIds.has(String(record.attempt_id)))) invalid('Provider call 引用了未知 attempt');
   for (const role of ['asr', 'chat'] as const) {
     const roleCalls = calls.filter((record) => record.role === role);
@@ -2299,31 +2315,47 @@ function assertRetryLedgerIdentity(records: RetryLedgerRecord[], task: TaskRecor
     for (const [callNumber, phases] of groupedByNumber) {
       const callIds = new Set(phases.map((record) => record.call_id));
       if (callIds.size !== 1) invalid('同一 Provider call_number 对应多个 call ID');
-      if (phases.filter((record) => record.phase === 'dispatched').length !== 1 || phases.filter((record) => record.phase === 'terminal').length !== 1) invalid('Provider call phase 不完整或重复');
+      if (phases.filter((record) => record.phase === 'dispatched').length !== 1 || phases.filter((record) => record.phase === 'terminal').length > 1) invalid('Provider call phase 不完整或重复');
       if (phases.filter((record) => record.phase === 'response_persisted').length > 1) invalid('Provider response phase 重复');
       const order = phases.map((record) => ({ dispatched: 1, response_persisted: 2, terminal: 3 })[String(record.phase)] ?? 0);
       if (order.includes(0) || order.some((value, index) => index > 0 && value <= order[index - 1]!)) invalid('Provider call phase 顺序无效');
-      const attempt = attemptFacts.find((facts) => callNumber > facts.starting[role] && callNumber <= facts.ending[role]);
+      const attempt = allAttemptFacts.find((facts) => callNumber > facts.starting[role] && callNumber <= facts.ending[role]);
       if (!attempt || phases.some((record) => record.attempt_id !== attempt!.start.attempt_id)) invalid('Provider call 未落在唯一历史 attempt 计数区间');
       const expectedCapability = role === 'asr' ? 'transcription' : 'calibration';
-      const expectedModelRef = task.execution.provider_calls[role].model_snapshot_entry_ref;
+      const expectedModelRef = role === 'asr' ? snapshot.models.asr?.snapshot_entry_id ?? null : snapshot.models.chat.snapshot_entry_id;
       if (!expectedModelRef || phases.some((record) => record.capability !== expectedCapability || record.model_snapshot_entry_ref !== expectedModelRef)) invalid('历史 Provider call 能力或模型 identity 不一致');
-      const terminal = phases.find((record) => record.phase === 'terminal')!;
-      const outcomes = attempt!.result.provider_outcomes as { asr?: unknown; chat?: unknown };
-      const evidence = attempt!.result.response_evidence as { asr?: unknown; chat?: unknown };
-      if (terminal.outcome !== outcomes[role] || terminal.evidence_sha256 !== evidence[role]) invalid('历史 Provider terminal outcome/evidence 与 attempt result 不一致');
-      if (callNumber === total) {
+      const terminal = phases.find((record) => record.phase === 'terminal');
+      if (!attempt!.active) {
+        if (!terminal) invalid('历史 Provider call 缺少 terminal phase');
+        const outcomes = attempt!.result!.provider_outcomes as { asr?: unknown; chat?: unknown };
+        const evidence = attempt!.result!.response_evidence as { asr?: unknown; chat?: unknown };
+        if (terminal!.outcome !== outcomes[role] || terminal!.evidence_sha256 !== evidence[role]) invalid('历史 Provider terminal outcome/evidence 与 attempt result 不一致');
+      } else {
         const currentCall = task.execution.provider_calls[role];
-        if (terminal.call_id !== currentCall.call_id || terminal.outcome !== currentCall.outcome
-          || terminal.evidence_ref !== currentCall.evidence_ref || terminal.evidence_sha256 !== currentCall.evidence_sha256) invalid(`当前 ${role} Provider call 与 task 不一致`);
+        const responseCount = phases.filter((record) => record.phase === 'response_persisted').length;
+        const terminalCount = terminal ? 1 : 0;
+        if (callNumber !== total || phases.some((record) => record.call_id !== currentCall.call_id)
+          || (currentCall.state === 'in_flight' && (responseCount !== 0 || terminalCount !== 0))
+          || (currentCall.state === 'response_persisted' && (responseCount !== 1 || terminalCount !== 0))
+          || (currentCall.state === 'terminal' && terminalCount !== 1)) invalid('active attempt Provider phase 与 task checkpoint 不一致');
+        const latest = phases.at(-1)!;
+        if (currentCall.state !== 'in_flight' && (latest.evidence_ref !== currentCall.evidence_ref || latest.evidence_sha256 !== currentCall.evidence_sha256)) invalid('active attempt Provider evidence 与 task 不一致');
+      }
+      if (!activeCurrent && callNumber === total && !attempt!.active) {
+        const currentCall = task.execution.provider_calls[role];
+        if (terminal!.call_id !== currentCall.call_id || terminal!.outcome !== currentCall.outcome
+          || terminal!.evidence_ref !== currentCall.evidence_ref || terminal!.evidence_sha256 !== currentCall.evidence_sha256) invalid(`当前 ${role} Provider call 与 task 不一致`);
       }
     }
   }
 }
 
 async function readVerifiedRetryLedger(directory: string, task: TaskRecordV5): Promise<RetryLedgerRecord[]> {
-  const records = await readRetryLedgerReadOnly(directory);
-  assertRetryLedgerIdentity(records, task);
+  const [records, snapshot] = await Promise.all([
+    readRetryLedgerReadOnly(directory),
+    readVerifiedV5ModelSnapshot(directory, task),
+  ]);
+  assertRetryLedgerIdentity(records, task, snapshot);
   return records;
 }
 
@@ -2334,7 +2366,7 @@ async function readRetryLedger(directory: string, task?: TaskRecordV5): Promise<
     throw error;
   });
   const records = await readRetryLedgerReadOnly(directory);
-  if (task) assertRetryLedgerIdentity(records, task);
+  if (task) assertRetryLedgerIdentity(records, task, await readVerifiedV5ModelSnapshot(directory, task));
   return records;
 }
 
