@@ -212,9 +212,22 @@ describe('V02-D004 packaged Mercury skill', () => {
     expect(skill).toContain('references/commands.md');
     expect(skill).toContain('Never call a Provider directly');
     expect(skill).toContain('Never ask the user to paste a key');
+    expect(skill).toContain('`resume.allowed`');
     expect(skill).not.toContain('TODO');
     for (const reference of ['commands.md', 'task-states.md', 'review.md', 'troubleshooting.md']) {
       expect((await readFile(path.join(source, 'references', reference), 'utf8')).length).toBeGreaterThan(200);
     }
+    const commands = await readFile(path.join(source, 'references', 'commands.md'), 'utf8');
+    expect(commands).toContain('config status.data.defaults');
+    expect(commands).toContain('config status.data.models[].model_id');
+    expect(commands).toContain('Never use `provider`, `name`, or `category` as a model ID');
+    expect(commands).toContain('derive a new stable request ID');
+    expect(commands).toContain('`resume.allowed`');
+    const troubleshooting = await readFile(path.join(source, 'references', 'troubleshooting.md'), 'utf8');
+    expect(troubleshooting).toContain('If `approved_srt.exists` is false, do not call `task deliver`');
+    expect(troubleshooting).toContain('never reuse the conflicting ID or choose a random replacement');
+    const taskStates = await readFile(path.join(source, 'references', 'task-states.md'), 'utf8');
+    expect(taskStates).toContain('`resume.allowed` is true');
+    expect(taskStates).toContain('not permission to act');
   });
 });

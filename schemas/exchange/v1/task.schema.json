@@ -24,6 +24,7 @@
       }
     },
     "pause": { "$ref": "#/$defs/actionCapability" },
+    "resume": { "$ref": "#/$defs/actionCapability" },
     "cancel": { "$ref": "#/$defs/actionCapability" },
     "retry": { "$ref": "#/$defs/actionCapability" },
     "attempt": {

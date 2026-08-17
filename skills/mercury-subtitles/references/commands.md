@@ -17,6 +17,8 @@ mercury dictionary show <dictionary-id> --json
 
 `config status` exposes only non-sensitive defaults/readiness. If not configured/current/ready, send the user to interactive `mercury` → 模型中心. Do not inspect config files.
 
+For `models.asr` and `models.chat`, copy only an exact Mercury model instance ID from `config status.data.defaults` or a ready `config status.data.models[].model_id`. Never use `provider`, `name`, or `category` as a model ID. If the selected model ID changes after a request was derived, that is a new logical request: derive a new stable request ID and write a new request file; never reuse the old ID.
+
 ## Build and submit Exchange request v1
 
 Create a private temporary JSON file (0600). `request_id` must be stable and non-random: hash a stable Agent/user logical-run key together with the exact inspected input hashes, selected model IDs, mode, dictionary references and delivery directory; use `req-` plus 40 lowercase hex characters. Record the ID and file path before submit. Never put transcript text or credentials in the logical key.
@@ -75,7 +77,7 @@ mercury task retry <task-id> --plan <plan-id> --json
 mercury task cancel <task-id> --json
 ```
 
-Pause/resume are same-attempt operations. Retry creates one append-only attempt and may add the exact Provider calls shown in the plan. `retry-plan` is read-only: show its checkpoint, reuse/discard lists, call estimates, models, risk, and reason before asking permission to execute. Never execute a disallowed/stale/expired/unknown-outcome plan.
+Use the task's current `pause.allowed`, `resume.allowed`, and `retry.allowed` fields, not contract-level `capabilities.*.supported`, to decide whether an action is currently valid. Pause/resume are same-attempt operations. Retry creates one append-only attempt and may add the exact Provider calls shown in the plan. `retry-plan` is read-only: show its checkpoint, reuse/discard lists, call estimates, models, risk, and reason before asking permission to execute. Never execute a disallowed/stale/expired/unknown-outcome plan.
 
 ## Review and final delivery
 

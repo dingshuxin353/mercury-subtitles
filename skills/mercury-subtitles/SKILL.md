@@ -13,7 +13,7 @@ Use only `mercury.cli/v1` machine commands. Never call a Provider directly. Neve
 2. Confirm whether an external SRT/VTT/JSON is `transcript_source` (skip ASR) or `reference` (still run ASR). Confirm any dictionary scope and any absolute approved-SRT delivery directory.
 3. Derive and record one stable non-sensitive request ID from the logical user request plus the exact inspected hashes, modes, model IDs, dictionary revisions, and delivery directory. Never use a random ID. Write a 0600 request file following [commands.md](references/commands.md), then submit it once.
 4. Return the task ID immediately. Use only stable status/list/watch/result queries; queries never wake a Worker.
-5. Use pause/resume/retry only according to Mercury's advertised action fields and [task-states.md](references/task-states.md). Always show a retry plan before executing it.
+5. Use pause/resume/retry only according to the task's current `pause.allowed`, `resume.allowed`, and `retry.allowed` fields—not contract-level support—and [task-states.md](references/task-states.md). Always show a retry plan before executing it.
 6. After completion, follow [review.md](references/review.md). Only `approved_srt` is final. If delivery was requested, use the projected delivery state and local-only `task deliver` recovery.
 
 Read [commands.md](references/commands.md) for exact commands/request shape. Read [task-states.md](references/task-states.md) before any control or recovery action. Read [review.md](references/review.md) for decisions/finalize. Read [troubleshooting.md](references/troubleshooting.md) only after a structured failure.

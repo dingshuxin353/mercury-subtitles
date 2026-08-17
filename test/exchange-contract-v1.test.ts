@@ -305,10 +305,14 @@ describe('stable storage and history projection', () => {
     expect(validateExchangeContract('task', task).valid).toBe(true);
     expect(validateExchangeContract('result', result).valid).toBe(true);
     expect(task.request_id).toBeNull();
+    expect(task.resume).toEqual({ allowed: false, reason: '此历史任务没有 Alpha.2 安全检查点，不能恢复。' });
     expect(task.capabilities.dictionary_snapshot.supported).toBe(false);
     expect(result.transcription.asr_call_count).toBeNull();
     expect(result.dictionaries.snapshots).toEqual([]);
     expect(task.delivery).toMatchObject({ status: 'unsupported', requested_directory: null, history: [] });
     expect(result.delivery).toEqual(task.delivery);
+    const oldTaskWithoutCurrentResume = structuredClone(task) as typeof task & { resume?: unknown };
+    delete oldTaskWithoutCurrentResume.resume;
+    expect(validateExchangeContract('task', oldTaskWithoutCurrentResume).valid).toBe(true);
   });
 });

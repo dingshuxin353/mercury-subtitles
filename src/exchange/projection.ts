@@ -60,6 +60,7 @@ export function projectMachineTaskToExchangeTask(
     progress: null,
     worker: { status: status === 'running' ? 'unknown' : 'inactive', heartbeat_at: null },
     pause: { allowed: false, reason: '0.3.0-alpha.1 尚未提供暂停；能力发现会明确返回 unsupported。' },
+    resume: { allowed: false, reason: '此历史任务没有 Alpha.2 安全检查点，不能恢复。' },
     cancel: { allowed: ['queued', 'running'].includes(status), reason: ['queued', 'running'].includes(status) ? null : '当前状态不能取消。' },
     retry: { allowed: false, reason: '0.3.0-alpha.1 尚未提供安全重试。' },
     attempt: { attempt_id: null, count: status === 'queued' ? 0 : 1 },

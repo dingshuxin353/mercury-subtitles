@@ -128,6 +128,12 @@ export async function stableRetryTask(workspaceRoot: string, record: CompatibleT
 
 export async function stableDeliverTask(workspaceRoot: string, record: CompatibleTask): Promise<{ task: ExchangeTaskV1; result: ExchangeResultV1 }> {
   if (!('identity' in record)) throw new MercuryError('CONTRACT_UNSUPPORTED', '此历史任务不支持业务目录交付；查询未做任何写入。', { exitCode: 5 });
+  if (record.status !== 'completed' || !record.artifacts.approved) {
+    throw new MercuryError('DELIVERY_NOT_READY', '当前任务没有可交付的最终批准字幕；业务目录不会产生新文件。', {
+      exitCode: 3,
+      remediation: '请按任务主错误处理，或在 completed 任务中先完成审阅并 finalize；不要执行 task deliver，也不要重放当前任务。',
+    });
+  }
   const directory = path.join(workspaceRoot, 'tasks', record.identity.task_directory);
   const delivered = await deliverCurrentV5Review(directory);
   return { task: await projectV5Task(directory, delivered), result: await projectV5Result(directory, delivered) };

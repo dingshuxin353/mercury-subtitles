@@ -22,6 +22,7 @@ export interface ExchangeTaskV1 {
     heartbeat_at: null | string;
   };
   pause: ActionCapability;
+  resume?: ActionCapability;
   cancel: ActionCapability;
   retry: ActionCapability;
   attempt: {

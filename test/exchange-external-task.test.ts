@@ -267,6 +267,7 @@ describe('Exchange v1 external transcript task', () => {
     const source = path.join(input.home, 'long-provided.vtt');
     await writeFile(source, sourceText);
     input.request.request_id = 'request-long-provided-without-reference';
+    input.request.output.approved_srt_directory = path.join(input.home, 'business-final');
     input.request.inputs.transcript = { path: source, sha256: sha(sourceText), format: 'vtt', role: 'transcript_source' };
     const submitted = await submitExchangeRequest(input.workspace, input.request);
     const calls: string[] = [];
@@ -307,7 +308,38 @@ describe('Exchange v1 external transcript task', () => {
       expect(projected.error?.message).toContain('24 字或两行');
       expect(projected.next_action).toBe('请依据真实时间边界把该 cue/segment 拆成不超过 24 字且不超过两行的合规片段，并使用新的 request ID 创建任务；不要重放当前任务。');
       expect(projected.next_action).not.toContain('模型配置');
+      if ('capabilities' in projected) {
+        expect(projected).toMatchObject({
+          capabilities: { pause: { supported: true }, resume: { supported: true }, retry: { supported: true } },
+          pause: { allowed: false, reason: '任务状态 failed 不能暂停。' },
+          resume: { allowed: false, reason: '任务状态 failed 不能恢复。' },
+          retry: { allowed: false, reason: expect.stringContaining('输入、配置或安全问题') },
+          delivery: {
+            status: 'failed', final_path: null,
+            error: {
+              code: 'DELIVERY_NOT_READY',
+              remediation: ['当前任务没有可交付的最终批准字幕。请按任务主错误处理；不要执行 task deliver，也不要重放当前任务。'],
+            },
+            next_action: expect.stringContaining('不能用 task deliver'),
+          },
+        });
+      }
     }
+    const deliverOutput: string[] = [];
+    expect(await runCli(['task', 'deliver', task.identity.task_id, '--json'], {
+      homeDirectory: input.home,
+      stdout: (value) => deliverOutput.push(value),
+      stderr: () => undefined,
+    })).toBe(3);
+    expect(JSON.parse(deliverOutput[0]!)).toMatchObject({
+      contract: 'mercury.cli/v1', command: 'task.deliver', ok: false,
+      error: {
+        code: 'DELIVERY_NOT_READY', category: 'conflict', retryability: 'after_user_action',
+        message: '当前任务没有可交付的最终批准字幕；业务目录不会产生新文件。',
+        remediation: ['请按任务主错误处理，或在 completed 任务中先完成审阅并 finalize；不要执行 task deliver，也不要重放当前任务。'],
+      },
+    });
+    await expect(lstat(path.join(input.home, 'business-final'))).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await directoryManifest(directory)).toEqual(before);
   });
 
@@ -1883,7 +1915,7 @@ describe('Exchange v1 external transcript task', () => {
     expect(paused).toMatchObject({ pending: false, task: { status: 'paused', execution: { safe_checkpoint: 'queued', attempt_id: null, attempt_count: 0 } } });
     expect((await readJob(input.workspace, submitted.task.identity.task_id)).state).toBe('paused');
     const view = await stableTaskView(input.workspace, await findTaskReadOnly(input.workspace, submitted.task.identity.task_id));
-    expect(view).toMatchObject({ status: 'paused', capabilities: { pause: { supported: true }, resume: { supported: true } }, pause: { allowed: false } });
+    expect(view).toMatchObject({ status: 'paused', capabilities: { pause: { supported: true }, resume: { supported: true } }, pause: { allowed: false }, resume: { allowed: true, reason: null } });
     const resumed = await resumeV5Task(input.workspace, paused.task);
     expect(resumed).toMatchObject({ status: 'queued', execution: { attempt_id: null, attempt_count: 0, control: { resume_count: 1, pause_requested_at: null, paused_at: null } } });
     const calls: string[] = [];

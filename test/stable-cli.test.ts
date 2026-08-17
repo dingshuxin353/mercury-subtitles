@@ -100,6 +100,32 @@ describe('stable CLI v1 protocol and configuration', () => {
     await expect(lstat(path.join(home, 'mercury-workspace'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it('projects an exited Worker as stopped while preserving stale record evidence separately and read-only', async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), 'mercury-stable-worker-stopped-'));
+    const runtime = path.join(home, 'mercury-workspace', 'runtime');
+    await mkdir(runtime, { recursive: true });
+    const recordPath = path.join(runtime, 'worker.json');
+    const record = {
+      contract_version: 'mercury-worker-experimental-v1',
+      worker_id: 'worker-finished', pid: 999_999, started_at: '2026-08-17T10:00:00.000Z',
+      heartbeat_at: '2026-08-17T10:01:00.000Z', state: 'stopping', task_id: null, diagnostic_count: 0,
+    };
+    await writeFile(recordPath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    const before = await readFile(recordPath, 'utf8');
+    const output = capture(home);
+    expect(await runCli(['worker', 'status', '--json'], output.io)).toBe(0);
+    expect(output.stderr).toEqual([]);
+    expect(JSON.parse(output.stdout[0]!)).toMatchObject({
+      contract: 'mercury.cli/v1', command: 'worker.status', ok: true,
+      data: {
+        running: false, stale: false, state: 'stopped', task_id: null, heartbeat_at: null,
+        last_record: { state: 'stopping', task_id: null, heartbeat_at: record.heartbeat_at, stale: true },
+        next_action: 'Worker 已停止；查询不会启动任务。只有存在安全 queued 任务时才显式执行 worker start。',
+      },
+    });
+    expect(await readFile(recordPath, 'utf8')).toBe(before);
+  });
+
   it('checks a v1 migration read-only, applies only the matching plan, and preserves a 0600 backup', async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), 'mercury-stable-migrate-'));
     const configDirectory = path.join(home, 'mercury-workspace', 'config');

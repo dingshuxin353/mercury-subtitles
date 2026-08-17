@@ -29,11 +29,17 @@ async function fireFault(fault: ((point: DeliveryFaultPoint) => Promise<void> | 
   try { await fault?.(point); } catch (error) { throw new SimulatedDeliveryCrash(point, error); }
 }
 
-function deliveryError(code: string, message: string, category: ExchangeErrorV1['category'], detail: string | null = null): ExchangeErrorV1 {
+function deliveryError(
+  code: string,
+  message: string,
+  category: ExchangeErrorV1['category'],
+  detail: string | null = null,
+  remediation = '工作区内的批准稿仍然安全；修复业务目录后执行 mercury task deliver <task-id> --json。本动作不会再次调用 Provider。',
+): ExchangeErrorV1 {
   return {
     contract: 'mercury.error/v1', code, category, message,
     retryability: 'after_user_action', provider_outcome: 'not_applicable',
-    remediation: ['工作区内的批准稿仍然安全；修复业务目录后执行 mercury task deliver <task-id> --json。本动作不会再次调用 Provider。'],
+    remediation: [remediation],
     technical: detail ? { provider_code: null, log_id: null, detail: detail.replace(/[\u0000-\u001f\u007f]/gu, ' ').slice(0, 1000) } : null,
     extensions: {},
   };
@@ -259,7 +265,13 @@ export async function projectDeliveryReadOnly(task: TaskRecordV5): Promise<NonNu
   const delivery = task.delivery;
   if (!delivery) return { requested_directory: null, status: 'not_requested', final_path: null, sha256: null, validation: 'unavailable', delivered_at: null, review_revision: null, history: [], error: null, next_action: '此任务未请求业务目录交付。' };
   if (delivery.requested_directory && ['failed', 'cancelled', 'interrupted', 'needs_input'].includes(task.status)) {
-    const error = deliveryError('DELIVERY_NOT_READY', '任务未成功完成并形成当前批准稿；Mercury 不会向业务目录发布 transcribed 或 calibrated 字幕。', 'conflict');
+    const error = deliveryError(
+      'DELIVERY_NOT_READY',
+      '任务未成功完成并形成当前批准稿；Mercury 不会向业务目录发布 transcribed 或 calibrated 字幕。',
+      'conflict',
+      null,
+      '当前任务没有可交付的最终批准字幕。请按任务主错误处理；不要执行 task deliver，也不要重放当前任务。',
+    );
     return { ...delivery, status: 'failed', final_path: null, sha256: null, validation: 'unavailable', delivered_at: null, review_revision: null, error, next_action: '当前任务不能发布最终字幕；业务目录没有新文件。请保留任务证据并按任务错误处理，不能用 task deliver 重放 Provider。' };
   }
   let status: NonNullable<ExchangeTaskV1['delivery']>['status'] = delivery.status;

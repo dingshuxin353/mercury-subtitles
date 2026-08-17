@@ -1592,6 +1592,14 @@ export async function projectV5Task(directory: string, input?: TaskRecordV5): Pr
   const delivery = await (await import('../delivery.js')).projectDeliveryReadOnly(task);
   const taskControl = hasTaskControl(task);
   const retryPlan = taskControl ? await planV5Retry(directory, task) : null;
+  const pauseAllowed = taskControl && ['queued', 'running'].includes(task.status);
+  const resumeAllowed = taskControl
+    && ['paused', 'interrupted'].includes(task.status)
+    && task.execution.safe_checkpoint !== null
+    && !Object.values(task.execution.provider_calls).some((entry) => entry.state === 'in_flight'
+      || entry.outcome === 'outcome_unknown'
+      || (entry.state === 'terminal' && entry.outcome === 'known_terminal'));
+  const cancelAllowed = ['queued', 'running', 'pausing', 'paused'].includes(task.status);
   const nextAction = task.status === 'queued' ? '任务已入队；查询不会启动 Worker。若 Worker 未运行，请显式执行 worker start。'
     : task.status === 'running' ? '任务正在后台处理，请稍后查询。'
       : task.status === 'pausing' ? '暂停请求已记录；Provider 调用若正在进行会先等待结果固定，再在安全检查点暂停。'
@@ -1610,8 +1618,9 @@ export async function projectV5Task(directory: string, input?: TaskRecordV5): Pr
     contract: 'mercury.task/v1', task_id: task.identity.task_id, request_id: task.identity.request_id, revision: task.identity.revision, created_at: task.created_at, updated_at: task.updated_at,
     status: task.status, stage: task.stage, progress: null,
     worker: { status: ['running', 'pausing'].includes(task.status) ? 'active' : 'inactive', heartbeat_at: task.execution.heartbeat_at },
-    pause: { allowed: taskControl && ['queued', 'running'].includes(task.status), reason: taskControl && ['queued', 'running'].includes(task.status) ? null : task.status === 'pausing' ? '暂停请求已经记录。' : task.status === 'paused' ? '任务已经暂停。' : '当前状态不能暂停。' },
-    cancel: { allowed: ['queued', 'running', 'pausing', 'paused'].includes(task.status), reason: ['queued', 'running', 'pausing', 'paused'].includes(task.status) ? null : '当前状态不能取消。' },
+    pause: { allowed: pauseAllowed, reason: pauseAllowed ? null : task.status === 'pausing' ? '暂停请求已经记录。' : task.status === 'paused' ? '任务已经暂停；如需继续请查看 resume 动作。' : `任务状态 ${task.status} 不能暂停。` },
+    resume: { allowed: resumeAllowed, reason: resumeAllowed ? null : !taskControl ? '此历史任务没有 Alpha.2 安全检查点。' : task.status === 'pausing' ? '暂停尚未到达安全检查点；请继续查询当前任务。' : task.status === 'paused' || task.status === 'interrupted' ? '当前检查点或 Provider 结果不能证明安全恢复。' : `任务状态 ${task.status} 不能恢复。` },
+    cancel: { allowed: cancelAllowed, reason: cancelAllowed ? null : `任务状态 ${task.status} 不能取消。` },
     retry: { allowed: retryPlan?.allowed ?? false, reason: retryPlan?.allowed ? null : retryPlan?.reason ?? '安全重试不可用。' },
     attempt: { attempt_id: task.execution.attempt_id, count: task.execution.attempt_count },
     artifacts,

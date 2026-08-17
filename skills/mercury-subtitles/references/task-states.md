@@ -3,7 +3,7 @@
 - `queued`: safely persisted and waiting. Querying does not start work.
 - `running`: owned by one Worker.
 - `pausing`: the pause intent is durable, but work has not reached a safe checkpoint. If a Provider call is in flight, wait; do not claim it was stopped.
-- `paused`: safe checkpoint and same attempt are durable. Resume only when `capabilities.resume.supported` is true.
+- `paused`: safe checkpoint and same attempt are durable. Resume only when the current task field `resume.allowed` is true; contract-level `capabilities.resume.supported` alone is not permission to act.
 - `completed`: processing passed; review may still be pending.
 - `failed`: a known failure. Read the deterministic retry plan; do not auto-execute it.
 - `interrupted`: inspect `provider_outcome`. `outcome_unknown` forbids resume/retry; `response_persisted` may permit local-only resume.

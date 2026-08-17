@@ -381,6 +381,23 @@ try {
     path.join(standardSkillParent, 'mercury-subtitles'),
     { recursive: true, errorOnExist: true, force: false },
   );
+  const packagedCommands = await readFile(
+    path.join(installedPackage, 'skills', 'mercury-subtitles', 'references', 'commands.md'),
+    'utf8',
+  );
+  const packagedTroubleshooting = await readFile(
+    path.join(installedPackage, 'skills', 'mercury-subtitles', 'references', 'troubleshooting.md'),
+    'utf8',
+  );
+  if (
+    !packagedCommands.includes('config status.data.models[].model_id') ||
+    !packagedCommands.includes('Never use `provider`, `name`, or `category` as a model ID') ||
+    !packagedCommands.includes('derive a new stable request ID') ||
+    !packagedCommands.includes('`resume.allowed`') ||
+    !packagedTroubleshooting.includes('If `approved_srt.exists` is false, do not call `task deliver`')
+  ) {
+    throw new Error('Installed package Skill is missing the rc2 model/action/delivery safety guidance');
+  }
   const { stdout: skillInstallOutput } = await runCli(['skill', 'install', '--json']);
   const skillInstall = JSON.parse(skillInstallOutput);
   if (

@@ -107,13 +107,23 @@ export async function tryRunStableCli(args: string[], context: StableCliContext)
       exactJson(args.slice(2));
       if (args[1] === 'status') {
         const status = await workerStatus(context.workspaceRoot);
+        const running = status.running;
         data = {
-          running: status.running,
-          stale: status.stale,
-          state: status.worker?.state ?? 'stopped',
-          task_id: status.worker?.task_id ?? null,
-          heartbeat_at: status.worker?.heartbeat_at ?? null,
+          running,
+          stale: false,
+          state: running ? status.worker?.state ?? 'running' : 'stopped',
+          task_id: running ? status.worker?.task_id ?? null : null,
+          heartbeat_at: running ? status.worker?.heartbeat_at ?? null : null,
           diagnostic_count: status.worker?.diagnostic_count ?? 0,
+          last_record: status.worker ? {
+            state: status.worker.state,
+            task_id: status.worker.task_id,
+            heartbeat_at: status.worker.heartbeat_at,
+            stale: status.stale,
+          } : null,
+          next_action: running
+            ? 'Worker 正在运行；可继续只读查询任务状态。'
+            : 'Worker 已停止；查询不会启动任务。只有存在安全 queued 任务时才显式执行 worker start。',
         };
       } else {
         const scan = await listJobsIsolated(context.workspaceRoot);
