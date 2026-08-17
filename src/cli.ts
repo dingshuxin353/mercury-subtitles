@@ -63,7 +63,9 @@ import {
   readVerifiedReview,
   type ReviewActor,
 } from './review.js';
+import { acceptAllV5ReviewChanges, decideV5ReviewChange, finalizeV5Review, readVerifiedV5Review } from './review-v5.js';
 import { installSkill, skillStatus } from './skill.js';
+import { tryRunStableCli } from './stable-cli/index.js';
 
 export interface CliIo {
   stdout: (message: string) => void;
@@ -76,7 +78,7 @@ export interface CliIo {
 
 const HELP = `mercury（推荐：打开交互式 App）
 
-Mercury 0.2 Alpha
+Mercury 0.3 Alpha.1
 
 普通用户场景：
   1. 第一次使用：运行 mercury，按向导添加语音转文字和内容校准服务
@@ -87,7 +89,23 @@ Mercury 0.2 Alpha
   mercury --version
   mercury --help
 
-高级 / 兼容命令（脚本和自动化）：
+稳定非交互命令（脚本、Agent 与外部软件）：
+  mercury protocol version --json
+  mercury protocol capabilities --json
+  mercury config status --json
+  mercury config migrate --check --json
+  mercury config migrate --plan <plan-id> --json
+  mercury input inspect --file <absolute-path> --format auto|srt|vtt|transcript-json --role transcript-source|reference --json
+  mercury task submit --request <absolute-request.json> --json
+  mercury task status|result <task-id> --json
+  mercury task list --limit <n> --json
+  mercury task watch <task-id> --after <sequence> --jsonl
+  mercury task deliver <task-id> --json
+  mercury dictionary create|list|show ... --json
+  mercury dictionary entry add|edit|remove <dictionary-id> ... --json
+  mercury dictionary validate|import|export ... --json
+
+高级 / 兼容命令（旧实验合同，deprecated）：
   mercury setup [--config <setup.json>] [--confirm-cloud-data]
   mercury model check --model <model-id> [--audio <check.mp3>]
   mercury model list
@@ -106,6 +124,7 @@ Mercury 0.2 Alpha
   npx skills add dingshuxin353/mercury-subtitles
   mercury skill status [--json]
   mercury skill install [--target <skills-directory>] [--json]  # 旧版兼容
+  旧实验机器输出临时兼容：在原机器命令后加 --experimental（至少保留一个 V0.3 Alpha）
 `;
 
 const SETUP_HELP = `用法：
@@ -1188,9 +1207,21 @@ export async function runCli(
     startDetachedWorker?: typeof startDetachedWorker;
   } = {},
 ): Promise<number> {
+  const experimentalMachine = args.includes('--experimental');
+  if (experimentalMachine) {
+    if (!args.includes('--json') && !args.includes('--jsonl')) {
+      io.stderr('CLI_ARGUMENT_INVALID: --experimental 只用于旧 JSON/JSONL 机器合同。\n');
+      return 2;
+    }
+    args = args.filter((argument) => argument !== '--experimental');
+  }
   const workspaceRoot = defaultWorkspaceRoot(io.homeDirectory ?? homedir());
   const requestedMachineCommand = machineCommand(args);
   try {
+    if (!experimentalMachine) {
+      const stable = await tryRunStableCli(args, { workspaceRoot, io });
+      if (stable !== null) return stable;
+    }
     if (args[0] === '__worker') {
       const internalArgs = args.slice(1);
       assertAllowedArguments(internalArgs, new Set(['--workspace']), new Set());
@@ -1786,16 +1817,18 @@ export async function runCli(
       if (operation === 'decide') { valueOptions.add('--change'); valueOptions.add('--text'); flags.add('--accept'); flags.add('--reject'); }
       if (operation === 'accept-all') valueOptions.add('--confirm-count');
       assertAllowedArguments(commandArgs.slice(1), valueOptions, flags);
-      const discovered = (await findTask(workspaceRoot, taskId)) as unknown as TaskRecordV2;
-      if (discovered.schema_version !== '4.0.0') throw new MercuryError('MACHINE_CONTRACT_UNAVAILABLE', '此历史任务不支持人工审阅。');
-      const directory = path.join(workspaceRoot, 'tasks', discovered.task_directory);
-      await readTaskRecordV2(directory);
+      const discovered = await (await import('./stable-cli/tasks.js')).findTaskReadOnly(workspaceRoot, taskId);
+      const isV5 = 'identity' in discovered;
+      if (!isV5 && (discovered as unknown as { schema_version?: string }).schema_version !== '4.0.0') throw new MercuryError('MACHINE_CONTRACT_UNAVAILABLE', '此历史任务不支持人工审阅。');
+      const directoryName = isV5 ? discovered.identity.task_directory : (discovered as TaskRecordV2).task_directory;
+      const directory = path.join(workspaceRoot, 'tasks', directoryName);
+      if (!isV5) await readTaskRecordV2(directory);
       let data: unknown;
       if (operation === 'status') {
-        const { review } = await readVerifiedReview(directory);
+        const review = isV5 ? await readVerifiedV5Review(directory) : (await readVerifiedReview(directory)).review;
         data = { task_id: taskId, status: review.status, counts: review.counts, next_change_id: review.changes.find((item) => item.decision === 'pending')?.change_id ?? null, approved_artifact: review.approved_artifact ? { ...review.approved_artifact, absolute_path: path.join(directory, review.approved_artifact.path) } : null };
       } else if (operation === 'list') {
-        const { review } = await readVerifiedReview(directory);
+        const review = isV5 ? await readVerifiedV5Review(directory) : (await readVerifiedReview(directory)).review;
         const after = optionValue(commandArgs, '--after');
         const start = after ? review.changes.findIndex((item) => item.change_id === after) + 1 : 0;
         if (after && start === 0) throw new MercuryError('REVIEW_CHANGE_NOT_FOUND', '审阅游标不存在。', { exitCode: 2 });
@@ -1808,21 +1841,22 @@ export async function runCli(
         if (!change) throw new MercuryError('REVIEW_CHANGE_REQUIRED', 'review decide 必须提供 --change。', { exitCode: 2 });
         const selected = [commandArgs.includes('--accept'), commandArgs.includes('--reject'), optionValue(commandArgs, '--text') !== undefined].filter(Boolean).length;
         if (selected !== 1) throw new MercuryError('CLI_ARGUMENT_INVALID', '必须且只能选择 --accept、--reject 或 --text。', { exitCode: 2 });
-        const review = await decideReviewChange(directory, {
+        const reviewInput = {
           changeId: change,
           decision: commandArgs.includes('--accept') ? 'accepted' : commandArgs.includes('--reject') ? 'rejected' : 'edited',
           ...(optionValue(commandArgs, '--text') !== undefined ? { text: optionValue(commandArgs, '--text')! } : {}),
           actor: reviewActor(commandArgs),
-        });
+        } as const;
+        const review = isV5 ? await decideV5ReviewChange(directory, reviewInput) : await decideReviewChange(directory, reviewInput);
         data = { task_id: taskId, status: review.status, counts: review.counts, change: review.changes.find((item) => item.change_id === change) };
       } else if (operation === 'accept-all') {
         const rawCount = optionValue(commandArgs, '--confirm-count');
         const confirmCount = Number.parseInt(rawCount ?? '', 10);
         if (!rawCount || !Number.isSafeInteger(confirmCount) || confirmCount < 0) throw new MercuryError('CLI_ARGUMENT_INVALID', '--confirm-count 必须是非负整数。', { exitCode: 2 });
-        const review = await acceptAllReviewChanges(directory, { confirmCount, actor: reviewActor(commandArgs) });
+        const review = isV5 ? await acceptAllV5ReviewChanges(directory, { confirmCount, actor: reviewActor(commandArgs) }) : await acceptAllReviewChanges(directory, { confirmCount, actor: reviewActor(commandArgs) });
         data = { task_id: taskId, status: review.status, counts: review.counts };
       } else {
-        const review = await finalizeReview(directory);
+        const review = isV5 ? await finalizeV5Review(directory) : await finalizeReview(directory);
         data = { task_id: taskId, status: review.status, counts: review.counts, approved_artifact: review.approved_artifact ? { ...review.approved_artifact, absolute_path: path.join(directory, review.approved_artifact.path) } : null };
       }
       if (commandArgs.includes('--json')) writeMachine(io, machineSuccess(`review.${operation}`, data));

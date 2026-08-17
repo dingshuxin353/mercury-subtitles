@@ -8,7 +8,7 @@ export {
 } from './alignment.js';
 export { runSubtitleCore } from './pipeline.js';
 export { applyAudioVerificationFindings } from './audio-verification.js';
-export { parseReferenceSrt, textOnlyTimelineIssue } from './srt.js';
+export { normalizeCalibrationUnitText, normalizeReferenceSrtForCalibration, parseReferenceSrt, textOnlyTimelineIssue } from './srt.js';
 export { countSubtitleCharacters, lineCount } from './text.js';
 export {
   HARD_MAX_CHARACTERS,

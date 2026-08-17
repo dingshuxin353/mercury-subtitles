@@ -682,7 +682,8 @@ describe('V01-D011 C01-C09/C11', () => {
   it('C03 uses one multimodal Vertex call and text-only preserves segment count, order, and every timestamp', async () => {
     const input = await prepared(model('chat-gemini', 'chat', 'gemini', AUDIO));
     const srt = path.join(input.root, 'source.srt');
-    await writeFile(srt, REFERENCE_TWO);
+    const multilineReference = REFERENCE_TWO.replace(TIMED_TEXT[0], '您好世界，\n和平发展。');
+    await writeFile(srt, multilineReference);
     const requests: any[] = [];
     const generateContent = vi.fn(async (request: any) => {
       const units = promptPayload(request.contents[0].parts[0].text).calibration_units;
@@ -720,6 +721,10 @@ describe('V01-D011 C01-C09/C11', () => {
     expect(generateContent).toHaveBeenCalledTimes(1);
     expect(requests).toHaveLength(1);
     expect(JSON.stringify(requests[0])).toContain('inlineData');
+    const sentPrompt = requests[0].contents[0].parts.find((part: any) => typeof part.text === 'string').text;
+    const sentUnit = promptPayload(sentPrompt).calibration_units[0]!;
+    expect(sentUnit.original_text).toBe('您好世界， 和平发展。');
+    expect(sentUnit.original_text).not.toMatch(/[\r\n]/u);
     const result = JSON.parse(
       await readFile(path.join(root, 'work/calibration-result.json'), 'utf8'),
     );

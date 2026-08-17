@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { dirname, extname, resolve } from 'node:path';
 import type {
@@ -302,6 +302,7 @@ function redactedProviderResponse(value: unknown): unknown {
 
 export class VolcengineAsrAdapter implements AsrAdapter {
   readonly adapterId = 'volcengine_asr' as const;
+  readonly asrHintsCapability = { status: 'not_supported', reason: '内置火山极速版未提供逐任务动态热词映射。' } as const;
 
   private readonly fetch: typeof globalThis.fetch;
   private readonly now: () => Date;
@@ -347,12 +348,21 @@ export class VolcengineAsrAdapter implements AsrAdapter {
 
     let audioData: Buffer;
     try {
-      audioData = await readFile(input.audio.sourcePath);
+      audioData = input.audio.verifiedBytes ? Buffer.from(input.audio.verifiedBytes) : await readFile(input.audio.sourcePath);
     } catch {
       return this.failedResult(input, {
         call: null,
         code: 'ASR_AUDIO_READ_FAILED',
         message: 'The task audio copy could not be read.',
+        stage: 'media_decode',
+        retryable: false
+      });
+    }
+    if (input.audio.verifiedBytes && createHash('sha256').update(audioData).digest('hex') !== input.audio.sha256) {
+      return this.failedResult(input, {
+        call: null,
+        code: 'ASR_AUDIO_HASH_MISMATCH',
+        message: 'The verified task audio bytes do not match the recorded hash.',
         stage: 'media_decode',
         retryable: false
       });
@@ -383,7 +393,8 @@ export class VolcengineAsrAdapter implements AsrAdapter {
     try {
       await input.beforeProviderDispatch?.('volcengine_asr_recognize');
       await this.dependencies.beforeProviderDispatch?.('volcengine_asr_recognize');
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && error.name === 'SimulatedV5Crash') throw error;
       return this.failedResult(input, {
         call: null,
         code: 'PROVIDER_DISPATCH_CHECKPOINT_FAILED',

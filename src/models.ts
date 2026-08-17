@@ -476,7 +476,7 @@ function mp3Frame(buffer: Buffer, index: number): { length: number; durationMs: 
   };
 }
 
-function mp3Duration(buffer: Buffer): number {
+export function readMp3DurationMsFromBytes(buffer: Buffer): number {
   let start = -1;
   for (let index = 0; index + 3 < buffer.length; index += 1) {
     const first = mp3Frame(buffer, index);
@@ -500,7 +500,7 @@ function mp3Duration(buffer: Buffer): number {
 }
 
 export async function readMp3DurationMs(filePath: string): Promise<number> {
-  return mp3Duration(await readFile(filePath));
+  return readMp3DurationMsFromBytes(await readFile(filePath));
 }
 
 async function prepareCheckAudio(workspaceRoot: string, audioPath: string, checkId: string) {
@@ -512,7 +512,7 @@ async function prepareCheckAudio(workspaceRoot: string, audioPath: string, check
     throw new MercuryError('ASR_INPUT_SIZE_EXCEEDED', '模型检查 MP3 超过火山极速版 100 MiB 限制。');
   }
   const bytes = await readFile(absolute);
-  const durationMs = mp3Duration(bytes);
+  const durationMs = readMp3DurationMsFromBytes(bytes);
   const beforeHash = await sha256File(absolute);
   const checkRoot = path.join(workspaceRoot, 'models', 'checks', checkId);
   const inputDirectory = path.join(checkRoot, 'input');

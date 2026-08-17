@@ -1,6 +1,6 @@
 {
   "name": "mercury-subtitles",
-  "version": "0.2.0-alpha.3",
+  "version": "0.3.0-alpha.1",
   "description": "Local-first Chinese MP3 transcription, AI proofreading, and human-approved SRT workflow for CLI users and AI agents.",
   "type": "module",
   "packageManager": "npm@11.12.1",
@@ -36,10 +36,16 @@
       "types": "./dist/src/model-center/index.d.ts",
       "import": "./dist/src/model-center/index.js"
     },
+    "./exchange": {
+      "types": "./dist/src/exchange/index.d.ts",
+      "import": "./dist/src/exchange/index.js"
+    },
     "./schemas/v1/*": "./schemas/v1/*",
     "./schemas/v2/*": "./schemas/v2/*",
     "./schemas/v3/*": "./schemas/v3/*",
-    "./schemas/v4/*": "./schemas/v4/*"
+    "./schemas/v4/*": "./schemas/v4/*",
+    "./schemas/exchange/v1/*": "./schemas/exchange/v1/*",
+    "./schemas/v5/*": "./schemas/v5/*"
   },
   "engines": {
     "node": ">=24.0.0 <25.0.0"

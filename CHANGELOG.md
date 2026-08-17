@@ -1,5 +1,14 @@
 # Mercury Changelog
 
+## 0.3.0-alpha.1 — Unreleased
+
+- Added Exchange Protocol v1 schemas, generated types and stable machine CLI foundations.
+- Added external SRT, VTT and transcript JSON imports with explicit roles, normalized provenance and auditable zero-ASR provided mode.
+- Added versioned global/project dictionaries, task override snapshots, conflict detection, stable CRUD/import/export and Chat context evidence.
+- Unified provider/reference and provided requests on the same internal v5 idempotency, Worker, result and review path.
+- Added an ASR hints capability SPI; built-in Volcengine adapters explicitly report per-task dynamic hints as unsupported.
+- Hardened v5 cancellation and crash recovery with pinned ASR/Chat response hashes, normalized reference evidence, immutable dictionary snapshot versions, and dispatch-confirmed ASR hints evidence.
+
 ## 0.2.0-alpha.3 — 2026-08-16
 
 ### Skill 安装与兼容

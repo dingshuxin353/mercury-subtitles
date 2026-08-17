@@ -61,7 +61,7 @@ describe('V02-D004 packaged Mercury skill', () => {
     expect(status).toMatchObject({
       installed: false,
       compatible: false,
-      product_version: '0.2.0-alpha.3',
+      product_version: '0.3.0-alpha.1',
       machine_contract: 'mercury-cli-experimental-v1',
       recommended_install_command: MERCURY_SKILL_INSTALL_COMMAND,
       install_method: 'none',

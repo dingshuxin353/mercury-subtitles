@@ -87,19 +87,28 @@ mercury
 需要脚本化时，再使用高级命令：
 
 ```bash
-# 后台提交，并立即返回任务 ID
-mercury calibrate --audio "/绝对路径/访谈.mp3" --background --json
+# 稳定后台提交，并立即返回任务 ID
+mercury task submit --request "/绝对路径/request.json" --json
 
 # 找回任务状态和结果
 mercury task status <task-id> --json
 mercury task result <task-id> --json
+
+# 业务目录暂时不可用时，只重试本地批准稿交付（不会调用 Provider）
+mercury task deliver <task-id> --json
 
 # Worker 停止且任务仍在排队时，显式恢复
 mercury worker status --json
 mercury worker start --json
 ```
 
+`request.json` 使用 Exchange Protocol v1，并必须包含一个稳定 `request_id`：同一次逻辑请求丢失输出后重试时复用它，用户明确要求重新处理时才生成新的 ID。外部字幕先用 `mercury input inspect ... --json` 检查，并在 request 中显式声明 `transcript_source` 或 `reference`；完整 request 字段见下方 CLI 文档。
+
+如需把最终批准字幕交付到业务目录，可在 request 的 `output` 中增加 `"approved_srt_directory": "/规范化绝对路径"`。Mercury 只在 approved.srt 形成后发布内容寻址的 0600 副本；工作区仍是事实源。目录属于 request 指纹，不能用同一 request ID 改目录；交付失败后使用上面的 `task deliver`，无需重跑 ASR 或 Chat。
+
 查询状态不会偷偷启动 Worker，也不会重复提交任务。Provider 结果不确定时，Mercury 会停下来阻止自动重放，避免重复调用或计费。
+
+`0.3.0-alpha.1` 候选还提供 Exchange Protocol v1：脚本可显式导入 SRT、VTT 或 transcript JSON 作为转写事实源（ASR 0 调用），也可用 `reference` 继续走 ASR；两种模式共用稳定任务、事件、结果、词典快照和审阅合同。全局/项目词典通过 `mercury dictionary ... --json` 管理，任务创建后固定 revision/hash。
 
 [CLI 完整说明 →](https://github.com/dingshuxin353/mercury-subtitles/blob/main/docs/cli.md)
 
@@ -145,6 +154,8 @@ Skill 只使用 Mercury 的机器命令。它不会向你索要 Key，不会自�
 
 所有项目决定完毕后才会生成 `approved.srt`。批准稿沿用校验字幕的完整时间轴，不通过删段或合段来掩盖正文分配问题。
 
+稳定 request 可选指定批准稿业务目录。再次修改同一任务的审阅决定时，旧业务文件保持不可变；下一次 finalize 按新批准稿 hash 生成新路径，任务结果会区分 latest 与 history。
+
 ## 你的数据会去哪里
 
 - **本地保存：** 配置、任务、日志和结果默认位于 `~/mercury-workspace/`。
@@ -164,7 +175,7 @@ Skill 只使用 Mercury 的机器命令。它不会向你索要 Key，不会自�
 - 输入以中文 MP3 为主；视频、翻译、批量任务、本地 ASR、插件市场和多 Worker 尚未提供。
 - 大于 15 MB 的音频不会发送给 Chat 做强校验，但仍可按文本路径处理；这不是 ASR 的通用大小上限。
 - 内置 ASR：火山音视频字幕、火山极速版。校验模型支持 Vertex AI Gemini、Gemini Developer API 与 OpenAI-compatible Chat endpoint；实际可用性仍取决于你的账号、区域和模型权限。
-- Alpha 版本可能调整机器 JSON 合同；自动化用户升级前请阅读 [CHANGELOG](./CHANGELOG.md)。
+- Exchange Protocol v1 是 V0.3 的稳定外部机器合同；内部 task/job/lock 文件仍不是公共 API。自动化用户升级前请阅读 [CHANGELOG](./CHANGELOG.md)。
 
 ## 常见问题
 
@@ -250,7 +261,7 @@ npm run verify
 
 ## 版本与反馈
 
-- 当前版本：`0.2.0-alpha.3`，推荐通过 npm dist-tag `next` 安装 Public Alpha。
+- 当前开发候选：`0.3.0-alpha.1`；尚未发布，已发布 Public Alpha 仍可通过 npm dist-tag `next` 安装。
 - 版本变化：[CHANGELOG.md](./CHANGELOG.md)
 - 下载与校验：[GitHub Releases](https://github.com/dingshuxin353/mercury-subtitles/releases)
 - 安装或配置求助：[创建安装帮助](https://github.com/dingshuxin353/mercury-subtitles/issues/new?template=installation-help.yml)

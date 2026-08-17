@@ -32,7 +32,7 @@ describe('Public Alpha release surface', () => {
 
     expect(packageJson).toMatchObject({
       name: 'mercury-subtitles',
-      version: '0.2.0-alpha.3',
+      version: '0.3.0-alpha.1',
       license: 'Apache-2.0',
       engines: { node: '>=24.0.0 <25.0.0' },
       bin: { mercury: './dist/src/bin.js' },
@@ -71,6 +71,8 @@ describe('Public Alpha release surface', () => {
     }
     expect(readme).toContain('npm install --global mercury-subtitles@next');
     expect(readme).toContain('npx skills add dingshuxin353/mercury-subtitles');
+    expect(readme).toContain('mercury task submit --request "/绝对路径/request.json" --json');
+    expect(readme).not.toContain('mercury calibrate --audio "/绝对路径/访谈.mp3" --background --json');
     expect(readme).toContain('Skill 只使用 Mercury 的机器命令');
     expect(readme).toContain('MP3 会发送给你在模型中心选择的 ASR 服务');
     expect(readme).toContain('当前版本没有 Mercury 托管的云端中转服务');

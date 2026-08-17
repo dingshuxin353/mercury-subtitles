@@ -1,0 +1,188 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercury.local/schemas/v5/task-record.schema.json",
+  "title": "TaskRecordV5",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "identity", "created_at", "updated_at", "status", "stage", "input_config", "inputs", "calibration_sources", "models", "dictionary_snapshot", "execution", "artifacts", "review", "warnings", "error"],
+  "properties": {
+    "schema_version": { "const": "5.0.0" },
+    "identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["task_id", "request_id", "request_fingerprint", "task_directory", "revision"],
+      "properties": {
+        "task_id": { "$ref": "../exchange/v1/common.schema.json#/$defs/taskId" },
+        "request_id": { "$ref": "../exchange/v1/common.schema.json#/$defs/requestId" },
+        "request_fingerprint": { "$ref": "../exchange/v1/common.schema.json#/$defs/sha256" },
+        "task_directory": { "type": "string", "pattern": "^tsk-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}-.+$" },
+        "revision": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "created_at": { "$ref": "../exchange/v1/common.schema.json#/$defs/timestamp" },
+    "updated_at": { "$ref": "../exchange/v1/common.schema.json#/$defs/timestamp" },
+    "status": { "enum": ["queued", "running", "pausing", "paused", "needs_input", "completed", "failed", "cancelled", "interrupted"] },
+    "stage": { "type": ["string", "null"], "maxLength": 100 },
+    "input_config": {
+      "type": "object", "additionalProperties": false,
+      "required": ["transcription_mode", "calibration_mode", "source_language", "evidence_mode"],
+      "properties": {
+        "transcription_mode": { "enum": ["provider", "provided"] },
+        "calibration_mode": { "enum": ["text-only", "text-and-segmentation"] },
+        "source_language": { "type": "string", "minLength": 2, "maxLength": 35 },
+        "evidence_mode": { "enum": ["text", "audio_multimodal"] }
+      }
+    },
+    "inputs": {
+      "type": "object", "additionalProperties": false,
+      "required": ["media", "transcript_source", "reference", "reference_normalized"],
+      "properties": {
+        "media": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/input" }] },
+        "transcript_source": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/transcriptInput" }] },
+        "reference": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/transcriptInput" }] },
+        "reference_normalized": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/internalArtifact" }] }
+      }
+    },
+    "calibration_sources": {
+      "type": "object", "additionalProperties": false,
+      "required": ["transcript", "reference"],
+      "properties": {
+        "transcript": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/internalArtifact" }] },
+        "reference": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/internalArtifact" }] }
+      }
+    },
+    "models": {
+      "type": "object", "additionalProperties": false,
+      "required": ["asr", "chat", "snapshot_path", "snapshot_sha256"],
+      "properties": {
+        "asr": { "type": ["string", "null"], "minLength": 1, "maxLength": 100 },
+        "chat": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "snapshot_path": { "$ref": "../exchange/v1/common.schema.json#/$defs/taskRelativePath" },
+        "snapshot_sha256": { "$ref": "../exchange/v1/common.schema.json#/$defs/sha256" }
+      }
+    },
+    "dictionary_snapshot": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256", "resolved"],
+      "properties": {
+        "path": { "$ref": "../exchange/v1/common.schema.json#/$defs/taskRelativePath" },
+        "sha256": { "$ref": "../exchange/v1/common.schema.json#/$defs/sha256" },
+        "resolved": { "type": "array", "maxItems": 32, "items": { "$ref": "../exchange/v1/common.schema.json#/$defs/dictionaryReference" } }
+      }
+    },
+    "execution": {
+      "type": "object", "additionalProperties": false,
+      "required": ["queued_at", "started_at", "ended_at", "worker_id", "heartbeat_at", "attempt_id", "attempt_count", "safe_checkpoint", "provider_calls", "cancel_requested_at"],
+      "properties": {
+        "queued_at": { "$ref": "../exchange/v1/common.schema.json#/$defs/timestamp" },
+        "started_at": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/timestamp" }] },
+        "ended_at": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/timestamp" }] },
+        "worker_id": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._-]{1,80}$" },
+        "heartbeat_at": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/timestamp" }] },
+        "attempt_id": { "type": ["string", "null"], "maxLength": 100 },
+        "attempt_count": { "type": "integer", "minimum": 0, "maximum": 1000 },
+        "safe_checkpoint": { "enum": ["queued", "claimed", "asr_not_started", "asr_response_persisted", "chat_not_started", "chat_response_persisted", "outputs_validated", null] },
+        "provider_calls": {
+          "type": "object", "additionalProperties": false,
+          "required": ["asr", "chat"],
+          "properties": { "asr": { "$ref": "#/$defs/providerCall" }, "chat": { "$ref": "#/$defs/providerCall" } }
+        },
+        "cancel_requested_at": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/timestamp" }] }
+      }
+    },
+    "artifacts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["transcript", "transcribed", "calibrated", "approved", "report"],
+      "properties": {
+        "transcript": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/internalArtifact" }] },
+        "transcribed": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/internalArtifact" }] },
+        "calibrated": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/internalArtifact" }] },
+        "approved": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/internalArtifact" }] },
+        "report": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/internalArtifact" }] }
+      }
+    },
+    "review": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "pending_count"],
+      "properties": {
+        "status": { "enum": ["unsupported", "not_ready", "pending", "in_progress", "ready", "not_required", "finalized", "invalid"] },
+        "pending_count": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "delivery": { "$ref": "#/$defs/delivery" },
+    "warnings": { "type": "array", "maxItems": 1000, "items": { "type": "string", "minLength": 1, "maxLength": 500 } },
+    "error": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/error.schema.json" }] }
+  },
+  "$defs": {
+    "input": {
+      "type": "object", "additionalProperties": false,
+      "required": ["original_path", "workspace_path", "sha256", "bytes", "mime_type"],
+      "properties": {
+        "original_path": { "$ref": "../exchange/v1/common.schema.json#/$defs/absolutePath" },
+        "workspace_path": { "$ref": "../exchange/v1/common.schema.json#/$defs/taskRelativePath" },
+        "sha256": { "$ref": "../exchange/v1/common.schema.json#/$defs/sha256" },
+        "bytes": { "type": "integer", "minimum": 1 },
+        "mime_type": { "const": "audio/mpeg" }
+      }
+    },
+    "transcriptInput": {
+      "type": "object", "additionalProperties": false,
+      "required": ["original_path", "workspace_path", "sha256", "bytes", "mime_type", "format", "role"],
+      "properties": {
+        "original_path": { "$ref": "../exchange/v1/common.schema.json#/$defs/absolutePath" },
+        "workspace_path": { "$ref": "../exchange/v1/common.schema.json#/$defs/taskRelativePath" },
+        "sha256": { "$ref": "../exchange/v1/common.schema.json#/$defs/sha256" },
+        "bytes": { "type": "integer", "minimum": 1 },
+        "mime_type": { "type": "string", "minLength": 3, "maxLength": 100 },
+        "format": { "enum": ["srt", "vtt", "transcript_json"] },
+        "role": { "enum": ["transcript_source", "reference"] }
+      }
+    },
+    "providerCall": {
+      "type": "object", "additionalProperties": false,
+      "required": ["state", "count", "outcome", "evidence_ref", "evidence_sha256"],
+      "properties": {
+        "state": { "enum": ["not_started", "in_flight", "response_persisted", "terminal"] },
+        "count": { "type": "integer", "minimum": 0, "maximum": 1000 },
+        "outcome": { "enum": ["not_dispatched", "known_terminal", "response_persisted", "outcome_unknown", "not_applicable"] },
+        "evidence_ref": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/taskRelativePath" }] },
+        "evidence_sha256": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/sha256" }] }
+      }
+    },
+    "internalArtifact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256", "validation"],
+      "properties": {
+        "path": { "$ref": "../exchange/v1/common.schema.json#/$defs/taskRelativePath" },
+        "sha256": { "$ref": "../exchange/v1/common.schema.json#/$defs/sha256" },
+        "validation": { "enum": ["passed", "pending"] }
+      }
+    },
+    "delivery": {
+      "type": "object", "additionalProperties": false,
+      "required": ["requested_directory", "status", "final_path", "sha256", "validation", "delivered_at", "review_revision", "history", "error"],
+      "properties": {
+        "requested_directory": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/absolutePath" }] },
+        "status": { "enum": ["not_requested", "pending_review", "ready", "delivered", "failed"] },
+        "final_path": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/absolutePath" }] },
+        "sha256": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/sha256" }] },
+        "validation": { "enum": ["passed", "unavailable"] },
+        "delivered_at": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/timestamp" }] },
+        "review_revision": { "type": ["string", "null"], "pattern": "^rev-[a-f0-9]{20}$" },
+        "history": {
+          "type": "array", "maxItems": 1000,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["path", "sha256", "review_revision", "delivered_at"],
+            "properties": {
+              "path": { "$ref": "../exchange/v1/common.schema.json#/$defs/absolutePath" },
+              "sha256": { "$ref": "../exchange/v1/common.schema.json#/$defs/sha256" },
+              "review_revision": { "type": "string", "pattern": "^rev-[a-f0-9]{20}$" },
+              "delivered_at": { "$ref": "../exchange/v1/common.schema.json#/$defs/timestamp" }
+            }
+          }
+        },
+        "error": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/error.schema.json" }] }
+      }
+    }
+  }
+}

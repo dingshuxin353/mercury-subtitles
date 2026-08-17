@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercury.local/schemas/exchange/v1/dictionary.schema.json",
+  "title": "ExchangeDictionaryV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "dictionary_id", "scope", "project_key", "name", "revision", "content_hash", "created_at", "updated_at", "enabled", "is_default", "entries", "extensions"],
+  "properties": {
+    "contract": { "const": "mercury.dictionary/v1" },
+    "dictionary_id": { "type": "string", "pattern": "^dict-[a-z0-9][a-z0-9-]{2,63}$" },
+    "scope": { "enum": ["global", "project"] },
+    "project_key": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9._-]{0,79}$" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 100, "pattern": "\\S" },
+    "revision": { "type": "string", "pattern": "^rev-[a-f0-9]{12,64}$" },
+    "content_hash": { "$ref": "common.schema.json#/$defs/sha256" },
+    "created_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "updated_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "enabled": { "type": "boolean" },
+    "is_default": { "type": "boolean" },
+    "entries": { "type": "array", "maxItems": 10000, "items": { "$ref": "#/$defs/entry" } },
+    "extensions": { "$ref": "common.schema.json#/$defs/extensions" }
+  },
+  "$defs": {
+    "entry": {
+      "type": "object", "additionalProperties": false,
+      "required": ["entry_id", "kind", "canonical", "variants", "language", "case_sensitive", "number_sensitive", "notes", "tags", "enabled", "created_at", "updated_at"],
+      "properties": {
+        "entry_id": { "type": "string", "pattern": "^entry-[a-z0-9][a-z0-9-]{2,63}$" },
+        "kind": { "enum": ["term", "person", "brand", "product", "acronym", "other"] },
+        "canonical": { "type": "string", "minLength": 1, "maxLength": 500, "pattern": "\\S" },
+        "variants": { "type": "array", "maxItems": 100, "uniqueItems": true, "items": { "type": "string", "minLength": 1, "maxLength": 500, "pattern": "\\S" } },
+        "language": { "type": "string", "minLength": 2, "maxLength": 35 },
+        "case_sensitive": { "type": "boolean" },
+        "number_sensitive": { "type": "boolean" },
+        "notes": { "type": ["string", "null"], "maxLength": 2000 },
+        "tags": { "type": "array", "maxItems": 50, "uniqueItems": true, "items": { "type": "string", "minLength": 1, "maxLength": 80 } },
+        "enabled": { "type": "boolean" },
+        "created_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "updated_at": { "$ref": "common.schema.json#/$defs/timestamp" }
+      }
+    }
+  }
+}

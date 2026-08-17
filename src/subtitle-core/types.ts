@@ -132,6 +132,8 @@ export interface SubtitleCoreInput {
   calibrationResult: CalibrationResult;
   referenceSrtText: string | null;
   requestedMode?: CalibrationMode | null;
+  /** Preserve an imported transcript's own segmentation without presenting it as reference SRT. */
+  transcriptSourceMode?: CalibrationMode | null;
 }
 
 export type SubtitleCoreResult =

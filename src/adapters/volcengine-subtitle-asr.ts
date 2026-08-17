@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { dirname, extname, resolve } from 'node:path';
 import type {
@@ -225,6 +225,7 @@ function normalizeSegments(
 
 export class VolcengineSubtitleAsrAdapter implements AsrAdapter {
   readonly adapterId = 'volcengine_subtitle_asr' as const;
+  readonly asrHintsCapability = { status: 'not_supported', reason: '内置火山音视频字幕未提供逐任务动态热词映射。' } as const;
   private readonly fetch: typeof globalThis.fetch;
   private readonly now: () => Date;
   private readonly createId: () => string;
@@ -266,14 +267,18 @@ export class VolcengineSubtitleAsrAdapter implements AsrAdapter {
     const authHeaders = { Authorization: `Bearer; ${credential.token}` };
     let audioBody: Buffer;
     try {
-      audioBody = await readFile(input.audio.sourcePath);
+      audioBody = input.audio.verifiedBytes ? Buffer.from(input.audio.verifiedBytes) : await readFile(input.audio.sourcePath);
     } catch {
       return this.failure(input, callId, startedAt, 'ASR_INPUT_FILE_UNAVAILABLE', '任务中的 MP3 副本不可用。', 'media_decode', false, null, '重新创建任务。');
+    }
+    if (input.audio.verifiedBytes && createHash('sha256').update(audioBody).digest('hex') !== input.audio.sha256) {
+      return this.failure(input, callId, startedAt, 'ASR_AUDIO_HASH_MISMATCH', '任务中的 MP3 字节与固定 hash 不一致。', 'media_decode', false, null, '重新创建任务。');
     }
     try {
       await input.beforeProviderDispatch?.('volcengine_subtitle_submit');
       await this.dependencies.beforeProviderDispatch?.('volcengine_subtitle_submit');
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && error.name === 'SimulatedV5Crash') throw error;
       return this.failure(input, callId, startedAt, 'PROVIDER_DISPATCH_CHECKPOINT_FAILED', '无法在上传前保存 Provider 调用检查点。', 'artifact_write', false, null, '检查任务目录权限后显式恢复 Worker。', 'not_dispatched');
     }
     let submit: Response;
@@ -315,7 +320,8 @@ export class VolcengineSubtitleAsrAdapter implements AsrAdapter {
     try {
       await input.beforeProviderDispatch?.('volcengine_subtitle_query');
       await this.dependencies.beforeProviderDispatch?.('volcengine_subtitle_query');
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && error.name === 'SimulatedV5Crash') throw error;
       return this.failure(input, callId, startedAt, 'PROVIDER_QUERY_CHECKPOINT_FAILED', `任务已提交，但无法在查询前保存调用检查点（task id=${jobId}）。`, 'artifact_write', false, jobId, '保留 task id；修复本地任务目录后只读续查，绝不能重新提交音频。', 'outcome_unknown');
     }
     let queried: Response;

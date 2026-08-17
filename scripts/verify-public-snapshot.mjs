@@ -141,7 +141,7 @@ const lockJson = JSON.parse(await readFile(path.join(snapshotRoot, 'package-lock
 const version = (await readFile(path.join(snapshotRoot, 'VERSION'), 'utf8')).trim();
 if (
   packageJson.name !== 'mercury-subtitles' ||
-  packageJson.version !== '0.2.0-alpha.3' ||
+  packageJson.version !== '0.3.0-alpha.1' ||
   packageJson.version !== version ||
   lockJson.name !== packageJson.name ||
   lockJson.version !== packageJson.version ||
@@ -163,12 +163,16 @@ for (const required of [
   '## 方式二：让 Agent 通过 Skill 使用',
   '## 你的数据会去哪里',
   'mercury-subtitles@next',
+  'mercury task submit --request "/绝对路径/request.json" --json',
   'npx skills add dingshuxin353/mercury-subtitles',
   'Public Alpha',
 ]) {
   if (!readme.includes(required)) {
     throw new Error(`Public README is missing required beginner content: ${required}`);
   }
+}
+if (readme.includes('mercury calibrate --audio "/绝对路径/访谈.mp3" --background --json')) {
+  throw new Error('Public README contains a machine submission example without a stable request ID');
 }
 if (!readme.includes('Skill 只使用 Mercury 的机器命令')) {
   throw new Error('Public README does not state the Skill execution boundary');

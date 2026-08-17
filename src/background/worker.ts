@@ -18,6 +18,24 @@ import {
   writeJob,
 } from './storage.js';
 import { acquireOwnedLock, type OwnedLock } from './owned-lock.js';
+import {
+  auditV5Job,
+  appendV5Event,
+  claimV5Job,
+  containV5Failure,
+  executeV5Task,
+  finishV5Job,
+  heartbeatV5Task,
+  isV5TaskDirectory,
+  readV5Task,
+  SimulatedV5Crash,
+  type V5FaultPoint,
+  type ExchangeRuntimeDependencies,
+  v5CancellationEventFacts,
+  writeV5Result,
+} from '../exchange/runtime.js';
+import type { TaskRecordV5 } from '../contracts/generated/task-record-v5.js';
+import { finalizeV5Review, initializeV5Review } from '../review-v5.js';
 
 const HEARTBEAT_INTERVAL_MS = 2_000;
 export const WORKER_STALE_AFTER_MS = 15_000;
@@ -88,7 +106,6 @@ export async function workerStatus(workspaceRoot: string, now = Date.now()): Pro
   stale: boolean;
   worker: WorkerRecord | null;
 }> {
-  await ensureRuntimeLayout(workspaceRoot);
   const worker = await readWorkerRecord(workspaceRoot);
   if (!worker) return { running: false, stale: false, worker: null };
   const stale = worker.state === 'stopping' || now - new Date(worker.heartbeat_at).getTime() > WORKER_STALE_AFTER_MS || !processAlive(worker.pid);
@@ -102,6 +119,15 @@ export async function auditInterruptedTasks(workspaceRoot: string): Promise<Set<
   for (const listedJob of scan.jobs) {
     try {
       const directory = taskDirectoryForJob(workspaceRoot, listedJob);
+      if (await isV5TaskDirectory(directory)) {
+        await auditV5Job(workspaceRoot, listedJob);
+        const audited = await readV5Task(directory);
+        if (audited.status === 'completed') {
+          const review = await initializeV5Review(directory);
+          if (review.status === 'not_required') await finalizeV5Review(directory);
+        }
+        continue;
+      }
       await withTaskTransitionLock(directory, async () => {
       const job = await readJob(workspaceRoot, listedJob.task_id);
       const task = await readBackgroundTaskForJob(workspaceRoot, job);
@@ -307,6 +333,16 @@ type WorkerFaultPoint =
   | 'after_review'
   | 'before_finish';
 
+type V5WorkerFaultPoint = V5FaultPoint | 'after_claim' | 'after_execute' | 'after_review' | 'before_finish';
+
+async function v5CrashFault(
+  fault: ((point: V5WorkerFaultPoint, task: TaskRecordV5) => Promise<void> | void) | undefined,
+  point: V5WorkerFaultPoint,
+  task: TaskRecordV5,
+): Promise<void> {
+  try { await fault?.(point, structuredClone(task)); } catch (error) { throw new SimulatedV5Crash(point, error); }
+}
+
 class SimulatedClaimCrash extends Error {
   constructor(readonly cause: unknown) {
     super(cause instanceof Error ? cause.message : String(cause));
@@ -486,6 +522,10 @@ async function heartbeatWorkerAndTask(
   if (!worker.task_id) return;
   const job = await readJob(workspaceRoot, worker.task_id);
   const directory = taskDirectoryForJob(workspaceRoot, job);
+  if (await isV5TaskDirectory(directory)) {
+    await heartbeatV5Task(workspaceRoot, worker.task_id, worker.worker_id, at);
+    return;
+  }
   await updateTaskRecordV2(directory, (task) => {
     if (task.execution.status === 'running' && task.execution.worker_id === worker.worker_id) {
       task.execution.heartbeat_at = at;
@@ -496,12 +536,13 @@ async function heartbeatWorkerAndTask(
 
 export async function runWorker(
   workspaceRoot: string,
-  dependencies: CoreIntegrationV2Dependencies = {},
+  dependencies: CoreIntegrationV2Dependencies & ExchangeRuntimeDependencies = {},
   options: {
     idleExitMs?: number;
     now?: () => Date;
     heartbeatIntervalMs?: number;
     fault?: (point: WorkerFaultPoint, task: TaskRecordV2) => Promise<void> | void;
+    v5Fault?: (point: V5WorkerFaultPoint, task: TaskRecordV5) => Promise<void> | void;
     lifecycleFault?: (point: 'after_empty_scan' | 'after_stopping_persisted') => Promise<void> | void;
     heartbeatFault?: () => Promise<void> | void;
   } = {},
@@ -569,13 +610,18 @@ export async function runWorker(
         }
         break;
       }
-      let task: TaskRecordV2 | null;
+      let task: TaskRecordV2 | TaskRecordV5 | null;
+      const directory = taskDirectoryForJob(workspaceRoot, job);
+      const v5 = await isV5TaskDirectory(directory);
       try {
-        task = await claimJob(workspaceRoot, worker.worker_id, job, options.fault);
+        task = v5
+          ? await claimV5Job(workspaceRoot, job, worker.worker_id)
+          : await claimJob(workspaceRoot, worker.worker_id, job, options.fault);
       } catch (error) {
         if (error instanceof SimulatedClaimCrash) throw error.cause;
         try {
-          await containJobFailure(workspaceRoot, job, error);
+          if (v5) await containV5Failure(workspaceRoot, job, error);
+          else await containJobFailure(workspaceRoot, job, error);
         } catch (containError) {
           quarantined.add(job.task_id);
           worker.diagnostic_count = quarantined.size;
@@ -592,11 +638,41 @@ export async function runWorker(
       }
       if (!task) continue;
       worker.state = 'running';
-      worker.task_id = task.task_id;
+      worker.task_id = 'identity' in task ? task.identity.task_id : task.task_id;
       await queueWorkerWrite();
-      const directory = path.join(workspaceRoot, 'tasks', task.task_directory);
       try {
-        await options.fault?.('after_claim', task);
+        if (v5) {
+          await v5CrashFault(options.v5Fault, 'after_claim', task as TaskRecordV5);
+          let finalTask = await executeV5Task(directory, dependencies, options.v5Fault);
+          await v5CrashFault(options.v5Fault, 'after_execute', finalTask);
+          await heartbeatChain;
+          if (heartbeatError) throw heartbeatError;
+          if (finalTask.status === 'completed') {
+            const review = await initializeV5Review(directory);
+            if (review.status === 'not_required') await finalizeV5Review(directory);
+            finalTask = await readV5Task(directory);
+          }
+          await v5CrashFault(options.v5Fault, 'after_review', finalTask);
+          const cancellation = finalTask.status === 'cancelled' ? await v5CancellationEventFacts(directory, finalTask) : null;
+          await appendV5Event(
+            directory,
+            finalTask,
+            finalTask.status === 'completed' ? 'task_completed' : finalTask.status === 'cancelled' ? 'task_cancelled' : finalTask.status === 'interrupted' ? 'task_interrupted' : 'task_failed',
+            finalTask.status === 'completed' ? '后台任务处理完成。' : cancellation?.message ?? '后台任务已结束，请查看状态和下一步。',
+            cancellation?.data ?? {},
+          );
+          if (finalTask.status === 'completed') await appendV5Event(directory, finalTask, 'review_ready', finalTask.review.status === 'finalized' ? '校验结果无需逐项决定，人工批准稿已生成。' : 'AI 校验已完成，可以开始人工审阅。');
+          finalTask = await readV5Task(directory);
+          await writeV5Result(directory, finalTask);
+          await v5CrashFault(options.v5Fault, 'before_finish', finalTask);
+          await finishV5Job(workspaceRoot, finalTask);
+          worker.state = 'idle';
+          worker.task_id = null;
+          await queueWorkerWrite();
+          continue;
+        }
+        const v4Task = task as TaskRecordV2;
+        await options.fault?.('after_claim', v4Task);
         let finalTask = await executeCalibrationTaskV2(directory, dependencies);
         await options.fault?.('after_execute', finalTask);
         await heartbeatChain;
@@ -626,13 +702,11 @@ export async function runWorker(
         await options.fault?.('before_finish', finalTask);
         await finishJob(workspaceRoot, finalTask);
       } catch (error) {
+        if (error instanceof SimulatedV5Crash) throw error.cause;
         try {
-          const outcome = await containJobFailure(
-            workspaceRoot,
-            job,
-            error,
-            !localRecoveryAttempted.has(job.task_id),
-          );
+          const outcome = v5
+            ? await containV5Failure(workspaceRoot, job, error)
+            : await containJobFailure(workspaceRoot, job, error, !localRecoveryAttempted.has(job.task_id));
           if (outcome === 'requeued') localRecoveryAttempted.add(job.task_id);
         } catch (containError) {
           quarantined.add(job.task_id);

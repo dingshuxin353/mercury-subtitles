@@ -132,7 +132,9 @@ describe('V02-D002 crash recovery and query safety', () => {
       ['task', 'result', submitted.task.task_id, '--json'],
       ['worker', 'status', '--json'],
     ]) {
-      expect(await runCli(args, { homeDirectory: input.home, stdout: () => {}, stderr: () => {} })).toBe(0);
+      const stdout: string[] = [];
+      expect(await runCli(args, { homeDirectory: input.home, stdout: (value) => stdout.push(value), stderr: () => {} })).toBe(0);
+      expect(JSON.parse(stdout[0]!).contract).toBe('mercury.cli/v1');
     }
     const watch = runCli(
       ['task', 'watch', submitted.task.task_id, '--after', '1', '--jsonl'],

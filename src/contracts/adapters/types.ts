@@ -1,9 +1,16 @@
 import type { CalibrationResult } from '../generated/calibration-result.js';
 import type { ModelSnapshotEntry } from '../generated/model-snapshot.js';
 import type { TranscriptRaw } from '../generated/transcript-raw.js';
+import type { AsrHintsDispatchEvidence, AsrHintsInput } from './asr.js';
 
 export interface AdapterAudioInput {
   sourcePath: string;
+  /**
+   * Bytes already read and verified by the owning runtime from one open file
+   * handle. When present, an Adapter must dispatch these exact bytes and must
+   * not reopen sourcePath for the request body.
+   */
+  verifiedBytes?: Uint8Array;
   pathRef: string;
   sha256: string;
   durationMs: number;
@@ -21,8 +28,10 @@ export interface AsrAdapterInput {
   modelSnapshotRef: string;
   model: ModelSnapshotEntry & { role: 'asr'; adapter: 'volcengine_asr' };
   audio: AdapterAudioInput;
+  asrHints?: AsrHintsInput;
   beforeProviderDispatch?: (
     operation: 'volcengine_asr_recognize' | 'volcengine_subtitle_submit' | 'volcengine_subtitle_query',
+    evidence?: { asrHints?: AsrHintsDispatchEvidence },
   ) => Promise<void>;
 }
 

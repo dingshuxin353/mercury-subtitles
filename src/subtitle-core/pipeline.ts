@@ -84,6 +84,12 @@ export function runSubtitleCore(input: SubtitleCoreInput): SubtitleCoreResult {
   const modeResult = resolveMode(input.referenceSrtText, input.requestedMode);
   if ('issue' in modeResult) return rejected(modeResult.issue);
   const mode = modeResult.mode;
+  if (input.referenceSrtText !== null && input.transcriptSourceMode != null) {
+    return rejected({ code: 'TRANSCRIPT_SOURCE_MODE_CONFLICT', message: 'Transcript-source mode cannot be combined with reference SRT.' });
+  }
+  const documentMode = input.referenceSrtText === null && input.transcriptSourceMode != null
+    ? input.transcriptSourceMode
+    : mode;
   const expectedReference = input.referenceSrtText === null ? null : 'input/reference.srt';
   if (
     calibration.request.reference_srt_ref !== expectedReference ||
@@ -124,7 +130,7 @@ export function runSubtitleCore(input: SubtitleCoreInput): SubtitleCoreResult {
     calibration.suggestions,
     transcript,
     alignment,
-    mode,
+    documentMode,
     referenceSegments,
     documentUsesReference,
     nextModificationId
@@ -135,8 +141,10 @@ export function runSubtitleCore(input: SubtitleCoreInput): SubtitleCoreResult {
     ...alignmentWarnings(alignment),
     ...applied.warnings
   ];
-  if (mode === 'text-only' && referenceSegments) {
-    segments = textOnlySegments(applied.document, referenceSegments, transcript, alignment, applied.modifications);
+  if (documentMode === 'text-only') {
+    segments = referenceSegments
+      ? textOnlySegments(applied.document, referenceSegments, transcript, alignment, applied.modifications)
+      : transcriptTextOnlySegments(applied.document, transcript, applied.modifications);
     const illegalSegment = segments.find((segment) =>
       countSubtitleCharacters(segment.text) > HARD_MAX_CHARACTERS || lineCount(segment.text) > 2
     );
@@ -183,7 +191,7 @@ export function runSubtitleCore(input: SubtitleCoreInput): SubtitleCoreResult {
   const artifact: CalibratedTranscript = {
     artifact_version: '1.0.0',
     task_id: transcript.task_id,
-    mode,
+    mode: documentMode,
     thresholds_version: SUBTITLE_THRESHOLDS_VERSION,
     source_refs: {
       transcript_ref: 'work/transcript.raw.json',
@@ -383,6 +391,32 @@ function textOnlySegments(
         .filter((segment) => segment.end_ms > reference.start_ms && segment.start_ms < reference.end_ms)
         .map((segment) => segment.segment_id),
       reference_segment_refs: [reference.reference_segment_id]
+    };
+  });
+}
+
+function transcriptTextOnlySegments(
+  document: DocumentCharacter[],
+  transcript: TranscriptRaw,
+  modifications: SubtitleModification[]
+): CalibratedSubtitleSegment[] {
+  return transcript.segments.map((source, index) => {
+    const text = document
+      .filter((entry) => entry.sourceRefs.includes(source.segment_id))
+      .map((entry) => entry.value)
+      .join('');
+    const appliedConfidence = modifications
+      .filter((modification) => modification.applied && modification.original_segment_refs.includes(source.segment_id))
+      .map((modification) => modification.confidence);
+    return {
+      subtitle_segment_id: subtitleId(index),
+      index,
+      start_ms: source.start_ms,
+      end_ms: source.end_ms,
+      text,
+      confidence: lowestConfidence(appliedConfidence),
+      asr_segment_refs: [source.segment_id],
+      reference_segment_refs: [],
     };
   });
 }

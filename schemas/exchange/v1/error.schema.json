@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercury.local/schemas/exchange/v1/error.schema.json",
+  "title": "ExchangeErrorV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "code", "category", "message", "retryability", "provider_outcome", "remediation", "technical", "extensions"],
+  "properties": {
+    "contract": { "const": "mercury.error/v1" },
+    "code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{2,79}$" },
+    "category": { "enum": ["input", "config", "provider", "runtime", "compatibility", "security", "conflict"] },
+    "message": { "type": "string", "minLength": 1, "maxLength": 1000, "pattern": "\\S" },
+    "retryability": { "enum": ["safe", "unsafe", "after_user_action", "not_applicable"] },
+    "provider_outcome": { "enum": ["not_dispatched", "known_terminal", "response_persisted", "outcome_unknown", "not_applicable"] },
+    "remediation": { "type": "array", "minItems": 1, "maxItems": 10, "items": { "type": "string", "minLength": 1, "maxLength": 500, "pattern": "\\S" } },
+    "technical": {
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["provider_code", "log_id", "detail"],
+          "properties": {
+            "provider_code": { "type": ["string", "null"], "maxLength": 100 },
+            "log_id": { "type": ["string", "null"], "maxLength": 200 },
+            "detail": { "type": ["string", "null"], "maxLength": 2000 }
+          }
+        }
+      ]
+    },
+    "extensions": { "$ref": "common.schema.json#/$defs/extensions" }
+  }
+}
