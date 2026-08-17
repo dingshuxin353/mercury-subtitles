@@ -19,6 +19,33 @@ mercury dictionary show <dictionary-id> --json
 
 For `models.asr` and `models.chat`, copy only an exact Mercury model instance ID from `config status.data.defaults` or a ready `config status.data.models[].model_id`. Never use `provider`, `name`, or `category` as a model ID. If the selected model ID changes after a request was derived, that is a new logical request: derive a new stable request ID and write a new request file; never reuse the old ID.
 
+## Create and maintain a dictionary
+
+`--scope` is exactly `global` or `project`. A project dictionary also requires `--project <project-key>`. Create one, then copy `data.dictionary_id` and `data.revision` from the successful envelope:
+
+```sh
+mercury dictionary create --name "通用术语" --scope global --json
+mercury dictionary create --name "项目术语" --scope project --project "demo-project" --json
+```
+
+Every entry ID must match `entry-[a-z0-9][a-z0-9-]{2,63}`. `--kind` is one of `term|person|brand|product|acronym|other`; repeat `--variant` or `--tag` for multiple values. Add the first entry with the current revision returned by create:
+
+```sh
+mercury dictionary entry add <dictionary-id> --revision <current-revision> --entry-id entry-product-name --canonical "Mercury" --variant "水星" --kind product --language zh-CN --case-sensitive false --number-sensitive false --enabled true --json
+```
+
+Every successful mutation returns `data.dictionary.revision`. Use that new revision for the next write. Never reuse an old revision; `DICTIONARY_REVISION_CONFLICT` means reread the dictionary and reapply only the intended change.
+
+```sh
+mercury dictionary show <dictionary-id> --json
+mercury dictionary entry edit <dictionary-id> --revision <latest-revision> --entry-id entry-product-name --canonical "Mercury 字幕" --clear-variants --clear-tags --clear-notes --case-sensitive false --number-sensitive false --enabled true --json
+mercury dictionary entry remove <dictionary-id> --revision <latest-revision> --entry-id entry-product-name --json
+```
+
+On edit, omit a field to keep it. Use explicit `true|false` for `--case-sensitive`, `--number-sensitive`, and `--enabled`; use `--clear-variants`, `--clear-tags`, or `--clear-notes` to clear those values.
+
+The first positive flow is: create → read `data.dictionary_id` and `data.revision` → add an `entry-...` entry → read the mutation's new `data.dictionary.revision` (or run `dictionary show`) → put only the dictionary ID string in the Exchange request, for example `"selected": ["dict-project-terms"]`. Mercury pins that revision and content hash in the task snapshot.
+
 ## Build and submit Exchange request v1
 
 Create a private temporary JSON file (0600). `request_id` must be stable and non-random: hash a stable Agent/user logical-run key together with the exact inspected input hashes, selected model IDs, mode, dictionary references and delivery directory; use `req-` plus 40 lowercase hex characters. Record the ID and file path before submit. Never put transcript text or credentials in the logical key.

@@ -24,7 +24,7 @@ export function stableSuccess<T>(command: string, data: T, version: string): Sta
 
 function category(code: string): ExchangeErrorV1['category'] {
   if (/^DELIVERY_PATH_UNSAFE$/u.test(code)) return 'security';
-  if (/^(?:DELIVERY_CONFLICT|DELIVERY_NOT_READY)$/u.test(code)) return 'conflict';
+  if (/^(?:DELIVERY_CONFLICT|DELIVERY_NOT_READY|REVIEW_NOT_READY)$/u.test(code)) return 'conflict';
   if (/^(?:DELIVERY_DIRECTORY_INVALID|DELIVERY_DIRECTORY_NOT_WRITABLE|DELIVERY_NOT_REQUESTED)$/u.test(code)) return 'input';
   if (/^(?:INPUT|TRANSCRIPT|SRT|VTT|REQUEST_INVALID|CLI_|DICTIONARY_IMPORT_INVALID)/u.test(code)) return 'input';
   if (/^(?:MODEL|CONFIG|MIGRATION)/u.test(code)) return 'config';
@@ -53,7 +53,7 @@ export function stableErrorFrom(error: unknown): { error: ExchangeErrorV1; exitC
         return sensitiveTextIssues(message).length > 0 ? '操作失败，原始错误包含敏感信息，已脱敏。' : message;
       })(),
       retryability: mercury.code === 'RETRY_UNSAFE_PROVIDER_OUTCOME' ? 'unsafe'
-        : /^(?:DELIVERY_|TASK_RESUME_UNSAFE|RETRY_)/u.test(mercury.code) ? 'after_user_action' : 'not_applicable',
+        : /^(?:DELIVERY_|REVIEW_NOT_READY|TASK_RESUME_UNSAFE|RETRY_)/u.test(mercury.code) ? 'after_user_action' : 'not_applicable',
       provider_outcome: mercury.code === 'RETRY_UNSAFE_PROVIDER_OUTCOME' ? 'outcome_unknown' : 'not_applicable',
       remediation: [mercury.remediation ?? (mercury.code === 'RETRY_UNSAFE_PROVIDER_OUTCOME'
         ? '不要重放当前 attempt；如用户明确接受可能重复计费，请使用新的逻辑 request ID 创建新任务。'

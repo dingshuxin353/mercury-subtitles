@@ -4,7 +4,7 @@ import { MercuryError } from '../errors.js';
 import { readProductVersion } from '../version.js';
 import { applyConfigMigration, inspectConfigMigration } from './config.js';
 import { stableFailure, stableSuccess } from './envelope.js';
-import { createdAtOf, decodeTaskCursor, findTaskReadOnly, listTasksReadOnly, stableCancelTask, stableDeliverTask, stableEventsAfter, stablePauseTask, stableResumeTask, stableRetryPlan, stableRetryTask, stableTaskResult, stableTaskView, taskCursor, taskIdOf } from './tasks.js';
+import { assertStableReviewReady, createdAtOf, decodeTaskCursor, findTaskReadOnly, listTasksReadOnly, stableCancelTask, stableDeliverTask, stableEventsAfter, stablePauseTask, stableResumeTask, stableRetryPlan, stableRetryTask, stableTaskResult, stableTaskView, taskCursor, taskIdOf } from './tasks.js';
 import { readStableJson, writeStableJsonAtomic } from '../exchange/storage.js';
 import { projectV5Task, submitExchangeRequest } from '../exchange/runtime.js';
 import { startDetachedWorker, workerStatus } from '../background/worker.js';
@@ -142,6 +142,7 @@ export async function tryRunStableCli(args: string[], context: StableCliContext)
       else exactJson(reviewArgs.slice(1));
       const record = await findTaskReadOnly(context.workspaceRoot, taskId);
       if (!('identity' in record)) throw new MercuryError('CONTRACT_UNSUPPORTED', '此历史任务不支持稳定人工审阅命令。', { exitCode: 5 });
+      assertStableReviewReady(record);
       const directory = path.join(context.workspaceRoot, 'tasks', record.identity.task_directory);
       const actorText = value(reviewArgs, '--actor');
       if (actorText && !['cli', 'skill'].includes(actorText)) throw new MercuryError('CLI_ARGUMENT_INVALID', '--actor 只能是 cli 或 skill。', { exitCode: 2 });

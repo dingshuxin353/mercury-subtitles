@@ -7,7 +7,7 @@ import { ensureWorkspace } from '../src/workspace.js';
 import { loadModelRegistryV2 } from '../src/models-v2.js';
 import { runWorker } from '../src/background/worker.js';
 import { appendV5Event, auditV5Job, cancelV5Task, claimV5Job, executeV5Retry, pauseV5Task, persistV5Task, planV5Retry, readV5Events, readV5Task, resumeV5Task, submitExchangeRequest } from '../src/exchange/runtime.js';
-import { findTaskReadOnly, stablePauseTask, stableTaskResult, stableTaskView } from '../src/stable-cli/tasks.js';
+import { assertStableReviewReady, findTaskReadOnly, stablePauseTask, stableTaskResult, stableTaskView } from '../src/stable-cli/tasks.js';
 import { createDictionary, makeDictionaryEntry, mutateDictionary } from '../src/dictionary.js';
 import { runCli } from '../src/cli.js';
 import type { AsrAdapter, AsrHintsCapableAdapter, ExchangeRequestV1 } from '../src/contracts/index.js';
@@ -2606,6 +2606,55 @@ describe('Exchange v1 external transcript task', () => {
       expect((await readV5Task(directory)).execution).toMatchObject({ attempt_count: 1, provider_calls: { chat: { count: 1 } } });
       expect(calls).toEqual(['chat']);
     }
+  });
+
+  it('keeps REVIEW_NOT_READY aligned with the active task action and strictly read-only', async () => {
+    const input = await prepared(); input.request.request_id = 'request-alpha2-review-not-ready-action';
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+
+    for (const status of ['queued', 'running', 'pausing', 'paused', 'needs_input'] as const) {
+      const candidate = structuredClone(submitted.task);
+      candidate.status = status;
+      try {
+        assertStableReviewReady(candidate);
+        throw new Error(`expected REVIEW_NOT_READY for ${status}`);
+      } catch (error) {
+        expect(error).toMatchObject({ code: 'REVIEW_NOT_READY', exitCode: 3 });
+        const remediation = (error as { remediation: string }).remediation;
+        expect(remediation).not.toContain('核对命令');
+        expect(remediation).not.toContain('finalize');
+        expect(remediation).not.toContain('deliver');
+        if (status === 'paused') expect(remediation).toContain(`mercury task resume ${submitted.task.identity.task_id} --json`);
+      }
+    }
+
+    const queuedBefore = await directoryManifest(directory);
+    const queuedOutput: string[] = [];
+    expect(await runCli(['review', 'status', submitted.task.identity.task_id, '--json'], {
+      homeDirectory: input.home,
+      stdout: (line) => queuedOutput.push(line),
+      stderr: () => { throw new Error('stable review must not use stderr'); },
+    })).toBe(3);
+    expect(JSON.parse(queuedOutput[0]!)).toMatchObject({
+      contract: 'mercury.cli/v1', command: 'review.status', ok: false,
+      error: { code: 'REVIEW_NOT_READY', category: 'conflict', retryability: 'after_user_action', remediation: [expect.stringContaining('worker start')] },
+    });
+    expect(await directoryManifest(directory)).toEqual(queuedBefore);
+
+    const paused = (await pauseV5Task(input.workspace, submitted.task)).task;
+    const pausedBefore = await directoryManifest(directory);
+    const pausedOutput: string[] = [];
+    expect(await runCli(['review', 'list', paused.identity.task_id, '--limit', '10', '--json'], {
+      homeDirectory: input.home,
+      stdout: (line) => pausedOutput.push(line),
+      stderr: () => { throw new Error('stable review must not use stderr'); },
+    })).toBe(3);
+    const pausedError = JSON.parse(pausedOutput[0]!).error;
+    expect(pausedError).toMatchObject({ code: 'REVIEW_NOT_READY', category: 'conflict', retryability: 'after_user_action' });
+    expect(pausedError.remediation).toEqual([expect.stringContaining(`mercury task resume ${paused.identity.task_id} --json`)]);
+    expect(JSON.stringify(pausedError)).not.toMatch(/finalize|deliver|核对命令/iu);
+    expect(await directoryManifest(directory)).toEqual(pausedBefore);
   });
 
   it.each(['after_retry_ledger_appended', 'after_retry_task_committed', 'after_retry_job_committed'] as const)('recovers the retry %s window with one append-only attempt and no duplicate call', async (point) => {

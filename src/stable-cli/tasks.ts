@@ -139,6 +139,28 @@ export async function stableDeliverTask(workspaceRoot: string, record: Compatibl
   return { task: await projectV5Task(directory, delivered), result: await projectV5Result(directory, delivered) };
 }
 
+export function assertStableReviewReady(record: TaskRecordV5): void {
+  if (record.status === 'completed' && record.artifacts.transcribed && record.artifacts.calibrated) return;
+  const taskId = record.identity.task_id;
+  const remediation = record.status === 'queued'
+    ? '任务仍在队列中。先查看 task status；若 Worker 已停止，显式执行 mercury worker start --json，然后等待任务形成 AI 校验稿。'
+    : record.status === 'running'
+      ? 'Worker 正在处理任务。请等待并只读查询 task status，直到任务形成 AI 校验稿。'
+      : record.status === 'pausing'
+        ? '暂停正在安全收敛。请等待 task status 进入 paused，再按其当前动作继续。'
+        : record.status === 'paused'
+          ? `先执行 mercury task resume ${taskId} --json 继续同一 attempt，再等待任务形成 AI 校验稿。`
+          : record.status === 'needs_input'
+            ? '任务正在等待输入。请先按 task status 的 error.remediation 和当前动作补齐输入。'
+            : record.status === 'completed'
+              ? '任务缺少可验证的审阅来源。请只读查看 task status 和 task result，并保留现有证据。'
+              : '此任务没有形成可审阅的 AI 校验稿。请按 task status 的 error.remediation 和当前动作处理。';
+  throw new MercuryError('REVIEW_NOT_READY', `任务当前为 ${record.status}，尚未形成可审阅的 AI 校验稿。`, {
+    exitCode: 3,
+    remediation,
+  });
+}
+
 export async function stableEventsAfter(workspaceRoot: string, record: CompatibleTask, after: number): Promise<ExchangeEventV1[]> {
   if ('identity' in record) return readV5Events(path.join(workspaceRoot, 'tasks', record.identity.task_directory), after);
   if ((record as unknown as { schema_version?: string }).schema_version !== '4.0.0') return [];
