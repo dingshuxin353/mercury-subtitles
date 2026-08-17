@@ -2050,7 +2050,7 @@ describe('Exchange v1 external transcript task', () => {
     const taskBefore = await readFile(path.join(directory, 'task.json'));
     const jobPath = path.join(input.workspace, 'runtime/jobs', `${failed.identity.task_id}.json`);
     const jobBefore = await readFile(jobPath);
-    await expect(executeV5Retry(input.workspace, failed, plan.plan_id)).rejects.toMatchObject({ code: 'EVENT_LOG_INVALID' });
+    await expect(executeV5Retry(input.workspace, failed, plan.plan_id)).rejects.toMatchObject({ code: 'RETRY_LEDGER_INVALID' });
     expect(await readFile(outside)).toEqual(outsideBefore.bytes);
     expect((await stat(outside)).mode & 0o777).toBe(outsideBefore.mode);
     expect(await readFile(path.join(directory, 'task.json'))).toEqual(taskBefore);
@@ -2134,17 +2134,93 @@ describe('Exchange v1 external transcript task', () => {
     expect(calls).toEqual(['chat']);
   });
 
-  it('rejects a stale or expired retry plan without appending an attempt', async () => {
+  it('refreshes an expired read-only plan without changing the task and rejects the old plan', async () => {
+    const input = await prepared(); input.request.request_id = 'request-alpha2-retry-expired-refresh';
+    const submitted = await submitExchangeRequest(input.workspace, input.request); const calls: string[] = [];
+    await runWorker(input.workspace, { chatRuntime: knownFailureChat(calls) });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory); const failed = await readV5Task(directory);
+    const plan = await planV5Retry(directory, failed, new Date(failed.updated_at));
+    const afterExpiry = new Date(new Date(plan.expires_at).getTime() + 1);
+    const beforeRefresh = await directoryManifest(directory);
+    const refreshed = await planV5Retry(directory, failed, afterExpiry);
+    expect(refreshed.plan_id).not.toBe(plan.plan_id);
+    expect(new Date(refreshed.created_at).getTime()).toBe(new Date(plan.expires_at).getTime());
+    expect(new Date(refreshed.expires_at).getTime()).toBeGreaterThan(afterExpiry.getTime());
+    expect(await directoryManifest(directory)).toEqual(beforeRefresh);
+    await expect(executeV5Retry(input.workspace, failed, plan.plan_id, afterExpiry)).rejects.toMatchObject({ code: 'RETRY_PLAN_EXPIRED' });
+    expect(await directoryManifest(directory)).toEqual(beforeRefresh);
+    expect(await executeV5Retry(input.workspace, failed, refreshed.plan_id, afterExpiry)).toMatchObject({ status: 'queued', execution: { attempt_count: 2 } });
+    expect(calls).toEqual(['chat']);
+  });
+
+  it('rejects a retry plan after the task revision changes', async () => {
     const input = await prepared(); input.request.request_id = 'request-alpha2-retry-stale';
     const submitted = await submitExchangeRequest(input.workspace, input.request); const calls: string[] = [];
     await runWorker(input.workspace, { chatRuntime: knownFailureChat(calls) });
     const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory); const failed = await readV5Task(directory); const plan = await planV5Retry(directory, failed);
-    const afterExpiry = new Date(new Date(plan.expires_at).getTime() + 1);
-    await expect(executeV5Retry(input.workspace, failed, plan.plan_id, afterExpiry)).rejects.toMatchObject({ code: 'RETRY_PLAN_EXPIRED' });
     await appendV5Event(directory, failed, 'fixture_revision_changed', 'fixture revision changed');
     const before = await directoryManifest(directory);
     await expect(executeV5Retry(input.workspace, failed, plan.plan_id)).rejects.toMatchObject({ code: 'RETRY_PLAN_STALE' });
     expect(await directoryManifest(directory)).toEqual(before);
+  });
+
+  it('keeps retry-plan/status/result read-only and rejects missing or malformed complete ledger records', async () => {
+    for (const corruption of ['missing', 'malformed'] as const) {
+      const input = await prepared(); input.request.request_id = `request-alpha2-retry-ledger-${corruption}`;
+      const submitted = await submitExchangeRequest(input.workspace, input.request); const calls: string[] = [];
+      await runWorker(input.workspace, { chatRuntime: knownFailureChat(calls) });
+      const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory); const failed = await readV5Task(directory);
+      await writeFile(path.join(directory, 'attempts.jsonl'), corruption === 'missing' ? '' : 'not-json\n', { mode: 0o600 });
+      const before = await directoryManifest(directory);
+      const plan = await planV5Retry(directory, failed);
+      expect(plan).toMatchObject({ allowed: false, estimated_calls: { asr: 0, chat: 0 } });
+      expect(plan.reason).toContain('RETRY_LEDGER_INVALID');
+      const record = await findTaskReadOnly(input.workspace, failed.identity.task_id);
+      expect((await stableTaskView(input.workspace, record)).retry).toMatchObject({ allowed: false });
+      expect((await stableTaskResult(input.workspace, record)).status).toBe('failed');
+      expect(await directoryManifest(directory)).toEqual(before);
+      await expect(executeV5Retry(input.workspace, failed, plan.plan_id)).rejects.toMatchObject({ code: 'RETRY_LEDGER_INVALID' });
+      expect(await directoryManifest(directory)).toEqual(before);
+      expect(calls).toEqual(['chat']);
+    }
+  });
+
+  it('rejects retry ledgers with broken task, attempt, result, or Provider call identity', async () => {
+    const corruptions: Array<{ name: string; mutate: (records: any[]) => any[] }> = [
+      { name: 'task-identity', mutate: (records) => records.map((record, index) => index === 0 ? { ...record, task_id: 'tsk-20260817-000000-deadbeef' } : record) },
+      { name: 'missing-result', mutate: (records) => records.filter((record) => record.contract !== 'mercury.attempt-result/v1') },
+      { name: 'result-call-count', mutate: (records) => records.map((record) => record.contract === 'mercury.attempt-result/v1' ? { ...record, ending_call_counts: { ...record.ending_call_counts, chat: 0 } } : record) },
+      { name: 'provider-model-identity', mutate: (records) => records.map((record) => record.contract === 'mercury.provider-call/v1' ? { ...record, model_snapshot_entry_ref: 'wrong-model-entry' } : record) },
+    ];
+    for (const corruption of corruptions) {
+      const input = await prepared(); input.request.request_id = `request-alpha2-ledger-identity-${corruption.name}`;
+      const submitted = await submitExchangeRequest(input.workspace, input.request); const calls: string[] = [];
+      await runWorker(input.workspace, { chatRuntime: knownFailureChat(calls) });
+      const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory); const failed = await readV5Task(directory);
+      const target = path.join(directory, 'attempts.jsonl');
+      const records = (await readFile(target, 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line));
+      await writeFile(target, `${corruption.mutate(records).map((record) => JSON.stringify(record)).join('\n')}\n`, { mode: 0o600 });
+      const before = await directoryManifest(directory); const plan = await planV5Retry(directory, failed);
+      expect(plan).toMatchObject({ allowed: false, reason: expect.stringContaining('RETRY_LEDGER_INVALID') });
+      expect(await directoryManifest(directory)).toEqual(before);
+      await expect(executeV5Retry(input.workspace, failed, plan.plan_id)).rejects.toMatchObject({ code: 'RETRY_LEDGER_INVALID' });
+      expect(await directoryManifest(directory)).toEqual(before); expect(calls).toEqual(['chat']);
+    }
+  });
+
+  it('ignores a trailing partial retry record during read-only planning and repairs it only during execute', async () => {
+    const input = await prepared(); input.request.request_id = 'request-alpha2-retry-ledger-trailing-partial';
+    const submitted = await submitExchangeRequest(input.workspace, input.request); const calls: string[] = [];
+    await runWorker(input.workspace, { chatRuntime: knownFailureChat(calls) });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory); const failed = await readV5Task(directory);
+    await writeFile(path.join(directory, 'attempts.jsonl'), '{"partial":', { flag: 'a' });
+    const before = await directoryManifest(directory); const plan = await planV5Retry(directory, failed);
+    expect(plan.allowed).toBe(true); expect(await directoryManifest(directory)).toEqual(before);
+    await executeV5Retry(input.workspace, failed, plan.plan_id);
+    const source = await readFile(path.join(directory, 'attempts.jsonl'), 'utf8');
+    expect(source).not.toContain('{"partial":');
+    expect(source.endsWith('\n')).toBe(true);
+    expect(calls).toEqual(['chat']);
   });
 
   it('replays queued pause/resume idempotently and repairs every local control commit window', async () => {

@@ -1981,7 +1981,7 @@ function retryOutcome(task: TaskRecordV5): ProviderCall['outcome'] {
     ?? 'not_dispatched';
 }
 
-export async function planV5Retry(directory: string, input?: TaskRecordV5): Promise<ExchangeRetryPlanV1> {
+export async function planV5Retry(directory: string, input?: TaskRecordV5, now = new Date()): Promise<ExchangeRetryPlanV1> {
   const task = input ?? await readV5Task(directory);
   if (!hasTaskControl(task)) throw new MercuryError('CONTRACT_UNSUPPORTED', '此 Alpha.1 历史任务没有安全重试账本；查询未做任何写入。', { exitCode: 5 });
   await readVerifiedV5ModelSnapshot(directory, task);
@@ -1998,6 +1998,7 @@ export async function planV5Retry(directory: string, input?: TaskRecordV5): Prom
   const userInputProblem = task.error ? ['input', 'config', 'security'].includes(task.error.category) : false;
   let evidenceProblem: string | null = null;
   try {
+    await readVerifiedRetryLedger(directory, task);
     await verifyV5ImmutableInputs(directory, task);
     if (retryChatOnly) {
       await verifyInternalArtifact(directory, task.artifacts.transcript, 'RETRY_EVIDENCE_INVALID');
@@ -2031,8 +2032,12 @@ export async function planV5Retry(directory: string, input?: TaskRecordV5): Prom
   const discard = ['current_error', 'calibration_report'];
   if (retryChatOnly) discard.push('chat_response', 'calibrated_srt', 'approved_srt');
   else discard.push('asr_response', 'transcript', 'transcribed_srt', 'chat_response', 'calibrated_srt', 'approved_srt');
-  const createdAt = task.updated_at;
-  const expiresAt = new Date(new Date(createdAt).getTime() + 24 * 60 * 60 * 1000).toISOString();
+  const validityMs = 24 * 60 * 60 * 1000;
+  const taskTime = new Date(task.updated_at).getTime();
+  const effectiveNow = Math.max(taskTime, now.getTime());
+  const validityWindow = Math.floor((effectiveNow - taskTime) / validityMs);
+  const createdAt = new Date(taskTime + validityWindow * validityMs).toISOString();
+  const expiresAt = new Date(taskTime + (validityWindow + 1) * validityMs).toISOString();
   const normalized = {
     task_id: task.identity.task_id, task_revision: task.identity.revision, attempt_id: task.execution.attempt_id,
     checkpoint, provider_outcome: outcome, reuse, discard, estimated_calls: estimate,
@@ -2041,7 +2046,7 @@ export async function planV5Retry(directory: string, input?: TaskRecordV5): Prom
     risk: outcome === 'outcome_unknown' ? 'unsafe_provider_outcome' : allowed ? 'new_provider_calls' : 'none',
   };
   return assertExchangeContract('retryPlan', {
-    contract: 'mercury.retry-plan/v1', plan_id: `rpl-${digest(canonicalJson(normalized)).slice(0, 24)}`,
+    contract: 'mercury.retry-plan/v1', plan_id: `rpl-${digest(canonicalJson({ ...normalized, created_at: createdAt, expires_at: expiresAt })).slice(0, 24)}`,
     ...normalized, created_at: createdAt, expires_at: expiresAt, extensions: {},
   });
 }
@@ -2114,11 +2119,11 @@ async function archiveRetryArtifacts(directory: string, task: TaskRecordV5): Pro
 
 async function appendRetryAttemptFacts(directory: string, task: TaskRecordV5, plan: ExchangeRetryPlanV1, nextAttemptId: string, at: string): Promise<void> {
   const target = path.join(directory, 'attempts.jsonl');
-  await repairTrailingJsonlFragment(target);
-  const records = await readFile(target, 'utf8').then((source) => source.split('\n').filter(Boolean).map((line) => JSON.parse(line) as { contract?: string; attempt_id?: string; plan_id?: string })).catch((error) => {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+  await repairTrailingJsonlFragment(target).catch((error) => {
+    if (error instanceof MercuryError) throw new MercuryError('RETRY_LEDGER_INVALID', error.message);
     throw error;
   });
+  const records = await readVerifiedRetryLedger(directory, task);
   if (!records.some((entry) => entry.contract === 'mercury.retry/v1' && entry.plan_id === plan.plan_id)) {
     const previousArtifacts = await archiveRetryArtifacts(directory, task);
     await appendStableJsonLine(target, {
@@ -2142,6 +2147,7 @@ async function appendRetryAttemptFacts(directory: string, task: TaskRecordV5, pl
 }
 
 interface RetryLedgerRecord {
+  [key: string]: unknown;
   contract?: string;
   task_id?: string;
   number?: number;
@@ -2153,16 +2159,122 @@ interface RetryLedgerRecord {
   plan?: unknown;
 }
 
-async function readRetryLedger(directory: string): Promise<RetryLedgerRecord[]> {
+async function readRetryLedgerReadOnly(directory: string): Promise<RetryLedgerRecord[]> {
   const target = path.join(directory, 'attempts.jsonl');
-  await repairTrailingJsonlFragment(target);
-  return readFile(target, 'utf8').then((source) => source.split('\n').filter(Boolean).map((line) => {
-    try { return JSON.parse(line) as RetryLedgerRecord; }
-    catch { throw new MercuryError('RETRY_LEDGER_INVALID', 'attempt 账本损坏；未执行 retry 或 Provider 调用。'); }
-  })).catch((error) => {
+  let handle;
+  try {
+    const entry = await lstat(target);
+    if (!entry.isFile() || entry.isSymbolicLink() || entry.size > 8 * 1024 * 1024) throw new MercuryError('RETRY_LEDGER_INVALID', 'attempt 账本不是安全的 Mercury 普通文件。');
+    handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.dev !== entry.dev || opened.ino !== entry.ino) throw new MercuryError('RETRY_LEDGER_INVALID', 'attempt 账本在只读核验期间被替换。');
+    const source = await handle.readFile('utf8');
+    const complete = source.endsWith('\n') ? source : source.slice(0, source.lastIndexOf('\n') + 1);
+    return complete.split('\n').filter(Boolean).map((line) => {
+      try { return JSON.parse(line) as RetryLedgerRecord; }
+      catch { throw new MercuryError('RETRY_LEDGER_INVALID', 'attempt 账本包含损坏的完整记录；未执行 retry 或 Provider 调用。'); }
+    });
+  } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    if (error instanceof MercuryError) throw error;
+    throw new MercuryError('RETRY_LEDGER_INVALID', 'attempt 账本无法安全读取；未执行 retry 或 Provider 调用。');
+  } finally { await handle?.close().catch(() => undefined); }
+}
+
+function assertRetryLedgerIdentity(records: RetryLedgerRecord[], task: TaskRecordV5): void {
+  const invalid = (message: string): never => { throw new MercuryError('RETRY_LEDGER_INVALID', `${message}；未执行 retry 或 Provider 调用。`); };
+  if (!task.execution.attempt_id || task.execution.attempt_count < 1) invalid('当前终态任务缺少 attempt identity');
+  if (records.length === 0) invalid('当前任务缺少 append-only attempt 账本');
+  const knownContracts = new Set([
+    'mercury.attempt/v1', 'mercury.attempt-result/v1', 'mercury.attempt-result-correction/v1',
+    'mercury.provider-call/v1', 'mercury.retry/v1',
+  ]);
+  if (records.some((record) => typeof record.contract !== 'string' || !knownContracts.has(record.contract))) invalid('attempt 账本包含未知合同');
+  if (records.some((record) => record.task_id !== task.identity.task_id)) invalid('attempt 账本 task identity 不一致');
+  const starts = records.filter((record) => record.contract === 'mercury.attempt/v1');
+  const startIds = new Set<string>();
+  for (const [index, start] of starts.entries()) {
+    const attemptId = start.attempt_id;
+    if (typeof attemptId !== 'string' || startIds.has(attemptId) || start.number !== index + 1) invalid('attempt 起点缺失、重复或序号不连续');
+    startIds.add(attemptId as string);
+    if (typeof start.based_on_revision !== 'number' || start.based_on_revision < 1 || start.based_on_revision > task.identity.revision) invalid('attempt 起点 revision 无效');
+    if (index === 0 && start.source !== 'initial') invalid('首个 attempt 不是 initial');
+    if (index > 0 && (start.source !== 'retry' || typeof start.retry_plan_id !== 'string')) invalid('后续 attempt 缺少 retry plan 引用');
+  }
+  const pendingStarts = starts.length - task.execution.attempt_count;
+  if (pendingStarts < 0 || pendingStarts > 1) invalid('attempt 数量与 task attempt_count 不一致');
+  const currentStart = starts[task.execution.attempt_count - 1];
+  if (!currentStart || currentStart.attempt_id !== task.execution.attempt_id) invalid('当前 task attempt 与 append-only 起点不一致');
+  if (pendingStarts === 1) {
+    const pending = starts.at(-1)!;
+    const retry = records.find((record) => record.contract === 'mercury.retry/v1' && record.plan_id === pending.retry_plan_id);
+    if (!retry || retry.based_on_revision !== task.identity.revision || typeof retry.plan !== 'object' || retry.plan === null) invalid('预提交 retry attempt 缺少固定计划');
+  }
+  const results = records.filter((record) => record.contract === 'mercury.attempt-result/v1');
+  for (let number = 1; number <= task.execution.attempt_count; number += 1) {
+    const start = starts[number - 1]!;
+    const matching = results.filter((record) => record.attempt_id === start.attempt_id);
+    if (matching.length !== 1 || matching[0]!.number !== number) invalid('attempt 终态结果缺失、重复或序号不一致');
+  }
+  if (results.some((record) => !startIds.has(String(record.attempt_id)))) invalid('attempt result 引用了未知 attempt');
+  const currentResult = results.find((record) => record.attempt_id === task.execution.attempt_id)!;
+  const corrections = records.filter((record) => record.contract === 'mercury.attempt-result-correction/v1' && record.attempt_id === task.execution.attempt_id);
+  if (corrections.length > 1) invalid('当前 attempt correction 重复');
+  const effectiveStatus = corrections[0]?.status ?? currentResult.status;
+  if (effectiveStatus !== task.status) invalid('当前 attempt 终态与 task status 不一致');
+  const expectedError = corrections[0]?.reason_code ?? currentResult.error_code ?? null;
+  if (expectedError !== (task.error?.code ?? null)) invalid('当前 attempt 错误 identity 与 task 不一致');
+  const ending = currentResult.ending_call_counts as { asr?: unknown; chat?: unknown } | undefined;
+  if (!ending || ending.asr !== task.execution.provider_calls.asr.count || ending.chat !== task.execution.provider_calls.chat.count) invalid('当前 attempt Provider 计数与 task 不一致');
+  const resultOutcomes = currentResult.provider_outcomes as { asr?: unknown; chat?: unknown } | undefined;
+  if (!resultOutcomes || resultOutcomes.asr !== task.execution.provider_calls.asr.outcome || resultOutcomes.chat !== task.execution.provider_calls.chat.outcome) invalid('当前 attempt Provider outcome 与 task 不一致');
+  const calls = records.filter((record) => record.contract === 'mercury.provider-call/v1');
+  if (calls.some((record) => !startIds.has(String(record.attempt_id)))) invalid('Provider call 引用了未知 attempt');
+  for (const role of ['asr', 'chat'] as const) {
+    const roleCalls = calls.filter((record) => record.role === role);
+    const grouped = new Map<string, RetryLedgerRecord[]>();
+    for (const record of roleCalls) {
+      const callId = record.call_id;
+      if (typeof callId !== 'string' || typeof record.call_number !== 'number' || record.call_number < 1) invalid('Provider call identity 无效');
+      grouped.set(callId as string, [...(grouped.get(callId as string) ?? []), record]);
+    }
+    for (const phases of grouped.values()) {
+      if (phases.filter((record) => record.phase === 'dispatched').length !== 1 || phases.filter((record) => record.phase === 'terminal').length !== 1) invalid('Provider call phase 不完整或重复');
+      if (phases.filter((record) => record.phase === 'response_persisted').length > 1) invalid('Provider response phase 重复');
+      const order = phases.map((record) => ({ dispatched: 1, response_persisted: 2, terminal: 3 })[String(record.phase)] ?? 0);
+      if (order.includes(0) || order.some((value, index) => index > 0 && value <= order[index - 1]!)) invalid('Provider call phase 顺序无效');
+    }
+    const maxCount = roleCalls.reduce((maximum, record) => Math.max(maximum, Number(record.call_number)), 0);
+    if (maxCount !== task.execution.provider_calls[role].count) invalid(`当前 ${role} Provider call 序号与 task 不一致`);
+    const currentCall = task.execution.provider_calls[role];
+    if (currentCall.count > 0) {
+      const facts = roleCalls.filter((record) => record.call_id === currentCall.call_id && record.call_number === currentCall.count);
+      if (facts.length < 2 || facts.some((record) => record.attempt_id !== task.execution.attempt_id
+        || record.capability !== currentCall.capability
+        || record.model_snapshot_entry_ref !== currentCall.model_snapshot_entry_ref)) invalid(`当前 ${role} Provider call identity 与 task 不一致`);
+      const terminal = facts.find((record) => record.phase === 'terminal');
+      if (!terminal || terminal.outcome !== currentCall.outcome
+        || terminal.evidence_ref !== currentCall.evidence_ref
+        || terminal.evidence_sha256 !== currentCall.evidence_sha256) invalid(`当前 ${role} Provider terminal evidence 与 task 不一致`);
+    }
+  }
+}
+
+async function readVerifiedRetryLedger(directory: string, task: TaskRecordV5): Promise<RetryLedgerRecord[]> {
+  const records = await readRetryLedgerReadOnly(directory);
+  assertRetryLedgerIdentity(records, task);
+  return records;
+}
+
+async function readRetryLedger(directory: string, task?: TaskRecordV5): Promise<RetryLedgerRecord[]> {
+  const target = path.join(directory, 'attempts.jsonl');
+  await repairTrailingJsonlFragment(target).catch((error) => {
+    if (error instanceof MercuryError) throw new MercuryError('RETRY_LEDGER_INVALID', error.message);
     throw error;
   });
+  const records = await readRetryLedgerReadOnly(directory);
+  if (task) assertRetryLedgerIdentity(records, task);
+  return records;
 }
 
 async function ensureRetryScheduledEvent(directory: string, taskInput: TaskRecordV5, plan: ExchangeRetryPlanV1, attemptId: string): Promise<TaskRecordV5> {
@@ -2256,9 +2368,20 @@ export async function executeV5Retry(workspace: string, task: TaskRecordV5, plan
   const directory = taskRoot(workspace, task.identity.task_directory);
   return withTaskTransitionLock(directory, async () => {
     const current = await readV5Task(directory);
-    const plan = await planV5Retry(directory, current);
-    if (plan.plan_id !== planId || plan.task_revision !== current.identity.revision) throw new MercuryError('RETRY_PLAN_STALE', 'retry plan 与当前 task revision 不一致；请重新运行 retry-plan。', { exitCode: 3 });
-    if (now.getTime() > new Date(plan.expires_at).getTime()) throw new MercuryError('RETRY_PLAN_EXPIRED', 'retry plan 已过期；请重新运行 retry-plan。', { exitCode: 3 });
+    if (retryOutcome(current) === 'outcome_unknown') throw new MercuryError('RETRY_UNSAFE_PROVIDER_OUTCOME', 'Provider 结果不确定，安全 retry 被禁止；不得自动重放。', { exitCode: 3 });
+    if (current.execution.provider_calls.chat.state === 'response_persisted' || current.execution.provider_calls.asr.state === 'response_persisted') {
+      throw new MercuryError('RETRY_USE_RESUME', 'Provider 响应已经固定；请使用 task resume 继续本地工作，不要新增调用。', { exitCode: 3 });
+    }
+    await readVerifiedRetryLedger(directory, current);
+    const plan = await planV5Retry(directory, current, now);
+    if (plan.plan_id !== planId || plan.task_revision !== current.identity.revision) {
+      const previous = await planV5Retry(directory, current, new Date(new Date(plan.created_at).getTime() - 1));
+      if (previous.plan_id === planId && now.getTime() >= new Date(previous.expires_at).getTime()) {
+        throw new MercuryError('RETRY_PLAN_EXPIRED', 'retry plan 已过期；请重新运行 retry-plan 获取新的只读计划。', { exitCode: 3 });
+      }
+      throw new MercuryError('RETRY_PLAN_STALE', 'retry plan 与当前 task revision 或有效时间窗口不一致；请重新运行 retry-plan。', { exitCode: 3 });
+    }
+    if (now.getTime() >= new Date(plan.expires_at).getTime()) throw new MercuryError('RETRY_PLAN_EXPIRED', 'retry plan 已过期；请重新运行 retry-plan 获取新的只读计划。', { exitCode: 3 });
     if (!plan.allowed) {
       const code = plan.provider_outcome === 'outcome_unknown' ? 'RETRY_UNSAFE_PROVIDER_OUTCOME' : plan.provider_outcome === 'response_persisted' ? 'RETRY_USE_RESUME' : 'RETRY_NOT_ALLOWED';
       throw new MercuryError(code, plan.reason ?? '当前任务不能安全 retry。', { exitCode: 3 });
@@ -2303,8 +2426,8 @@ export async function auditV5Job(workspace: string, listed: BackgroundJobV1): Pr
         await appendV5Event(directory, current, terminalType, cancellation?.message ?? '后台任务已在安全审计中确认终态。', cancellation?.data ?? {});
         current = await readV5Task(directory);
       }
-      await writeV5Result(directory, current);
       await ensureAttemptResultFact(directory, current);
+      await writeV5Result(directory, current);
       if (job.state !== 'terminal') { job.state = 'terminal'; job.updated_at = new Date().toISOString(); await writeJob(workspace, job); }
       return;
     }
