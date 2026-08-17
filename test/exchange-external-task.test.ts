@@ -149,6 +149,78 @@ async function forceStrongEvidence(directory: string, useGemini = false) {
 }
 
 describe('Exchange v1 external transcript task', () => {
+  it('sends equivalent SRT and transcript JSON units through the same Gemini request shape', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'same-shape.mp3');
+    const bytes = Buffer.alloc(417 * 80);
+    for (let offset = 0; offset < bytes.length; offset += 417) bytes.set([0xff, 0xfb, 0x90, 0x64], offset);
+    await writeFile(audio, bytes);
+    const inspected = await inspectTranscriptInput({ filePath: input.source, format: 'srt', role: 'transcript_source' });
+    const jsonSource = path.join(input.home, 'same-shape.transcript.json');
+    const jsonText = `${JSON.stringify(inspected.transcript, null, 2)}\n`;
+    await writeFile(jsonSource, jsonText);
+    const commonMedia = { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' as const };
+    const srtSubmitted = await submitExchangeRequest(input.workspace, {
+      ...input.request,
+      request_id: 'request-same-shape-srt',
+      inputs: { media: commonMedia, transcript: input.request.inputs.transcript },
+    });
+    const jsonSubmitted = await submitExchangeRequest(input.workspace, {
+      ...input.request,
+      request_id: 'request-same-shape-json',
+      inputs: {
+        media: commonMedia,
+        transcript: { path: jsonSource, sha256: sha(jsonText), format: 'transcript_json', role: 'transcript_source' },
+      },
+    });
+    const srtDirectory = path.join(input.workspace, 'tasks', srtSubmitted.task.identity.task_directory);
+    const jsonDirectory = path.join(input.workspace, 'tasks', jsonSubmitted.task.identity.task_directory);
+    await forceStrongEvidence(srtDirectory, true);
+    await forceStrongEvidence(jsonDirectory, true);
+    const requests: any[] = [];
+    let providerCalls = 0;
+    await runWorker(input.workspace, {
+      captureRequest: (request) => { requests.push(request); },
+      createVertexClient: () => ({
+        interactions: { create: async () => { throw new Error('unexpected'); } },
+        models: {
+          generateContent: async (request: any) => {
+            providerCalls += 1;
+            const prompt = request.contents[0].parts[0].text;
+            const payload = JSON.parse(prompt.slice(prompt.lastIndexOf('\n') + 1));
+            return {
+              responseId: `same-shape-${providerCalls}`,
+              finishReason: 'STOP',
+              text: JSON.stringify({
+                corrected_units: payload.calibration_units.map((unit: any) => ({
+                  unit_id: unit.unit_id,
+                  corrected_text: unit.original_text,
+                  rationale: null,
+                })),
+              }),
+            };
+          },
+        },
+      }),
+    });
+
+    expect(providerCalls).toBe(2);
+    expect(requests).toHaveLength(2);
+    expect(requests[0].model).toBe(requests[1].model);
+    expect(requests[0].contents).toEqual(requests[1].contents);
+    expect(requests[0].config).toEqual(requests[1].config);
+    for (const directory of [srtDirectory, jsonDirectory]) {
+      const task = await readV5Task(directory);
+      expect(task.status, JSON.stringify(task.error)).toBe('completed');
+      expect(task.execution.provider_calls).toMatchObject({
+        asr: { count: 0, outcome: 'not_dispatched' },
+        chat: { count: 1, outcome: 'response_persisted' },
+      });
+      const response = JSON.parse(await readFile(path.join(directory, 'work/calibration-response.json'), 'utf8'));
+      expect(response.strategy.output_budget_tokens).toBe(12_288);
+    }
+  });
+
   it.each(['srt', 'vtt', 'transcript_json'] as const)('normalizes multiline %s cues only in the frozen v1 bridge and completes with zero ASR', async (format) => {
     const input = await prepared();
     const source = path.join(input.home, `multiline.${format === 'transcript_json' ? 'json' : format}`);
@@ -1868,6 +1940,86 @@ describe('Exchange v1 external transcript task', () => {
     const completed = await readV5Task(directory);
     expect(completed).toMatchObject({ status: 'completed', execution: { attempt_id: attemptId, attempt_count: 1, provider_calls: { chat: { count: 1 } } } });
     expect(blockingFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('pins the actual Gemini budget through response_persisted pause/resume without replay', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'pause-gemini.mp3');
+    const bytes = Buffer.alloc(417 * 80);
+    for (let offset = 0; offset < bytes.length; offset += 417) bytes.set([0xff, 0xfb, 0x90, 0x64], offset);
+    await writeFile(audio, bytes);
+    const submitted = await submitExchangeRequest(input.workspace, {
+      ...input.request,
+      request_id: 'request-alpha2-gemini-budget-pause',
+      inputs: { ...input.request.inputs, media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' } },
+    });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    await forceStrongEvidence(directory, true);
+    let signalStarted!: () => void;
+    const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let providerCalls = 0;
+    const requests: any[] = [];
+    const dependencies = {
+      captureRequest: (request: Record<string, unknown>) => { requests.push(request); },
+      createVertexClient: () => ({
+        interactions: { create: async () => { throw new Error('unexpected'); } },
+        models: {
+          generateContent: async (request: any) => {
+            providerCalls += 1;
+            signalStarted();
+            await gate;
+            const prompt = request.contents[0].parts[0].text;
+            const payload = JSON.parse(prompt.slice(prompt.lastIndexOf('\n') + 1));
+            return {
+              responseId: 'gemini-budget-pause',
+              finishReason: 'STOP',
+              text: JSON.stringify({
+                corrected_units: payload.calibration_units.map((unit: any) => ({
+                  unit_id: unit.unit_id,
+                  corrected_text: unit.original_text,
+                  rationale: null,
+                })),
+              }),
+            };
+          },
+        },
+      }),
+    };
+    const worker = runWorker(input.workspace, dependencies);
+    await started;
+    expect((await pauseV5Task(input.workspace, await readV5Task(directory))).pending).toBe(true);
+    release();
+    await worker;
+
+    const paused = await readV5Task(directory);
+    expect(paused).toMatchObject({
+      status: 'paused',
+      execution: { safe_checkpoint: 'chat_response_persisted', provider_calls: { chat: { count: 1, state: 'response_persisted' } } },
+    });
+    expect(requests).toHaveLength(1);
+    expect(requests[0].config.maxOutputTokens).toBe(12_288);
+    const responsePath = path.join(directory, 'work/calibration-response.json');
+    const responseBytes = await readFile(responsePath);
+    const response = JSON.parse(responseBytes.toString('utf8'));
+    expect(response.strategy.output_budget_tokens).toBe(12_288);
+    expect(paused.execution.provider_calls.chat.evidence_sha256).toBe(sha(responseBytes));
+    const responseFacts = (await readFile(path.join(directory, 'attempts.jsonl'), 'utf8'))
+      .trim().split('\n').map((line) => JSON.parse(line))
+      .filter((entry) => entry.contract === 'mercury.provider-call/v1' && entry.phase === 'response_persisted');
+    expect(responseFacts).toEqual([
+      expect.objectContaining({ attempt_id: paused.execution.attempt_id, evidence_sha256: sha(responseBytes) }),
+    ]);
+
+    await resumeV5Task(input.workspace, paused);
+    await runWorker(input.workspace, dependencies);
+    const completed = await readV5Task(directory);
+    expect(completed.status).toBe('completed');
+    expect(completed.execution.attempt_id).toBe(paused.execution.attempt_id);
+    expect(completed.execution.provider_calls.chat.count).toBe(1);
+    expect(providerCalls).toBe(1);
+    expect(JSON.parse(await readFile(responsePath, 'utf8')).strategy.output_budget_tokens).toBe(12_288);
   });
 
   it('waits for an in-flight ASR response, then resumes from the pinned response without replaying ASR', async () => {

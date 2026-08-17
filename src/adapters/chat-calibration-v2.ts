@@ -237,8 +237,25 @@ function calibrationUnits(input: ChatCalibrationV2Input): CalibrationUnit[] {
   });
 }
 
-function outputBudget(unitCount: number): number {
+export function calibrationBaseOutputBudget(unitCount: number): number {
   return Math.min(32_768, Math.max(4_096, unitCount * 160));
+}
+
+export function calibrationOutputBudget(
+  unitCount: number,
+  provider: 'gemini' | 'non_gemini',
+): number {
+  const baseBudget = calibrationBaseOutputBudget(unitCount);
+  return provider === 'gemini'
+    ? Math.min(32_768, baseBudget + 8_192)
+    : baseBudget;
+}
+
+function outputBudget(input: ChatCalibrationV2Input, unitCount: number): number {
+  return calibrationOutputBudget(
+    unitCount,
+    input.model.plugin_id === 'gemini' ? 'gemini' : 'non_gemini',
+  );
 }
 
 function providerRequestCompatibility(endpoint: URL): Record<string, unknown> {
@@ -251,6 +268,7 @@ function providerRequestCompatibility(endpoint: URL): Record<string, unknown> {
 }
 
 function strategy(
+  input: ChatCalibrationV2Input,
   units: readonly CalibrationUnit[],
   returnedUnitCount: number,
   coverageComplete: boolean,
@@ -259,7 +277,7 @@ function strategy(
   return {
     prompt_version: CALIBRATION_PROMPT_VERSION,
     response_contract_version: CALIBRATION_RESPONSE_CONTRACT_VERSION,
-    output_budget_tokens: outputBudget(units.length),
+    output_budget_tokens: outputBudget(input, units.length),
     provider_finish_reason: finishReason,
     input_unit_count: units.length,
     returned_unit_count: returnedUnitCount,
@@ -736,7 +754,7 @@ abstract class CompleteCalibrationRuntimeBase {
         outcome: 'failed',
         error_ref: error.error_id,
       },
-      strategy: strategy(units, returnedUnitCount, false, finishReason),
+      strategy: strategy(input, units, returnedUnitCount, false, finishReason),
       corrected_units: [],
       suggestions: [],
       warnings: [],
@@ -782,7 +800,7 @@ abstract class CompleteCalibrationRuntimeBase {
         outcome: 'completed',
         error_ref: null,
       },
-      strategy: strategy(units, returned.length, true, finishReason),
+      strategy: strategy(input, units, returned.length, true, finishReason),
       corrected_units: normalized.corrected,
       suggestions: normalized.suggestions,
       warnings: [],
@@ -879,7 +897,7 @@ export class OpenAiChatCalibrationRuntimeV2
         { role: 'user', content: prompt(input, units) },
       ],
       response_format: { type: 'json_object' },
-      max_tokens: outputBudget(units.length),
+      max_tokens: outputBudget(input, units.length),
       temperature: 0,
       stream: true,
       ...providerRequestCompatibility(endpoint),
@@ -1165,7 +1183,7 @@ export class GeminiChatCalibrationRuntimeV2
           model: input.model.provider_model,
           store: false,
           input: parts,
-          max_output_tokens: outputBudget(units.length),
+          max_output_tokens: outputBudget(input, units.length),
           response_format: {
             type: 'text',
             mime_type: 'application/json',
@@ -1186,7 +1204,7 @@ export class GeminiChatCalibrationRuntimeV2
           model: input.model.provider_model,
           contents: [{ role: 'user', parts }],
           config: {
-            maxOutputTokens: outputBudget(units.length),
+            maxOutputTokens: outputBudget(input, units.length),
             responseMimeType: 'application/json',
             responseJsonSchema: schema,
           },
