@@ -185,9 +185,12 @@ describe('Exchange Protocol v1 contracts', () => {
       review: { status: 'not_ready', pending_count: null }, warnings: [], error: null,
     };
     expect(validateV5TaskRecord(record).valid).toBe(true);
-    const syntheticReference = structuredClone(record);
-    syntheticReference.calibration_sources.reference = { path: 'input/reference.srt', sha256: hash, validation: 'passed' };
-    expect(validateV5TaskRecord(syntheticReference).valid).toBe(false);
+    const legacyProvidedReference = structuredClone(record);
+    legacyProvidedReference.calibration_sources.reference = { path: 'input/reference.srt', sha256: hash, validation: 'passed' };
+    expect(validateV5TaskRecord(legacyProvidedReference).valid).toBe(true);
+    const unexpectedSyntheticReference = structuredClone(record);
+    unexpectedSyntheticReference.calibration_sources.reference = { path: 'input/not-a-legacy-reference.srt', sha256: hash, validation: 'passed' };
+    expect(validateV5TaskRecord(unexpectedSyntheticReference).valid).toBe(false);
     const missing = structuredClone(record);
     delete missing.inputs;
     expect(validateV5TaskRecord(missing).valid).toBe(false);
