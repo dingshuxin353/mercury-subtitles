@@ -87,8 +87,8 @@ mercury
 需要脚本化时，再使用高级命令：
 
 ```bash
-# 后台提交，并立即返回任务 ID
-mercury calibrate --audio "/绝对路径/访谈.mp3" --background --json
+# 稳定后台提交，并立即返回任务 ID
+mercury task submit --request "/绝对路径/request.json" --json
 
 # 找回任务状态和结果
 mercury task status <task-id> --json
@@ -98,6 +98,8 @@ mercury task result <task-id> --json
 mercury worker status --json
 mercury worker start --json
 ```
+
+`request.json` 使用 Exchange Protocol v1，并必须包含一个稳定 `request_id`：同一次逻辑请求丢失输出后重试时复用它，用户明确要求重新处理时才生成新的 ID。外部字幕先用 `mercury input inspect ... --json` 检查，并在 request 中显式声明 `transcript_source` 或 `reference`；完整 request 字段见下方 CLI 文档。
 
 查询状态不会偷偷启动 Worker，也不会重复提交任务。Provider 结果不确定时，Mercury 会停下来阻止自动重放，避免重复调用或计费。
 

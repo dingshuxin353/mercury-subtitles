@@ -200,12 +200,42 @@ describe('Exchange v1 external transcript task', () => {
     await runWorker(input.workspace, { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
     const task = await readV5Task(path.join(input.workspace, 'tasks', submitted.task.identity.task_directory));
     expect(task.status).toBe('failed');
-    expect(task.error?.code).toBe('CALIBRATED_HARD_LIMIT_INVALID_FOR_TEXT_ONLY');
+    expect(task.error).toMatchObject({
+      code: 'CALIBRATED_HARD_LIMIT_INVALID_FOR_TEXT_ONLY',
+      category: 'input',
+      message: '校验后的字幕片段 subtitle-0001 超过 24 字或两行限制，且当前没有可安全拆分的真实时间边界。',
+      retryability: 'after_user_action',
+      remediation: ['请依据真实时间边界把该 cue/segment 拆成不超过 24 字且不超过两行的合规片段，并使用新的 request ID 创建任务；不要重放当前任务。'],
+    });
+    expect(task.error?.technical?.detail).toBe('Calibrated segment subtitle-0001 exceeds the 24-character or two-line hard limit.');
     expect(task.error?.code).not.toContain('REFERENCE');
     expect(task.calibration_sources.reference).toBeNull();
-    expect(task.execution.provider_calls).toMatchObject({ asr: { count: 0 }, chat: { count: 0, state: 'not_started' } });
+    expect(task.execution.provider_calls).toMatchObject({ asr: { count: 0, state: 'not_started', outcome: 'not_dispatched' }, chat: { count: 0, state: 'not_started', outcome: 'not_dispatched' } });
     expect(task.artifacts.transcribed?.validation).toBe('passed');
     expect(calls).toEqual([]);
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const before = await directoryManifest(directory);
+    const view = await stableTaskView(input.workspace, await findTaskReadOnly(input.workspace, task.identity.task_id));
+    const result = await stableTaskResult(input.workspace, await findTaskReadOnly(input.workspace, task.identity.task_id));
+    const watchOutput: string[] = [];
+    expect(await runCli(['task', 'watch', task.identity.task_id, '--jsonl'], {
+      homeDirectory: input.home,
+      stdout: (value) => watchOutput.push(value),
+      stderr: () => undefined,
+    })).toBe(0);
+    const watchSnapshot = JSON.parse(watchOutput[0]!).data.task;
+    for (const projected of [view, result, watchSnapshot]) {
+      expect(projected.error).toMatchObject({
+        code: 'CALIBRATED_HARD_LIMIT_INVALID_FOR_TEXT_ONLY',
+        category: 'input',
+        retryability: 'after_user_action',
+      });
+      expect(projected.error?.message).toContain('subtitle-0001');
+      expect(projected.error?.message).toContain('24 字或两行');
+      expect(projected.next_action).toBe('请依据真实时间边界把该 cue/segment 拆成不超过 24 字且不超过两行的合规片段，并使用新的 request ID 创建任务；不要重放当前任务。');
+      expect(projected.next_action).not.toContain('模型配置');
+    }
+    expect(await directoryManifest(directory)).toEqual(before);
   });
 
   it('runs provider plus reference through the same v5 request, dictionary, result, and review semantics', async () => {

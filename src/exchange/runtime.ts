@@ -536,6 +536,11 @@ function exchangeError(code: string, message: string, providerOutcome: 'not_disp
 }
 
 const REFERENCE_AUDIO_MISMATCH_ACTION = '参考字幕与音频正文不完整对齐；请换用覆盖同一音频范围的完整参考字幕，并使用新的 request ID 创建任务；不要重放当前任务。';
+const TEXT_ONLY_HARD_LIMIT_CODES = new Set([
+  'CALIBRATED_HARD_LIMIT_INVALID_FOR_TEXT_ONLY',
+  'REFERENCE_HARD_LIMIT_INVALID_FOR_TEXT_ONLY',
+]);
+const TEXT_ONLY_HARD_LIMIT_ACTION = '请依据真实时间边界把该 cue/segment 拆成不超过 24 字且不超过两行的合规片段，并使用新的 request ID 创建任务；不要重放当前任务。';
 
 function referenceAudioMismatchError(
   detail: string,
@@ -550,9 +555,32 @@ function referenceAudioMismatchError(
   return error;
 }
 
+function textOnlyHardLimitError(
+  code: string,
+  detail: string,
+  providerOutcome: NonNullable<TaskRecordV5['error']>['provider_outcome'],
+): NonNullable<TaskRecordV5['error']> {
+  const calibrated = /Calibrated segment ([A-Za-z0-9._:-]+) exceeds the 24-character or two-line hard limit\.?/u.exec(detail);
+  const reference = /Reference SRT block ([0-9]+) exceeds the 24-character or two-line hard limit\.?/u.exec(detail);
+  const message = calibrated
+    ? `校验后的字幕片段 ${calibrated[1]} 超过 24 字或两行限制，且当前没有可安全拆分的真实时间边界。`
+    : reference
+      ? `参考字幕第 ${reference[1]} 个 cue 超过 24 字或两行限制，且当前没有可安全拆分的真实时间边界。`
+      : '字幕片段超过 24 字或两行限制，且当前没有可安全拆分的真实时间边界。';
+  const error = exchangeError(code, message, providerOutcome, detail, 'input');
+  error.remediation = [TEXT_ONLY_HARD_LIMIT_ACTION];
+  return error;
+}
+
 function projectedTaskError(error: TaskRecordV5['error']): TaskRecordV5['error'] {
-  if (!error || error.code !== 'REFERENCE_AUDIO_MISMATCH') return error;
-  return referenceAudioMismatchError(error.technical?.detail ?? error.message, error.provider_outcome);
+  if (!error) return error;
+  if (error.code === 'REFERENCE_AUDIO_MISMATCH') {
+    return referenceAudioMismatchError(error.technical?.detail ?? error.message, error.provider_outcome);
+  }
+  if (TEXT_ONLY_HARD_LIMIT_CODES.has(error.code)) {
+    return textOnlyHardLimitError(error.code, error.technical?.detail ?? error.message, error.provider_outcome);
+  }
+  return error;
 }
 
 async function writeReport(directory: string, task: TaskRecordV5, snapshot: ModelSnapshotV3, calibration: CalibrationResultV3 | null): Promise<void> {
@@ -1093,7 +1121,9 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
         task.status = 'failed';
         task.stage = null; task.execution.ended_at = new Date().toISOString();
         const issue = calibration.errors[0]! as { code: string; message: string };
-        task.error = exchangeError(issue.code, issue.message, 'response_persisted', issue.message);
+        task.error = TEXT_ONLY_HARD_LIMIT_CODES.has(issue.code)
+          ? textOnlyHardLimitError(issue.code, issue.message, 'response_persisted')
+          : exchangeError(issue.code, issue.message, 'response_persisted', issue.message);
         return commitTerminalThenDerive(directory, task, snapshot, calibration, fault);
       }
     }
@@ -1153,7 +1183,9 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
       const detail = error instanceof Error ? error.message : '本地处理失败。';
       task.status = 'failed'; task.error = code === 'REFERENCE_AUDIO_MISMATCH'
         ? referenceAudioMismatchError(detail, task.execution.provider_calls.chat.outcome)
-        : exchangeError(code, detail, task.execution.provider_calls.chat.outcome, error instanceof Error ? error.message : null, 'runtime');
+        : TEXT_ONLY_HARD_LIMIT_CODES.has(code)
+          ? textOnlyHardLimitError(code, detail, task.execution.provider_calls.chat.outcome)
+          : exchangeError(code, detail, task.execution.provider_calls.chat.outcome, error instanceof Error ? error.message : null, 'runtime');
     }
     task.stage = null; task.execution.ended_at = new Date().toISOString(); return commitTerminalThenDerive(directory, task, snapshot, calibration, fault);
   }
@@ -1228,7 +1260,7 @@ export async function projectV5Task(directory: string, input?: TaskRecordV5): Pr
     attempt: { attempt_id: task.execution.attempt_id, count: task.execution.attempt_count },
     artifacts,
     review, error: visibleError,
-    next_action: task.status === 'queued' ? '任务已入队；查询不会启动 Worker。若 Worker 未运行，请显式执行 worker start。' : task.status === 'running' ? '任务正在后台处理，请稍后查询。' : task.status === 'completed' && ['finalized', 'not_required'].includes(review.status) ? '人工批准稿已生成，可以直接打开批准后字幕。' : task.status === 'completed' ? `校验后字幕已生成，还有 ${review.pending_count ?? 0} 项修改待人工审阅。` : task.status === 'interrupted' ? 'Provider 结果不确定；不要自动重试。' : task.status === 'cancelled' ? (artifacts.find((entry) => entry.identity === 'transcribed_srt')?.exists ? '任务已取消；纯转写字幕仍可使用。' : '任务已取消；尚未产生字幕文件。') : visibleError?.code === 'REFERENCE_AUDIO_MISMATCH' ? REFERENCE_AUDIO_MISMATCH_ACTION : '按错误提示检查输入或模型配置。',
+    next_action: task.status === 'queued' ? '任务已入队；查询不会启动 Worker。若 Worker 未运行，请显式执行 worker start。' : task.status === 'running' ? '任务正在后台处理，请稍后查询。' : task.status === 'completed' && ['finalized', 'not_required'].includes(review.status) ? '人工批准稿已生成，可以直接打开批准后字幕。' : task.status === 'completed' ? `校验后字幕已生成，还有 ${review.pending_count ?? 0} 项修改待人工审阅。` : task.status === 'interrupted' ? 'Provider 结果不确定；不要自动重试。' : task.status === 'cancelled' ? (artifacts.find((entry) => entry.identity === 'transcribed_srt')?.exists ? '任务已取消；纯转写字幕仍可使用。' : '任务已取消；尚未产生字幕文件。') : visibleError?.code === 'REFERENCE_AUDIO_MISMATCH' ? REFERENCE_AUDIO_MISMATCH_ACTION : visibleError && TEXT_ONLY_HARD_LIMIT_CODES.has(visibleError.code) ? TEXT_ONLY_HARD_LIMIT_ACTION : '按错误提示检查输入或模型配置。',
     source_schema_version: '5.0.0', capabilities: { pause: { supported: false, reason: 'Alpha.2 capability' }, resume: { supported: false, reason: 'Alpha.2 capability' }, retry: { supported: false, reason: 'Alpha.2 capability' }, review: { supported: true, reason: null }, dictionary_snapshot: { supported: true, reason: null }, provided_transcript: { supported: true, reason: null } }, extensions: {},
   });
 }

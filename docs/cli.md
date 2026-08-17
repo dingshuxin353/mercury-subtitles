@@ -17,18 +17,18 @@ mercury
 交互 App 从主页发起的新任务默认在后台执行。高级用户可直接使用：
 
 ```bash
-mercury calibrate --audio "/path/to/input.mp3" --background --json
-mercury calibrate --audio "/path/to/input.mp3" --srt "/path/to/reference.srt" --mode text-only --background --json
-mercury calibrate --audio "/path/to/input.mp3" --srt "/path/to/reference.srt" --mode text-and-segmentation --background --json
-```
-
-保存返回的 `task_id`。机器调用如需安全重放，应先用稳定逻辑身份派生 `request_id`，并在同一次用户请求的重试中复用它；用户明确要求重新跑时应创建新的逻辑身份。
-
-V0.3 的稳定入口使用 Exchange request：
-
-```bash
 mercury input inspect --file "/绝对路径/subtitle.vtt" --format vtt --role transcript-source --json
 mercury task submit --request "/绝对路径/request.json" --json
+```
+
+保存返回的 `task_id`。`request.json` 必须包含稳定逻辑身份派生的 `request_id`；同一次用户请求丢失输出后的重试复用它，用户明确要求重新跑时才创建新的逻辑身份。
+
+旧 `calibrate --background --json` 仅作为过渡兼容入口；机器调用必须显式提供稳定 request ID，不能依赖随机 ID：
+
+```bash
+mercury calibrate --audio "/path/to/input.mp3" --background --request-id "stable-logical-id" --json
+mercury calibrate --audio "/path/to/input.mp3" --srt "/path/to/reference.srt" --mode text-only --background --request-id "stable-logical-id" --json
+mercury calibrate --audio "/path/to/input.mp3" --srt "/path/to/reference.srt" --mode text-and-segmentation --background --request-id "stable-logical-id" --json
 ```
 
 `transcription_mode=provided` 只接受显式 `transcript_source`，并保证 ASR 为 0；`transcription_mode=provider` 的可选字幕必须声明 `reference`，仍会执行 ASR。两种模式共用同一 v5 幂等、后台、词典、结果和审阅链路。
