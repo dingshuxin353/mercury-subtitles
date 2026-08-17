@@ -212,13 +212,17 @@ export async function appendV5Event(directory: string, task: TaskRecordV5, type:
   }, { waitMs: 15_000, errorCode: 'EVENT_LOG_LOCKED', errorMessage: '任务事件正在由另一个 Mercury 进程追加。' });
 }
 
-function srtFromTranscript(transcript: ExchangeTranscriptV1): string {
+function srtFromSegments(segments: Array<{ start_ms: number; end_ms: number; text: string }>): string {
   const stamp = (ms: number) => {
     const hours = Math.floor(ms / 3_600_000); const minutes = Math.floor((ms % 3_600_000) / 60_000);
     const seconds = Math.floor((ms % 60_000) / 1000); const milli = ms % 1000;
     return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')},${String(milli).padStart(3, '0')}`;
   };
-  return `${transcript.segments.map((segment, index) => `${index + 1}\n${stamp(segment.start_ms)} --> ${stamp(segment.end_ms)}\n${segment.text}\n`).join('\n')}\n`;
+  return `${segments.map((segment, index) => `${index + 1}\n${stamp(segment.start_ms)} --> ${stamp(segment.end_ms)}\n${segment.text}\n`).join('\n')}\n`;
+}
+
+function srtFromTranscript(transcript: ExchangeTranscriptV1): string {
+  return srtFromSegments(transcript.segments);
 }
 
 interface ModelSnapshotV3 {
@@ -386,8 +390,12 @@ async function createTaskDirectory(workspace: string, request: ExchangeRequestV1
     } as TaskRecordV5;
     if (provided) {
       const bridge = legacyTranscript(taskCandidate, inspected!.transcript, snapshot);
-      await writeStableJsonAtomic(path.join(staging, 'work/transcript.raw.json'), bridge);
-      await writeFile0600(path.join(staging, 'input/reference.srt'), srtFromTranscript(inspected!.transcript));
+      const bridgeContract = validateContract('transcript.raw', bridge);
+      if (!bridgeContract.valid) {
+        throw new MercuryError('TRANSCRIPT_IMPORT_INVALID', '外部转录无法安全转换为内部校准输入；任务未提交。', { exitCode: 2 });
+      }
+      await writeStableJsonAtomic(path.join(staging, 'work/transcript.raw.json'), bridgeContract.value);
+      await writeFile0600(path.join(staging, 'input/reference.srt'), srtFromSegments(bridge.segments));
       taskCandidate.calibration_sources = {
         transcript: { path: 'work/transcript.raw.json', sha256: await sha256File(path.join(staging, 'work/transcript.raw.json')), validation: 'passed' },
         reference: { path: 'input/reference.srt', sha256: await sha256File(path.join(staging, 'input/reference.srt')), validation: 'passed' },
@@ -455,14 +463,42 @@ export async function submitExchangeRequest(workspaceInput: string, raw: unknown
   });
 }
 
+function legacyInlineText(value: string, label: string): string {
+  const normalized = value
+    .normalize('NFC')
+    .replace(/[\t\r\n]+/gu, ' ')
+    .replace(/ {2,}/gu, ' ')
+    .trim();
+  if (!normalized || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(normalized)) {
+    throw new MercuryError('TRANSCRIPT_IMPORT_INVALID', `${label}在兼容合同规范化后没有可用正文。`, { exitCode: 2 });
+  }
+  return normalized;
+}
+
 function legacyTranscript(task: TaskRecordV5, transcript: ExchangeTranscriptV1, snapshot: ModelSnapshotV3): TranscriptRaw {
   const media = task.inputs.media;
   const duration = transcript.duration_ms ?? transcript.segments.at(-1)!.end_ms;
+  const segments = transcript.segments.map((segment, index) => ({
+    segment_id: segment.segment_id,
+    index,
+    start_ms: segment.start_ms,
+    end_ms: segment.end_ms,
+    text: legacyInlineText(segment.text, `第 ${index + 1} 个转录片段`),
+    confidence: null,
+    words: segment.words.map((word, wordIndex) => ({
+      word_id: `${segment.segment_id}-word-${wordIndex + 1}`,
+      index: wordIndex,
+      text: legacyInlineText(word.text, `第 ${index + 1} 个转录片段的第 ${wordIndex + 1} 个词`),
+      start_ms: word.start_ms,
+      end_ms: word.end_ms,
+      confidence: word.confidence,
+    })),
+  }));
   return {
     schema_version: '1.0.0', task_id: task.identity.task_id, created_at: transcript.created_at,
     audio: { path_ref: media?.workspace_path ?? task.inputs.transcript_source!.workspace_path, sha256: media?.sha256 ?? task.inputs.transcript_source!.sha256, duration_ms: duration, mime_type: 'audio/mpeg', language: 'zh-CN' },
-    full_text: transcript.text,
-    segments: transcript.segments.map((segment, index) => ({ segment_id: segment.segment_id, index, start_ms: segment.start_ms, end_ms: segment.end_ms, text: segment.text, confidence: null, words: segment.words.map((word, wordIndex) => ({ word_id: `${segment.segment_id}-word-${wordIndex + 1}`, index: wordIndex, text: word.text, start_ms: word.start_ms, end_ms: word.end_ms, confidence: word.confidence })) })),
+    full_text: segments.map((segment) => segment.text).join('\n'),
+    segments,
     model_snapshot_ref: snapshot.snapshot_id,
     call: { call_id: `${task.identity.task_id}-provided`, model_snapshot_entry_ref: 'provided-transcript', started_at: transcript.created_at, ended_at: transcript.created_at, outcome: 'completed', error_ref: null },
     raw_response_ref: null, warnings: [], errors: [],
@@ -706,7 +742,7 @@ export async function verifyV5CalibrationSources(directory: string, taskInput?: 
   }
   let referenceText: string | null = null;
   if (task.input_config.transcription_mode === 'provided') {
-    referenceText = srtFromTranscript(transcript);
+    referenceText = srtFromSegments(legacy.segments);
   } else if (task.inputs.reference) {
     if (!task.inputs.reference_normalized
       || await sha256File(managed(directory, task.inputs.reference.workspace_path)).catch(() => null) !== task.inputs.reference.sha256
@@ -915,7 +951,9 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
   }
   let calibration: CalibrationResultV3 | null = null;
   try {
-    const normalizedSrt = srtFromTranscript(transcript);
+    const normalizedSrt = task.input_config.transcription_mode === 'provided'
+      ? srtFromSegments(legacy.segments)
+      : srtFromTranscript(transcript);
     const referenceText = normalizedReferenceText ?? (task.input_config.transcription_mode === 'provided' ? normalizedSrt : null);
     await assertCalibrationSourceEvidence(directory, task, legacy, referenceText);
     const initial = preflight(task, legacy, snapshot, referenceText);

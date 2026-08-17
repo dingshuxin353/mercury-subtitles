@@ -17,6 +17,8 @@ import { canonicalJson } from '../src/exchange/storage.js';
 import { readJob } from '../src/background/storage.js';
 import { createChatCalibrationRuntimeV2, type ChatCalibrationRuntimeV2 } from '../src/adapters/chat-calibration-v2.js';
 import { readVerifiedV5Review } from '../src/review-v5.js';
+import { inspectTranscriptInput } from '../src/external-input.js';
+import { validateContract } from '../src/contracts/index.js';
 
 function sha(value: Buffer | string) { return createHash('sha256').update(value).digest('hex'); }
 
@@ -146,6 +148,44 @@ async function forceStrongEvidence(directory: string, useGemini = false) {
 }
 
 describe('Exchange v1 external transcript task', () => {
+  it.each(['srt', 'vtt', 'transcript_json'] as const)('normalizes multiline %s cues only in the frozen v1 bridge and completes with zero ASR', async (format) => {
+    const input = await prepared();
+    const source = path.join(input.home, `multiline.${format === 'transcript_json' ? 'json' : format}`);
+    let sourceText: string;
+    if (format === 'srt') {
+      sourceText = '1\n00:00:00,000 --> 00:00:01,000\n第一行\n第二行\n';
+    } else if (format === 'vtt') {
+      sourceText = 'WEBVTT\n\n1\n00:00.000 --> 00:01.000\n第一行\n第二行\n';
+    } else {
+      const inspected = await inspectTranscriptInput({ filePath: input.source, format: 'srt', role: 'transcript_source' });
+      inspected.transcript.segments[0]!.text = '第一行\n第二行';
+      inspected.transcript.text = inspected.transcript.segments.map((segment) => segment.text).join('\n');
+      sourceText = `${JSON.stringify(inspected.transcript, null, 2)}\n`;
+    }
+    await writeFile(source, sourceText);
+    input.request.request_id = `request-multiline-${format}`;
+    input.request.inputs.transcript = { path: source, sha256: sha(sourceText), format, role: 'transcript_source' };
+
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const calls: string[] = [];
+    await runWorker(input.workspace, { fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const task = await readV5Task(directory);
+    const normalized = JSON.parse(await readFile(path.join(directory, 'work/transcript.normalized.json'), 'utf8'));
+    const bridge = JSON.parse(await readFile(path.join(directory, 'work/transcript.raw.json'), 'utf8'));
+    const transcribed = await readFile(path.join(directory, task.artifacts.transcribed!.path), 'utf8');
+
+    expect(task.status, JSON.stringify(task.error)).toBe('completed');
+    expect(task.execution.provider_calls.asr).toMatchObject({ count: 0, outcome: 'not_dispatched' });
+    expect(task.execution.provider_calls.chat.count).toBe(1);
+    expect(calls).toEqual(['chat']);
+    expect(normalized.segments[0].text).toBe('第一行\n第二行');
+    expect(bridge.segments[0].text).toBe('第一行 第二行');
+    expect(bridge.full_text).toBe(bridge.segments.map((segment: { text: string }) => segment.text).join('\n'));
+    expect(validateContract('transcript.raw', bridge).valid).toBe(true);
+    expect(transcribed).toContain('第一行\n第二行');
+  });
+
   it('runs provider plus reference through the same v5 request, dictionary, result, and review semantics', async () => {
     const input = await prepared();
     const audio = path.join(input.home, 'provider.mp3');
