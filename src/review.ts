@@ -8,7 +8,7 @@ import { assertV4Contract } from './contracts/v4.js';
 import { validateV3CalibrationResult } from './contracts/v3.js';
 import { MercuryError } from './errors.js';
 import { formatSrtTimestamp, validateSrtFile, wrapSubtitleText } from './output-report/index.js';
-import { parseReferenceSrt, type CalibratedSubtitleSegment, type CalibratedTranscript } from './subtitle-core/index.js';
+import { normalizeVisibleSubtitleText, parseReferenceSrt, type CalibratedSubtitleSegment, type CalibratedTranscript } from './subtitle-core/index.js';
 import { safeAudioStem, sha256File, writeJsonAtomic } from './tasks.js';
 import { persistTaskRecordV2, readTaskRecordV2, type TaskRecordV2 } from './tasks-v2.js';
 import { withOwnedLock } from './background/owned-lock.js';
@@ -30,6 +30,10 @@ export function flatReviewText(value: string): string {
     const separator = /[A-Za-z0-9]$/u.test(combined) && /^[A-Za-z0-9]/u.test(line) ? ' ' : '';
     return `${combined}${separator}${line}`;
   }, '').trim();
+}
+
+export function visibleReviewText(value: string): string {
+  return normalizeVisibleSubtitleText(flatReviewText(value)).text;
 }
 
 export function reviewCounts(changes: ReviewRecordV1['changes']): ReviewRecordV1['counts'] {
@@ -117,13 +121,14 @@ export function authoritativeReviewChanges(
   const segmentIndex = new Map(calibrated.segments.map((segment) => [segment.subtitle_segment_id, segment.index]));
   const modificationById = new Map(calibrated.modifications.map((item) => [item.modification_id, item]));
   const suggestionByText = new Map(
-    calibration.suggestions.map((item) => [`${item.start_ms}:${item.end_ms}:${flatReviewText(item.original_text)}:${flatReviewText(item.suggested_text ?? '')}`, item]),
+    calibration.suggestions.map((item) => [`${item.start_ms}:${item.end_ms}:${visibleReviewText(item.original_text)}:${visibleReviewText(item.suggested_text ?? '')}`, item]),
   );
   const occupied = new Map<string, Array<{ start: number; end: number }>>();
   const changes: ReviewRecordV1['changes'] = [];
   for (const unit of calibration.corrected_units.filter((item) => item.changed)) {
-    const originalText = flatReviewText(unit.original_text);
-    const proposedText = flatReviewText(unit.corrected_text);
+    const originalText = visibleReviewText(unit.original_text);
+    const proposedText = visibleReviewText(unit.corrected_text);
+    if (originalText === proposedText) continue;
     const suggestion = suggestionByText.get(`${unit.start_ms}:${unit.end_ms}:${originalText}:${proposedText}`);
     if (!suggestion || suggestion.disposition !== 'applied' || suggestion.modification_refs.length === 0) {
       throw new MercuryError('REVIEW_MAPPING_INVALID', `校验单元 ${unit.unit_id} 缺少已验证的应用映射。`);
@@ -138,7 +143,7 @@ export function authoritativeReviewChanges(
     }
     const targetIndexes = (indexes as [number, ...number[]]).sort((a, b) => a - b) as [number, ...number[]];
     const key = targetIndexes.join(',');
-    const targetText = flatReviewText(targetIndexes.map((index) => calibrated.segments[index]!.text).join(''));
+    const targetText = visibleReviewText(targetIndexes.map((index) => calibrated.segments[index]!.text).join(''));
     const used = occupied.get(key) ?? [];
     const start = occurrences(targetText, proposedText).find((candidate) =>
       !used.some((range) => candidate < range.end && candidate + proposedText.length > range.start),
@@ -325,7 +330,9 @@ function checkedText(value: string): string {
   if (!text || /[\p{Cc}\p{Cf}]/u.test(text) || /<\/?[A-Za-z][^>]*>|\{\\[^}]+\}|```/u.test(text)) {
     throw new MercuryError('REVIEW_TEXT_INVALID', '编辑文字不能为空，也不能包含控制字符、样式标签或模型残片。', { exitCode: 2 });
   }
-  return text;
+  const visible = visibleReviewText(text);
+  if (!visible) throw new MercuryError('REVIEW_TEXT_INVALID', '编辑文字清理句读标点后不能为空。', { exitCode: 2 });
+  return visible;
 }
 
 export async function decideReviewChange(
@@ -421,7 +428,7 @@ export function applyReviewDecisions(
   segments: CalibratedSubtitleSegment[],
   changes: ReviewRecordV1['changes'],
 ): CalibratedSubtitleSegment[] {
-  const result = segments.map((segment) => ({ ...segment, text: flatReviewText(segment.text) }));
+  const result = segments.map((segment) => ({ ...segment, text: visibleReviewText(segment.text) }));
   const groups: Array<{
     indexes: Set<number>;
     changes: ReviewRecordV1['changes'];

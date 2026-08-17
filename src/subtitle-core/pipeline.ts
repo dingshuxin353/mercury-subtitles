@@ -27,8 +27,10 @@ import type {
   TimedTextUnit
 } from './types.js';
 import { countSubtitleCharacters, lineCount } from './text.js';
+import { normalizeVisibleSubtitleText, VISIBLE_SUBTITLE_STYLE_VERSION } from './visible-text.js';
 import {
   HARD_MAX_CHARACTERS,
+  SEGMENTATION_POLICY_VERSION,
   SOFT_MAX_DURATION_MS,
   SOFT_MAX_READING_SPEED,
   SOFT_MIN_DURATION_MS,
@@ -57,6 +59,8 @@ interface SegmentationResult {
   segments: CalibratedSubtitleSegment[];
   warnings: SubtitleCoreWarning[];
 }
+
+type BoundaryReason = 'source_boundary' | 'sentence_punctuation' | 'natural_pause' | 'hard_limit';
 
 export function runSubtitleCore(input: SubtitleCoreInput): SubtitleCoreResult {
   const transcriptValidation = validateContract('transcript.raw', input.transcript);
@@ -145,6 +149,10 @@ export function runSubtitleCore(input: SubtitleCoreInput): SubtitleCoreResult {
     segments = referenceSegments
       ? textOnlySegments(applied.document, referenceSegments, transcript, alignment, applied.modifications)
       : transcriptTextOnlySegments(applied.document, transcript, applied.modifications);
+    const visible = visibleSubtitleSegments(segments);
+    if ('issue' in visible) return failed(visible.issue.code, visible.issue.message, alignment);
+    segments = visible.segments;
+    if (visible.removed > 0) warnings.push(visibleStyleWarning(segments, visible.removed, visible.protected));
     const illegalSegment = segments.find((segment) =>
       countSubtitleCharacters(segment.text) > HARD_MAX_CHARACTERS || lineCount(segment.text) > 2
     );
@@ -169,6 +177,10 @@ export function runSubtitleCore(input: SubtitleCoreInput): SubtitleCoreResult {
     if ('issue' in segmented) return failed(segmented.issue.code, segmented.issue.message, alignment);
     segments = segmented.segments;
     warnings.push(...segmented.warnings);
+    const visible = visibleSubtitleSegments(segments);
+    if ('issue' in visible) return failed(visible.issue.code, visible.issue.message, alignment);
+    segments = visible.segments;
+    if (visible.removed > 0) warnings.push(visibleStyleWarning(segments, visible.removed, visible.protected));
     if (referenceSegments !== null) {
       for (const segment of segments) {
         segment.reference_segment_refs = mappedReferenceRefs(alignment, segment.asr_segment_refs, {
@@ -432,6 +444,12 @@ function segmentTimedUnits(
   }
 
   const groups: TimedTextUnit[][] = [];
+  const boundaryCounts: Record<BoundaryReason, number> = {
+    source_boundary: 0,
+    sentence_punctuation: 0,
+    natural_pause: 0,
+    hard_limit: 0,
+  };
   let current: TimedTextUnit[] = [];
   for (const unit of usable) {
     if (
@@ -445,9 +463,13 @@ function segmentTimedUnits(
         }
       };
     }
-    if (current.length > 0 && shouldBreak(current, unit)) {
-      groups.push(current);
-      current = [];
+    if (current.length > 0) {
+      const reason = breakReason(current, unit);
+      if (reason) {
+        groups.push(current);
+        boundaryCounts[reason] += 1;
+        current = [];
+      }
     }
     current.push(unit);
     const currentText = joinedUnitText(current);
@@ -519,22 +541,65 @@ function segmentTimedUnits(
       return { issue: { code: 'TIMELINE_OVERLAP', message: 'ASR evidence produced overlapping subtitle segments.' } };
     }
   }
+  warnings.push({
+    warning_id: 'warning-segmentation-policy-0001',
+    code: 'SEGMENTATION_POLICY_APPLIED',
+    message: `${SEGMENTATION_POLICY_VERSION} kept source boundaries and created ${boundaryCounts.sentence_punctuation} sentence, ${boundaryCounts.natural_pause} pause, and ${boundaryCounts.hard_limit} hard-limit boundaries; ${boundaryCounts.source_boundary} source boundaries were preserved.`,
+    segment_refs: unique(segments.flatMap((segment) => [...segment.asr_segment_refs, ...segment.reference_segment_refs]))
+  });
   return { segments, warnings };
 }
 
-function shouldBreak(current: TimedTextUnit[], next: TimedTextUnit): boolean {
+function breakReason(current: TimedTextUnit[], next: TimedTextUnit): BoundaryReason | null {
   const text = joinedUnitText(current);
   const combined = `${text}${next.text}`;
   const currentEnd = Math.max(...current.map((entry) => entry.end_ms));
-  const currentStart = Math.min(...current.map((entry) => entry.start_ms));
   const canSeparate = next.start_ms >= currentEnd;
-  if (!canSeparate) return false;
-  if (countSubtitleCharacters(combined) > HARD_MAX_CHARACTERS) return true;
-  if (currentEnd - currentStart >= SOFT_MAX_DURATION_MS) return true;
-  return countSubtitleCharacters(text) >= TARGET_MIN_CHARACTERS && (
-    /[。！？!?；;]$/u.test(text.trim()) ||
-    countSubtitleCharacters(combined) > TARGET_MAX_CHARACTERS
-  );
+  if (!canSeparate) return null;
+  const previous = current.at(-1)!;
+  if (
+    !sameValues(previous.asr_segment_refs, next.asr_segment_refs) ||
+    !sameValues(previous.source_segment_refs, next.source_segment_refs)
+  ) return 'source_boundary';
+  if (/[。！？!?；;]$/u.test(text.trim())) return 'sentence_punctuation';
+  if (next.start_ms - currentEnd >= 400) return 'natural_pause';
+  if (countSubtitleCharacters(combined) > HARD_MAX_CHARACTERS) return 'hard_limit';
+  return null;
+}
+
+function visibleSubtitleSegments(
+  segments: CalibratedSubtitleSegment[]
+): { segments: CalibratedSubtitleSegment[]; removed: number; protected: number } | { issue: SubtitleCoreIssue } {
+  let removed = 0;
+  let protectedCount = 0;
+  const visible = segments.map((segment) => {
+    const normalized = normalizeVisibleSubtitleText(segment.text);
+    removed += normalized.removed_punctuation_count;
+    protectedCount += normalized.protected_span_count;
+    return { ...segment, text: normalized.text };
+  });
+  if (visible.some((segment) => segment.text.length === 0)) {
+    return {
+      issue: {
+        code: 'VISIBLE_SUBTITLE_TEXT_EMPTY',
+        message: 'Removing sentence punctuation would leave an empty visible subtitle segment.'
+      }
+    };
+  }
+  return { segments: visible, removed, protected: protectedCount };
+}
+
+function visibleStyleWarning(
+  segments: CalibratedSubtitleSegment[],
+  removed: number,
+  protectedCount: number
+): SubtitleCoreWarning {
+  return {
+    warning_id: 'warning-visible-subtitle-style-0001',
+    code: 'VISIBLE_SENTENCE_PUNCTUATION_REMOVED',
+    message: `${VISIBLE_SUBTITLE_STYLE_VERSION} removed ${removed} sentence punctuation characters after preserving ${protectedCount} lexical spans.`,
+    segment_refs: unique(segments.flatMap((segment) => [...segment.asr_segment_refs, ...segment.reference_segment_refs]))
+  };
 }
 
 function addStructuralModifications(

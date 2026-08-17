@@ -224,7 +224,8 @@ describe('Exchange v1 external transcript task', () => {
   it.each(['srt', 'vtt', 'transcript_json'] as const)('normalizes multiline %s cues only in the frozen v1 bridge and completes with zero ASR', async (format) => {
     const input = await prepared();
     const source = path.join(input.home, `multiline.${format === 'transcript_json' ? 'json' : format}`);
-    const multilineText = '第一行内容\n第二行内容';
+    const multilineText = '第一行，内容\n第二行内容！';
+    const visibleMultilineText = '第一行内容\n第二行内容';
     let sourceText: string;
     if (format === 'srt') {
       sourceText = `1\n00:00:00,000 --> 00:00:01,000\n${multilineText}\n`;
@@ -258,7 +259,8 @@ describe('Exchange v1 external transcript task', () => {
     expect(bridge.segments[0].text).toBe(multilineText.replace('\n', ' '));
     expect(bridge.full_text).toBe(bridge.segments.map((segment: { text: string }) => segment.text).join('\n'));
     expect(validateContract('transcript.raw', bridge).valid).toBe(true);
-    expect(transcribed).toContain(multilineText);
+    expect(transcribed).toContain(visibleMultilineText);
+    expect(transcribed).not.toMatch(/[，！]/u);
   });
 
   it('reports the transcript timing hard limit instead of a fabricated reference limit and dispatches no Provider', async () => {
@@ -1758,14 +1760,14 @@ describe('Exchange v1 external transcript task', () => {
     expect(await directoryManifest(directory)).toEqual(pendingManifest); expect(await lstat(business).catch(() => null)).toBeNull();
     review = await decideV5ReviewChange(directory, { changeId: review.changes[0]!.change_id, decision: 'accepted', actor: 'user_via_cli' });
     review = await decideV5ReviewChange(directory, { changeId: review.changes[1]!.change_id, decision: 'rejected', actor: 'user_via_cli' });
-    review = await decideV5ReviewChange(directory, { changeId: review.changes[2]!.change_id, decision: 'edited', text: '丙人工确认', actor: 'user_via_cli' });
+    review = await decideV5ReviewChange(directory, { changeId: review.changes[2]!.change_id, decision: 'edited', text: '丙，人工确认！', actor: 'user_via_cli' });
     expect(review.counts).toMatchObject({ accepted: 1, rejected: 1, edited: 1, pending: 0 });
     expect(await lstat(business).catch(() => null)).toBeNull();
     const finalized = await finalizeV5Review(directory);
     const task = await readV5Task(directory); const delivered = await readFile(task.delivery!.final_path!, 'utf8');
     const calibrated = await readFile(path.join(directory, task.artifacts.calibrated!.path), 'utf8');
     expect(parseSrt(delivered)).toEqual(parseSrt(calibrated));
-    expect(delivered).toContain('甲原文校'); expect(delivered).toContain('乙原文'); expect(delivered).toContain('丙人工确认');
+    expect(delivered).toContain('甲原文校'); expect(delivered).toContain('乙原文'); expect(delivered).toContain('丙人工确认'); expect(delivered).not.toMatch(/[，！]/u);
     expect(task.delivery).toMatchObject({ status: 'delivered', sha256: finalized.approved_artifact!.sha256 });
     expect(calls).toEqual(['chat']);
   });

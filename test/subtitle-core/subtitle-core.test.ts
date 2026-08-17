@@ -234,7 +234,7 @@ describe('text-only fidelity', () => {
 
     expect(result.status).toBe('completed');
     if (result.status !== 'completed') return;
-    expect(result.artifact.segments[0]!.text).toBe('欢迎使用水星，这是一个更好用的字幕工具');
+    expect(result.artifact.segments[0]!.text).toBe('欢迎使用水星这是一个更好用的字幕工具');
     expect(result.artifact.modifications[0]).toMatchObject({ applied: true });
   });
 
@@ -544,7 +544,7 @@ describe('segmentation and ASR-backed timeline generation', () => {
     expect(result.status).toBe('completed');
     if (result.status !== 'completed') return;
     expect(result.artifact.segments.length).toBeGreaterThan(1);
-    expect(result.artifact.segments.map((segment) => segment.text).join('')).toBe(text);
+    expect(result.artifact.segments.map((segment) => segment.text).join('')).toBe(text.replaceAll('，', ''));
     expect(result.artifact.segments.every((segment) => countSubtitleCharacters(segment.text) <= 24)).toBe(true);
   });
 

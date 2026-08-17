@@ -13,6 +13,7 @@ import {
   readReview,
   reviewCounts,
   reviewStatusFor,
+  visibleReviewText,
   writeReviewRecord,
   type ReviewActor,
   type ReviewDecision,
@@ -47,7 +48,9 @@ function calibrated(value: unknown, taskId: string): CalibratedTranscript {
 function checkedText(value: string): string {
   const text = value.trim();
   if (!text || /[\p{Cc}\p{Cf}]/u.test(text) || /<\/?[A-Za-z][^>]*>|\{\\[^}]+\}|```/u.test(text)) throw new MercuryError('REVIEW_TEXT_INVALID', '编辑文字不能为空，也不能包含控制字符、样式标签或模型残片。', { exitCode: 2 });
-  return text;
+  const visible = visibleReviewText(text);
+  if (!visible) throw new MercuryError('REVIEW_TEXT_INVALID', '编辑文字清理句读标点后不能为空。', { exitCode: 2 });
+  return visible;
 }
 
 async function writeText(target: string, value: string): Promise<void> {

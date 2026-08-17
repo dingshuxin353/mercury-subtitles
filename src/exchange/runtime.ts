@@ -14,7 +14,7 @@ import { CHAT_INLINE_AUDIO_LIMIT_BYTES, createChatCalibrationRuntimeV2, type Cha
 import { VolcengineAsrAdapter, type ResolvedVolcengineCredential } from '../adapters/volcengine-asr.js';
 import { VolcengineSubtitleAsrAdapter } from '../adapters/volcengine-subtitle-asr.js';
 import { legacyAsrEntry } from '../core-integration-v2.js';
-import { normalizeReferenceSrtForCalibration, parseReferenceSrt, runSubtitleCore, type CalibratedTranscript } from '../subtitle-core/index.js';
+import { normalizeReferenceSrtForCalibration, normalizeVisibleSubtitleText, parseReferenceSrt, runSubtitleCore, type CalibratedTranscript } from '../subtitle-core/index.js';
 import { serializeCalibratedSrt, validateSrtFile } from '../output-report/srt.js';
 import { createTaskId, safeAudioStem, sha256File } from '../tasks.js';
 import { appendStableJsonLine, canonicalJson, readStableJson, repairTrailingJsonlFragment, writeStableJsonAtomic } from './storage.js';
@@ -307,7 +307,11 @@ function srtFromSegments(segments: Array<{ start_ms: number; end_ms: number; tex
 }
 
 function srtFromTranscript(transcript: ExchangeTranscriptV1): string {
-  return srtFromSegments(transcript.segments);
+  return srtFromSegments(transcript.segments.map((segment, index) => {
+    const text = normalizeVisibleSubtitleText(segment.text).text;
+    if (!text) throw new MercuryError('VISIBLE_SUBTITLE_TEXT_EMPTY', `第 ${index + 1} 个转写片段清理句读标点后为空。`, { exitCode: 2 });
+    return { ...segment, text };
+  }));
 }
 
 interface ModelSnapshotV3 {

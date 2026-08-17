@@ -7,6 +7,7 @@ import {
   HARD_MAX_CHARACTERS,
   TARGET_MAX_CHARACTERS,
   countSubtitleCharacters,
+  normalizeVisibleSubtitleText,
   type CalibratedSubtitleSegment,
   type CalibratedTranscript
 } from '../subtitle-core/index.js';
@@ -114,7 +115,7 @@ export function formatSrtTimestamp(milliseconds: number): string {
 
 export function serializeCalibratedSrt(artifact: CalibratedTranscript): string {
   const blocks = artifact.segments.map((segment, index) => {
-    const lines = wrapSubtitleText(segment.text, artifact.mode);
+    const lines = wrapSubtitleText(normalizeVisibleSubtitleText(segment.text).text, artifact.mode);
     return [
       String(index + 1),
       `${formatSrtTimestamp(segment.start_ms)} --> ${formatSrtTimestamp(segment.end_ms)}`,
@@ -211,6 +212,7 @@ export function validateSrtText(source: string, context: SrtValidationContext): 
   if (allBlocksParsed && !timeFormatFailed) checks.push(quality('SRT_TIME_FORMAT', 'passed', '全部时间行符合标准毫秒格式。'));
   if (allBlocksParsed && !textFailed) checks.push(quality('SRT_TEXT', 'passed', '全部字幕正文非空且不含控制字符、标签或模型残片。'));
   let timelineFailed = timeFormatFailed;
+  let visibleStyleFailed = false;
   for (const [index, segment] of segments.entries()) {
     const expected = context.expectedSegments[index];
     const segmentRef = expected ? [expected.subtitle_segment_id] : [];
@@ -227,6 +229,10 @@ export function validateSrtText(source: string, context: SrtValidationContext): 
       checks.push(quality('SRT_LINE_COUNT', 'failed', `字幕块 ${segment.sequence} 超过两行。`, segmentRef));
     }
     const segmentCharacters = countSubtitleCharacters(segment.text);
+    if (normalizeVisibleSubtitleText(flattenText(segment.text)).removed_punctuation_count > 0) {
+      visibleStyleFailed = true;
+      checks.push(quality('SRT_VISIBLE_SUBTITLE_STYLE', 'failed', `字幕块 ${segment.sequence} 仍含用户可见句读标点。`, segmentRef));
+    }
     if (segmentCharacters > HARD_MAX_CHARACTERS && context.purpose !== 'transcribed') {
       checks.push(quality('SRT_HARD_CHARACTER_LIMIT', 'failed', `字幕块 ${segment.sequence} 为 ${segmentCharacters} 个计数字符，超过 24 字硬限制。`, segmentRef));
     }
@@ -250,6 +256,7 @@ export function validateSrtText(source: string, context: SrtValidationContext): 
       checks.push(quality('SRT_READING_SPEED', 'warning', `字幕块 ${segment.sequence} 阅读速度为 ${speed.toFixed(2)} 字/秒。`, segmentRef));
     }
   }
+  if (!visibleStyleFailed && allBlocksParsed) checks.push(quality('SRT_VISIBLE_SUBTITLE_STYLE', 'passed', '用户可见字幕句读风格检查通过。'));
   if (!timelineFailed) checks.push(quality('SRT_TIMELINE', 'passed', '时间顺序、范围和重叠检查通过。'));
   if (!checks.some((check) => check.check_id === 'SRT_LINE_COUNT' && check.status === 'failed') && allBlocksParsed) {
     checks.push(quality('SRT_LINE_COUNT', 'passed', '全部字幕块不超过两行。'));
@@ -267,7 +274,7 @@ export function validateSrtText(source: string, context: SrtValidationContext): 
       if (
         segment.start_ms !== expected.start_ms ||
         segment.end_ms !== expected.end_ms ||
-        flattenText(segment.text) !== flattenText(expected.text)
+        flattenText(segment.text) !== normalizeVisibleSubtitleText(flattenText(expected.text)).text
       ) {
         mappingFailed = true;
         checks.push(quality('SRT_CALIBRATED_MAPPING', 'failed', `字幕块 ${segment.sequence} 无法映射回 ${expected.subtitle_segment_id}。`, [expected.subtitle_segment_id]));
