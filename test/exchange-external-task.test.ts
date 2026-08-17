@@ -2208,6 +2208,65 @@ describe('Exchange v1 external transcript task', () => {
     }
   });
 
+  it('closes the complete multi-attempt retry, plan, result, and Provider call history before attempt 3', async () => {
+    const failTwice = async (requestId: string) => {
+      const input = await prepared(); input.request.request_id = requestId;
+      const submitted = await submitExchangeRequest(input.workspace, input.request); const calls: string[] = [];
+      await runWorker(input.workspace, { chatRuntime: knownFailureChat(calls) });
+      const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+      const first = await readV5Task(directory); const firstPlan = await planV5Retry(directory, first);
+      await executeV5Retry(input.workspace, first, firstPlan.plan_id);
+      await runWorker(input.workspace, { chatRuntime: knownFailureChat(calls) });
+      return { input, directory, failed: await readV5Task(directory), calls };
+    };
+
+    const valid = await failTwice('request-alpha2-history-valid-attempt3');
+    const validManifest = await directoryManifest(valid.directory); const validPlan = await planV5Retry(valid.directory, valid.failed);
+    expect(validPlan.allowed).toBe(true); expect(await directoryManifest(valid.directory)).toEqual(validManifest);
+    const third = await executeV5Retry(valid.input.workspace, valid.failed, validPlan.plan_id);
+    expect(third).toMatchObject({ status: 'queued', execution: { attempt_count: 3, provider_calls: { chat: { count: 2 } } } });
+    const validRecords = (await readFile(path.join(valid.directory, 'attempts.jsonl'), 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    expect(validRecords.filter((record) => record.contract === 'mercury.attempt/v1').map((record) => record.number)).toEqual([1, 2, 3]);
+    expect(validRecords.filter((record) => record.contract === 'mercury.retry/v1')).toHaveLength(2);
+    expect(valid.calls).toEqual(['chat', 'chat']);
+
+    const corruptions: Array<{ name: string; mutate: (records: any[]) => any[] }> = [
+      { name: 'missing-retry', mutate: (records) => records.filter((record) => !(record.contract === 'mercury.retry/v1' && record.plan_id === records.find((entry) => entry.contract === 'mercury.attempt/v1' && entry.number === 2)?.retry_plan_id)) },
+      { name: 'missing-call1', mutate: (records) => records.filter((record) => !(record.contract === 'mercury.provider-call/v1' && record.call_number === 1)) },
+      { name: 'historical-call-model', mutate: (records) => records.map((record) => record.contract === 'mercury.provider-call/v1' && record.call_number === 1 ? { ...record, model_snapshot_entry_ref: 'wrong-historical-model' } : record) },
+      { name: 'historical-call-attempt', mutate: (records) => {
+        const secondAttempt = records.find((record) => record.contract === 'mercury.attempt/v1' && record.number === 2)?.attempt_id;
+        return records.map((record) => record.contract === 'mercury.provider-call/v1' && record.call_number === 1 ? { ...record, attempt_id: secondAttempt } : record);
+      } },
+      { name: 'duplicate-retry', mutate: (records) => [...records, { ...records.find((record) => record.contract === 'mercury.retry/v1') }] },
+      { name: 'orphan-retry', mutate: (records) => {
+        const retry = structuredClone(records.find((record) => record.contract === 'mercury.retry/v1'));
+        retry.plan_id = `rpl-${'f'.repeat(24)}`; retry.plan.plan_id = retry.plan_id;
+        return [...records, retry];
+      } },
+      { name: 'duplicate-call', mutate: (records) => [...records, { ...records.find((record) => record.contract === 'mercury.provider-call/v1' && record.call_number === 1 && record.phase === 'dispatched') }] },
+      { name: 'orphan-call', mutate: (records) => {
+        const call = structuredClone(records.find((record) => record.contract === 'mercury.provider-call/v1' && record.call_number === 2));
+        call.call_number = 3; call.call_id = 'pcl-orphan-history-call';
+        return [...records, call];
+      } },
+    ];
+    for (const corruption of corruptions) {
+      const fixture = await failTwice(`request-alpha2-history-${corruption.name}`); const target = path.join(fixture.directory, 'attempts.jsonl');
+      const records = (await readFile(target, 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line));
+      await writeFile(target, `${corruption.mutate(records).map((record) => JSON.stringify(record)).join('\n')}\n`, { mode: 0o600 });
+      const before = await directoryManifest(fixture.directory); const plan = await planV5Retry(fixture.directory, fixture.failed);
+      expect(plan).toMatchObject({ allowed: false, reason: expect.stringContaining('RETRY_LEDGER_INVALID') });
+      const record = await findTaskReadOnly(fixture.input.workspace, fixture.failed.identity.task_id);
+      expect((await stableTaskView(fixture.input.workspace, record)).retry).toMatchObject({ allowed: false });
+      expect((await stableTaskResult(fixture.input.workspace, record)).status).toBe('failed');
+      expect(await readV5Events(fixture.directory)).not.toHaveLength(0);
+      expect(await directoryManifest(fixture.directory)).toEqual(before);
+      await expect(executeV5Retry(fixture.input.workspace, fixture.failed, plan.plan_id)).rejects.toMatchObject({ code: 'RETRY_LEDGER_INVALID' });
+      expect(await directoryManifest(fixture.directory)).toEqual(before); expect(fixture.calls).toEqual(['chat', 'chat']);
+    }
+  }, 30_000);
+
   it('ignores a trailing partial retry record during read-only planning and repairs it only during execute', async () => {
     const input = await prepared(); input.request.request_id = 'request-alpha2-retry-ledger-trailing-partial';
     const submitted = await submitExchangeRequest(input.workspace, input.request); const calls: string[] = [];

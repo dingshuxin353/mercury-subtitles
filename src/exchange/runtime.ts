@@ -1981,6 +1981,10 @@ function retryOutcome(task: TaskRecordV5): ProviderCall['outcome'] {
     ?? 'not_dispatched';
 }
 
+function retryPlanId(identity: unknown): string {
+  return `rpl-${digest(canonicalJson(identity)).slice(0, 24)}`;
+}
+
 export async function planV5Retry(directory: string, input?: TaskRecordV5, now = new Date()): Promise<ExchangeRetryPlanV1> {
   const task = input ?? await readV5Task(directory);
   if (!hasTaskControl(task)) throw new MercuryError('CONTRACT_UNSUPPORTED', '此 Alpha.1 历史任务没有安全重试账本；查询未做任何写入。', { exitCode: 5 });
@@ -2045,9 +2049,9 @@ export async function planV5Retry(directory: string, input?: TaskRecordV5, now =
     requires_user_action: userInputProblem || outcome === 'outcome_unknown' || evidenceProblem !== null,
     risk: outcome === 'outcome_unknown' ? 'unsafe_provider_outcome' : allowed ? 'new_provider_calls' : 'none',
   };
+  const planBody = { ...normalized, created_at: createdAt, expires_at: expiresAt };
   return assertExchangeContract('retryPlan', {
-    contract: 'mercury.retry-plan/v1', plan_id: `rpl-${digest(canonicalJson({ ...normalized, created_at: createdAt, expires_at: expiresAt })).slice(0, 24)}`,
-    ...normalized, created_at: createdAt, expires_at: expiresAt, extensions: {},
+    contract: 'mercury.retry-plan/v1', plan_id: retryPlanId(planBody), ...planBody, extensions: {},
   });
 }
 
@@ -2183,6 +2187,11 @@ async function readRetryLedgerReadOnly(directory: string): Promise<RetryLedgerRe
 
 function assertRetryLedgerIdentity(records: RetryLedgerRecord[], task: TaskRecordV5): void {
   const invalid = (message: string): never => { throw new MercuryError('RETRY_LEDGER_INVALID', `${message}；未执行 retry 或 Provider 调用。`); };
+  const number = (value: unknown, label: string): number => {
+    if (!Number.isInteger(value) || Number(value) < 0) invalid(`${label} 不是非负整数`);
+    return Number(value);
+  };
+  const same = (left: unknown, right: unknown): boolean => canonicalJson(left) === canonicalJson(right);
   if (!task.execution.attempt_id || task.execution.attempt_count < 1) invalid('当前终态任务缺少 attempt identity');
   if (records.length === 0) invalid('当前任务缺少 append-only attempt 账本');
   const knownContracts = new Set([
@@ -2192,6 +2201,10 @@ function assertRetryLedgerIdentity(records: RetryLedgerRecord[], task: TaskRecor
   if (records.some((record) => typeof record.contract !== 'string' || !knownContracts.has(record.contract))) invalid('attempt 账本包含未知合同');
   if (records.some((record) => record.task_id !== task.identity.task_id)) invalid('attempt 账本 task identity 不一致');
   const starts = records.filter((record) => record.contract === 'mercury.attempt/v1');
+  const retries = records.filter((record) => record.contract === 'mercury.retry/v1');
+  const results = records.filter((record) => record.contract === 'mercury.attempt-result/v1');
+  const corrections = records.filter((record) => record.contract === 'mercury.attempt-result-correction/v1');
+  const calls = records.filter((record) => record.contract === 'mercury.provider-call/v1');
   const startIds = new Set<string>();
   for (const [index, start] of starts.entries()) {
     const attemptId = start.attempt_id;
@@ -2205,57 +2218,105 @@ function assertRetryLedgerIdentity(records: RetryLedgerRecord[], task: TaskRecor
   if (pendingStarts < 0 || pendingStarts > 1) invalid('attempt 数量与 task attempt_count 不一致');
   const currentStart = starts[task.execution.attempt_count - 1];
   if (!currentStart || currentStart.attempt_id !== task.execution.attempt_id) invalid('当前 task attempt 与 append-only 起点不一致');
-  if (pendingStarts === 1) {
-    const pending = starts.at(-1)!;
-    const retry = records.find((record) => record.contract === 'mercury.retry/v1' && record.plan_id === pending.retry_plan_id);
-    if (!retry || retry.based_on_revision !== task.identity.revision || typeof retry.plan !== 'object' || retry.plan === null) invalid('预提交 retry attempt 缺少固定计划');
+  if (retries.length !== Math.max(0, starts.length - 1)) invalid('retry 计划事实数量与 retry attempt 不一致');
+  const matchedRetryIds = new Set<string>();
+  for (let index = 1; index < starts.length; index += 1) {
+    const start = starts[index]!; const previous = starts[index - 1]!;
+    const matching = retries.filter((record) => record.plan_id === start.retry_plan_id);
+    if (matching.length !== 1) invalid('retry attempt 缺少唯一计划事实');
+    const retry = matching[0]!; const planId = String(start.retry_plan_id);
+    if (matchedRetryIds.has(planId)) invalid('retry plan 被多个 attempt 复用');
+    matchedRetryIds.add(planId);
+    if (retry.based_on_revision !== start.based_on_revision || retry.previous_attempt_id !== previous.attempt_id
+      || typeof retry.plan !== 'object' || retry.plan === null) invalid('retry 事实与 attempt/revision/前序 attempt 不一致');
+    let plan: ExchangeRetryPlanV1;
+    try { plan = assertExchangeContract('retryPlan', retry.plan); } catch { invalid('retry 账本内嵌计划不符合合同'); }
+    const { contract: _contract, plan_id: _planId, extensions: _extensions, ...planBody } = plan!;
+    if (plan!.plan_id !== planId || retry.plan_id !== planId || retryPlanId(planBody) !== planId
+      || plan!.task_id !== task.identity.task_id || plan!.task_revision !== start.based_on_revision
+      || plan!.attempt_id !== previous.attempt_id || !plan!.allowed || plan!.checkpoint !== start.checkpoint
+      || !same(retry.reuse, plan!.reuse) || !same(retry.discard, plan!.discard)
+      || !same(retry.estimated_calls, plan!.estimated_calls)) invalid('retry 计划 ID、revision、checkpoint 或执行内容不闭合');
   }
-  const results = records.filter((record) => record.contract === 'mercury.attempt-result/v1');
+  if (retries.some((retry) => typeof retry.plan_id !== 'string' || !matchedRetryIds.has(retry.plan_id))) invalid('retry 账本包含重复或孤儿计划事实');
   for (let number = 1; number <= task.execution.attempt_count; number += 1) {
     const start = starts[number - 1]!;
     const matching = results.filter((record) => record.attempt_id === start.attempt_id);
     if (matching.length !== 1 || matching[0]!.number !== number) invalid('attempt 终态结果缺失、重复或序号不一致');
   }
-  if (results.some((record) => !startIds.has(String(record.attempt_id)))) invalid('attempt result 引用了未知 attempt');
-  const currentResult = results.find((record) => record.attempt_id === task.execution.attempt_id)!;
-  const corrections = records.filter((record) => record.contract === 'mercury.attempt-result-correction/v1' && record.attempt_id === task.execution.attempt_id);
-  if (corrections.length > 1) invalid('当前 attempt correction 重复');
-  const effectiveStatus = corrections[0]?.status ?? currentResult.status;
-  if (effectiveStatus !== task.status) invalid('当前 attempt 终态与 task status 不一致');
-  const expectedError = corrections[0]?.reason_code ?? currentResult.error_code ?? null;
-  if (expectedError !== (task.error?.code ?? null)) invalid('当前 attempt 错误 identity 与 task 不一致');
-  const ending = currentResult.ending_call_counts as { asr?: unknown; chat?: unknown } | undefined;
-  if (!ending || ending.asr !== task.execution.provider_calls.asr.count || ending.chat !== task.execution.provider_calls.chat.count) invalid('当前 attempt Provider 计数与 task 不一致');
-  const resultOutcomes = currentResult.provider_outcomes as { asr?: unknown; chat?: unknown } | undefined;
-  if (!resultOutcomes || resultOutcomes.asr !== task.execution.provider_calls.asr.outcome || resultOutcomes.chat !== task.execution.provider_calls.chat.outcome) invalid('当前 attempt Provider outcome 与 task 不一致');
-  const calls = records.filter((record) => record.contract === 'mercury.provider-call/v1');
+  if (results.length !== task.execution.attempt_count || results.some((record) => !startIds.has(String(record.attempt_id)))) invalid('attempt result 包含重复或孤儿事实');
+  if (corrections.some((record) => !startIds.has(String(record.attempt_id)))) invalid('attempt correction 引用了未知 attempt');
+  const attemptFacts = starts.slice(0, task.execution.attempt_count).map((start, index) => {
+    const result = results.find((record) => record.attempt_id === start.attempt_id)!;
+    const attemptCorrections = corrections.filter((record) => record.attempt_id === start.attempt_id);
+    if (attemptCorrections.length > 1) invalid('attempt correction 重复');
+    const correction = attemptCorrections[0];
+    if (correction && correction.supersedes_status !== result.status) invalid('attempt correction 未指向原始终态');
+    const status = correction?.status ?? result.status;
+    const errorCode = correction?.reason_code ?? result.error_code ?? null;
+    const starting = {
+      asr: number(start.starting_asr_call_count ?? start.asr_call_count, `attempt ${index + 1} ASR 起始计数`),
+      chat: number(start.starting_chat_call_count ?? start.chat_call_count, `attempt ${index + 1} Chat 起始计数`),
+    };
+    const resultStarting = result.starting_call_counts as { asr?: unknown; chat?: unknown } | undefined;
+    const endingSource = result.ending_call_counts as { asr?: unknown; chat?: unknown } | undefined;
+    const deltas = result.new_call_counts as { asr?: unknown; chat?: unknown } | undefined;
+    if (!resultStarting || !endingSource || !deltas) invalid('attempt result 缺少调用计数闭包');
+    const ending = { asr: number(endingSource!.asr, 'ASR 终止计数'), chat: number(endingSource!.chat, 'Chat 终止计数') };
+    if (resultStarting!.asr !== starting.asr || resultStarting!.chat !== starting.chat
+      || result.asr_call_count !== ending.asr || result.chat_call_count !== ending.chat
+      || deltas!.asr !== ending.asr - starting.asr || deltas!.chat !== ending.chat - starting.chat
+      || ending.asr < starting.asr || ending.chat < starting.chat) invalid('attempt starting/ending/delta 调用计数不闭合');
+    if (index > 0) {
+      const prior = starts[index - 1]!; const priorResult = results.find((record) => record.attempt_id === prior.attempt_id)!;
+      const priorEnding = priorResult.ending_call_counts as { asr?: unknown; chat?: unknown };
+      if (starting.asr !== number(priorEnding.asr, '前一 attempt ASR 终止计数') || starting.chat !== number(priorEnding.chat, '前一 attempt Chat 终止计数')) invalid('相邻 attempt Provider 计数不连续');
+    }
+    const nextStart = starts[index + 1];
+    if (nextStart) {
+      const retry = retries.find((record) => record.plan_id === nextStart.retry_plan_id)!;
+      const previousError = retry.previous_error as { code?: unknown } | null | undefined;
+      if (retry.previous_status !== status || (previousError?.code ?? null) !== errorCode) invalid('retry 事实未固定前一 attempt 的有效终态/错误');
+    }
+    return { start, result, status, errorCode, starting, ending };
+  });
+  const currentFacts = attemptFacts.at(-1)!;
+  if (currentFacts.status !== task.status || currentFacts.errorCode !== (task.error?.code ?? null)) invalid('当前 attempt 有效终态/错误与 task 不一致');
+  if (currentFacts.ending.asr !== task.execution.provider_calls.asr.count || currentFacts.ending.chat !== task.execution.provider_calls.chat.count) invalid('当前 attempt Provider 计数与 task 不一致');
+  const currentOutcomes = currentFacts.result.provider_outcomes as { asr?: unknown; chat?: unknown } | undefined;
+  if (!currentOutcomes || currentOutcomes.asr !== task.execution.provider_calls.asr.outcome || currentOutcomes.chat !== task.execution.provider_calls.chat.outcome) invalid('当前 attempt Provider outcome 与 task 不一致');
   if (calls.some((record) => !startIds.has(String(record.attempt_id)))) invalid('Provider call 引用了未知 attempt');
   for (const role of ['asr', 'chat'] as const) {
     const roleCalls = calls.filter((record) => record.role === role);
-    const grouped = new Map<string, RetryLedgerRecord[]>();
+    const groupedByNumber = new Map<number, RetryLedgerRecord[]>();
     for (const record of roleCalls) {
-      const callId = record.call_id;
-      if (typeof callId !== 'string' || typeof record.call_number !== 'number' || record.call_number < 1) invalid('Provider call identity 无效');
-      grouped.set(callId as string, [...(grouped.get(callId as string) ?? []), record]);
+      const callId = record.call_id; const callNumber = record.call_number;
+      if (typeof callId !== 'string' || typeof callNumber !== 'number' || callNumber < 1) invalid('Provider call identity 无效');
+      groupedByNumber.set(callNumber as number, [...(groupedByNumber.get(callNumber as number) ?? []), record]);
     }
-    for (const phases of grouped.values()) {
+    const total = task.execution.provider_calls[role].count;
+    if (groupedByNumber.size !== total || Array.from({ length: total }, (_, index) => index + 1).some((callNumber) => !groupedByNumber.has(callNumber))) invalid(`${role} Provider call_number 不连续`);
+    for (const [callNumber, phases] of groupedByNumber) {
+      const callIds = new Set(phases.map((record) => record.call_id));
+      if (callIds.size !== 1) invalid('同一 Provider call_number 对应多个 call ID');
       if (phases.filter((record) => record.phase === 'dispatched').length !== 1 || phases.filter((record) => record.phase === 'terminal').length !== 1) invalid('Provider call phase 不完整或重复');
       if (phases.filter((record) => record.phase === 'response_persisted').length > 1) invalid('Provider response phase 重复');
       const order = phases.map((record) => ({ dispatched: 1, response_persisted: 2, terminal: 3 })[String(record.phase)] ?? 0);
       if (order.includes(0) || order.some((value, index) => index > 0 && value <= order[index - 1]!)) invalid('Provider call phase 顺序无效');
-    }
-    const maxCount = roleCalls.reduce((maximum, record) => Math.max(maximum, Number(record.call_number)), 0);
-    if (maxCount !== task.execution.provider_calls[role].count) invalid(`当前 ${role} Provider call 序号与 task 不一致`);
-    const currentCall = task.execution.provider_calls[role];
-    if (currentCall.count > 0) {
-      const facts = roleCalls.filter((record) => record.call_id === currentCall.call_id && record.call_number === currentCall.count);
-      if (facts.length < 2 || facts.some((record) => record.attempt_id !== task.execution.attempt_id
-        || record.capability !== currentCall.capability
-        || record.model_snapshot_entry_ref !== currentCall.model_snapshot_entry_ref)) invalid(`当前 ${role} Provider call identity 与 task 不一致`);
-      const terminal = facts.find((record) => record.phase === 'terminal');
-      if (!terminal || terminal.outcome !== currentCall.outcome
-        || terminal.evidence_ref !== currentCall.evidence_ref
-        || terminal.evidence_sha256 !== currentCall.evidence_sha256) invalid(`当前 ${role} Provider terminal evidence 与 task 不一致`);
+      const attempt = attemptFacts.find((facts) => callNumber > facts.starting[role] && callNumber <= facts.ending[role]);
+      if (!attempt || phases.some((record) => record.attempt_id !== attempt!.start.attempt_id)) invalid('Provider call 未落在唯一历史 attempt 计数区间');
+      const expectedCapability = role === 'asr' ? 'transcription' : 'calibration';
+      const expectedModelRef = task.execution.provider_calls[role].model_snapshot_entry_ref;
+      if (!expectedModelRef || phases.some((record) => record.capability !== expectedCapability || record.model_snapshot_entry_ref !== expectedModelRef)) invalid('历史 Provider call 能力或模型 identity 不一致');
+      const terminal = phases.find((record) => record.phase === 'terminal')!;
+      const outcomes = attempt!.result.provider_outcomes as { asr?: unknown; chat?: unknown };
+      const evidence = attempt!.result.response_evidence as { asr?: unknown; chat?: unknown };
+      if (terminal.outcome !== outcomes[role] || terminal.evidence_sha256 !== evidence[role]) invalid('历史 Provider terminal outcome/evidence 与 attempt result 不一致');
+      if (callNumber === total) {
+        const currentCall = task.execution.provider_calls[role];
+        if (terminal.call_id !== currentCall.call_id || terminal.outcome !== currentCall.outcome
+          || terminal.evidence_ref !== currentCall.evidence_ref || terminal.evidence_sha256 !== currentCall.evidence_sha256) invalid(`当前 ${role} Provider call 与 task 不一致`);
+      }
     }
   }
 }
