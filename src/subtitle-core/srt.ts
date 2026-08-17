@@ -9,6 +9,27 @@ export type ReferenceSrtParseResult =
   | { ok: true; segments: ReferenceSrtSegment[] }
   | { ok: false; issue: SubtitleCoreIssue };
 
+export function normalizeCalibrationUnitText(value: string): string {
+  return value
+    .normalize('NFC')
+    .replace(/[\r\n\u2028\u2029]+/gu, ' ')
+    .replace(/[\t ]+/gu, ' ')
+    .trim();
+}
+
+export function normalizeReferenceSrtForCalibration(source: string): string {
+  const parsed = parseReferenceSrt(source);
+  if (!parsed.ok) return source;
+  const stamp = (ms: number): string => {
+    const hours = Math.floor(ms / 3_600_000);
+    const minutes = Math.floor((ms % 3_600_000) / 60_000);
+    const seconds = Math.floor((ms % 60_000) / 1_000);
+    const milli = ms % 1_000;
+    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')},${String(milli).padStart(3, '0')}`;
+  };
+  return `${parsed.segments.map((segment) => `${segment.sequence}\n${stamp(segment.start_ms)} --> ${stamp(segment.end_ms)}\n${normalizeCalibrationUnitText(segment.text)}\n`).join('\n')}\n`;
+}
+
 const TIMELINE_PATTERN =
   /^(\d{2,}):(\d{2}):(\d{2}),(\d{3})\s+-->\s+(\d{2,}):(\d{2}):(\d{2}),(\d{3})$/;
 

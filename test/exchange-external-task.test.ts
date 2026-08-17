@@ -213,7 +213,7 @@ describe('Exchange v1 external transcript task', () => {
     const audio = path.join(input.home, 'provider.mp3');
     const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
     const reference = path.join(input.home, 'reference.srt');
-    const referenceText = '1\n00:00:00,000 --> 00:00:00,040\n您好 Mercury 字幕测试\n';
+    const referenceText = '1\n00:00:00,000 --> 00:00:00,040\n您好 Mercury\n字幕测试\n';
     await writeFile(reference, referenceText);
     const dictionary = await createDictionary(input.workspace, { name: 'Provider Terms', scope: 'global' });
     await mutateDictionary(input.workspace, dictionary.dictionary_id, dictionary.revision, (current) => current.entries.push(makeDictionaryEntry({ entry_id: 'entry-provider-mercury', canonical: 'Mercury', variants: ['水星'], kind: 'product' })));
@@ -230,8 +230,8 @@ describe('Exchange v1 external transcript task', () => {
     expect(submitted.task.artifacts.transcript).toBeNull();
     const changed = structuredClone(request); changed.dictionaries.selected = [];
     await expect(submitExchangeRequest(input.workspace, changed)).rejects.toMatchObject({ code: 'REQUEST_ID_CONFLICT' });
-    const calls: string[] = []; const capturedHints: Array<NonNullable<Parameters<AsrAdapter['run']>[0]['asrHints']>> = [];
-    await runWorker(input.workspace, { asrAdapter: fixtureHintsAsr(calls, capturedHints), fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' });
+    const calls: string[] = []; const capturedHints: Array<NonNullable<Parameters<AsrAdapter['run']>[0]['asrHints']>> = []; const capturedChat: Array<Record<string, any>> = [];
+    await runWorker(input.workspace, { asrAdapter: fixtureHintsAsr(calls, capturedHints), fetch: fixtureFetch(calls, capturedChat), readCredential: async () => 'fixture-secret' });
     const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
     const task = await readV5Task(directory);
     expect(task.status, JSON.stringify(task.error)).toBe('completed');
@@ -243,6 +243,11 @@ describe('Exchange v1 external transcript task', () => {
     expect(task.execution.provider_calls.asr).toMatchObject({ state: 'terminal', count: 1, outcome: 'response_persisted' });
     expect(task.execution.provider_calls.chat).toMatchObject({ state: 'terminal', count: 1, outcome: 'response_persisted' });
     expect(calls).toEqual(['asr', 'chat']);
+    const prompt = capturedChat[0]!.messages.find((message: any) => message.role === 'user').content as string;
+    const promptPayload = JSON.parse(prompt.slice(prompt.lastIndexOf('\n') + 1));
+    expect(promptPayload.calibration_units[0].original_text).toBe('您好 Mercury 字幕测试');
+    expect(promptPayload.calibration_units[0].original_text).not.toMatch(/[\r\n]/u);
+    expect(await readFile(path.join(directory, task.inputs.reference_normalized!.path), 'utf8')).toContain('您好 Mercury\n字幕测试');
     expect(capturedHints).toEqual([{ entries: [expect.objectContaining({ entryId: 'entry-provider-mercury', canonical: 'Mercury', variants: ['水星'] })] }]);
     const frozenDictionary = JSON.parse(await readFile(path.join(directory, task.dictionary_snapshot.path), 'utf8'));
     expect(frozenDictionary.asr_hints).toMatchObject({ status: 'used', adapter_id: 'fixture_contract_asr', entry_ids: ['entry-provider-mercury'], available_count: 1, input_count: 1, truncated: false });
@@ -259,6 +264,68 @@ describe('Exchange v1 external transcript task', () => {
   it('declares both built-in Volcengine ASR adapters as not supporting per-task dynamic hints', () => {
     expect(new VolcengineAsrAdapter({ resolveCredential: async () => ({ mode: 'api_key', uid: 'fixture', value: 'fixture' }) }).asrHintsCapability.status).toBe('not_supported');
     expect(new VolcengineSubtitleAsrAdapter({ readCredential: async () => 'fixture' }).asrHintsCapability.status).toBe('not_supported');
+  });
+
+  it('reads historical provider transcripts whose structured warning JSON differs only by key order', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'provider-warning-order.mp3');
+    const bytes = Buffer.alloc(834); bytes.set([0xff, 0xfb, 0x90, 0x64], 0); bytes.set([0xff, 0xfb, 0x90, 0x64], 417); await writeFile(audio, bytes);
+    const registry = await loadModelRegistryV2(input.workspace);
+    const submitted = await submitExchangeRequest(input.workspace, {
+      ...input.request,
+      request_id: 'request-provider-warning-order',
+      inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: null },
+      transcription_mode: 'provider',
+      models: { asr: registry.defaults.asr, chat: registry.defaults.chat },
+    });
+    const warningAsr: AsrAdapter = {
+      ...fixtureAsr([]),
+      async run(adapterInput) {
+        const result = await fixtureAsr([]).run(adapterInput);
+        if (result.kind === 'artifact') result.artifact.warnings = [{
+          warning_id: 'warning-words-dropped',
+          code: 'WORDS_DROPPED',
+          message: '3 word timings were dropped.',
+          stage: 'response_validation',
+          severity: 'low',
+        }];
+        return result;
+      },
+    };
+    await runWorker(input.workspace, { asrAdapter: warningAsr, fetch: fixtureFetch([]), readCredential: async () => 'fixture-secret' });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const transcriptPath = path.join(directory, 'work/transcript.normalized.json');
+    const transcript = JSON.parse(await readFile(transcriptPath, 'utf8'));
+    expect(JSON.parse(transcript.warnings[0])).toEqual({
+      code: 'WORDS_DROPPED',
+      message: '3 word timings were dropped.',
+      severity: 'low',
+      stage: 'response_validation',
+      warning_id: 'warning-words-dropped',
+    });
+
+    // Simulate the already-persisted Alpha.1 development shape: identical JSON
+    // value, insertion-order serialization, and its historical derived hash.
+    transcript.warnings = ['{"warning_id":"warning-words-dropped","severity":"low","stage":"response_validation","message":"3 word timings were dropped.","code":"WORDS_DROPPED"}'];
+    const hashMaterial = structuredClone(transcript);
+    hashMaterial.source.normalized_sha256 = '0'.repeat(64);
+    transcript.source.normalized_sha256 = sha(canonicalJson(hashMaterial));
+    await writeFile(transcriptPath, canonicalJson(transcript), { mode: 0o600 });
+    const task = await readV5Task(directory);
+    task.artifacts.transcript!.sha256 = sha(canonicalJson(transcript));
+    await persistV5Task(directory, task);
+
+    const before = await directoryManifest(directory);
+    await expect(stableTaskView(input.workspace, await findTaskReadOnly(input.workspace, task.identity.task_id))).resolves.toMatchObject({ status: 'completed' });
+    await expect(stableTaskResult(input.workspace, await findTaskReadOnly(input.workspace, task.identity.task_id))).resolves.toMatchObject({ status: 'completed' });
+    await expect(readVerifiedV5Review(directory)).resolves.toMatchObject({ task_id: task.identity.task_id });
+    expect(await directoryManifest(directory)).toEqual(before);
+
+    transcript.warnings = ['{"warning_id":"warning-words-dropped","severity":"low","stage":"response_validation","message":"4 word timings were dropped.","code":"WORDS_DROPPED"}'];
+    await writeFile(transcriptPath, canonicalJson(transcript), { mode: 0o600 });
+    task.artifacts.transcript!.sha256 = sha(canonicalJson(transcript));
+    await persistV5Task(directory, task);
+    await expect(stableTaskView(input.workspace, await findTaskReadOnly(input.workspace, task.identity.task_id))).rejects.toMatchObject({ code: 'CALIBRATION_SOURCE_INVALID' });
   });
 
   it('cancels a queued provider task with no transcript as a zero-call terminal result', async () => {

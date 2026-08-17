@@ -14,7 +14,7 @@ import { CHAT_INLINE_AUDIO_LIMIT_BYTES, createChatCalibrationRuntimeV2, type Cha
 import { VolcengineAsrAdapter, type ResolvedVolcengineCredential } from '../adapters/volcengine-asr.js';
 import { VolcengineSubtitleAsrAdapter } from '../adapters/volcengine-subtitle-asr.js';
 import { legacyAsrEntry } from '../core-integration-v2.js';
-import { parseReferenceSrt, runSubtitleCore, type CalibratedTranscript } from '../subtitle-core/index.js';
+import { normalizeReferenceSrtForCalibration, parseReferenceSrt, runSubtitleCore, type CalibratedTranscript } from '../subtitle-core/index.js';
 import { serializeCalibratedSrt, validateSrtFile } from '../output-report/srt.js';
 import { createTaskId, safeAudioStem, sha256File } from '../tasks.js';
 import { appendStableJsonLine, canonicalJson, readStableJson, writeStableJsonAtomic } from './storage.js';
@@ -593,12 +593,38 @@ function exchangeTranscriptFromProvider(task: TaskRecordV5, raw: TranscriptRaw, 
       generated_at: raw.call.ended_at, content_sha256: rawHash, original_path: null,
       original_sha256: raw.audio.sha256, normalized_sha256: '0'.repeat(64),
     },
-    warnings: raw.warnings.map((warning) => typeof warning === 'string' ? warning : JSON.stringify(warning)).slice(0, 1000), extensions: {},
+    warnings: raw.warnings.map((warning) => typeof warning === 'string' ? warning : canonicalJson(warning)).slice(0, 1000), extensions: {},
   };
   const hashMaterial = structuredClone(value);
   hashMaterial.source.normalized_sha256 = '0'.repeat(64);
   value.source.normalized_sha256 = digest(canonicalJson(hashMaterial));
   return assertExchangeContract('transcript', value);
+}
+
+function canonicalWarningText(value: string): string {
+  try {
+    return canonicalJson(JSON.parse(value));
+  } catch {
+    return value;
+  }
+}
+
+function providerTranscriptProjectionMatches(
+  expected: ExchangeTranscriptV1,
+  actual: ExchangeTranscriptV1,
+): boolean {
+  const comparable = (value: ExchangeTranscriptV1): ExchangeTranscriptV1 => {
+    const copy = structuredClone(value);
+    // normalized_sha256 is derived from the projection itself. Early Alpha.1
+    // development tasks serialized structured ASR warnings with insertion-order
+    // JSON, while stable storage canonicalized the raw evidence. Compare the
+    // pinned semantic warning values and every other source field, but do not
+    // make that historical serialization detail invalidate an immutable task.
+    copy.source.normalized_sha256 = '0'.repeat(64);
+    copy.warnings = copy.warnings.map(canonicalWarningText);
+    return copy;
+  };
+  return canonicalJson(comparable(expected)) === canonicalJson(comparable(actual));
 }
 
 function refreshDictionaryMatches(snapshot: ResolvedDictionarySnapshot, text: string): void {
@@ -738,7 +764,7 @@ export async function verifyV5CalibrationSources(directory: string, taskInput?: 
     const rawValue = validateContract('transcript.raw', rawCandidate);
     if (!rawValue.valid) throw new MercuryError('CALIBRATION_SOURCE_INVALID', rawValue.issues.map((entry) => `${entry.path} ${entry.message}`).join('; '));
     legacy = assertAsrEvidenceIdentity(rawValue.value, task, snapshot, media, rawValue.value.audio.duration_ms);
-    if (canonicalJson(exchangeTranscriptFromProvider(task, legacy, snapshot)) !== canonicalJson(transcript)) throw new MercuryError('CALIBRATION_SOURCE_INVALID', '规范化转录与固定 ASR 来源不一致。');
+    if (!providerTranscriptProjectionMatches(exchangeTranscriptFromProvider(task, legacy, snapshot), transcript)) throw new MercuryError('CALIBRATION_SOURCE_INVALID', '规范化转录与固定 ASR 来源不一致。');
   }
   let referenceText: string | null = null;
   if (task.input_config.transcription_mode === 'provided') {
@@ -954,11 +980,14 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
   }
   let calibration: CalibrationResultV3 | null = null;
   try {
-    const referenceText = normalizedReferenceText
+    const referenceEvidenceText = normalizedReferenceText
       ?? (task.input_config.transcription_mode === 'provided' && task.calibration_sources.reference
         ? srtFromSegments(legacy.segments)
         : null);
-    await assertCalibrationSourceEvidence(directory, task, legacy, referenceText);
+    await assertCalibrationSourceEvidence(directory, task, legacy, referenceEvidenceText);
+    const referenceText = referenceEvidenceText === null
+      ? null
+      : normalizeReferenceSrtForCalibration(referenceEvidenceText);
     const initial = preflight(task, legacy, snapshot, referenceText);
     if (initial.status !== 'completed' || initial.alignment === null) throw new MercuryError(initial.issues[0]?.code ?? 'ALIGNMENT_FAILED', initial.issues[0]?.message ?? '外部转录无法形成合法校验单元。');
     await writeStableJsonAtomic(path.join(directory, 'work/alignment.json'), initial.alignment);

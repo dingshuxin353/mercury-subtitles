@@ -14,6 +14,7 @@ import { validateV3CalibrationResult } from '../contracts/index.js';
 import type { ReferenceSrtInput } from '../contracts/adapters/types.js';
 import {
   mappedAsrRefs,
+  normalizeCalibrationUnitText,
   parseReferenceSrt,
   type AlignmentArtifact,
 } from '../subtitle-core/index.js';
@@ -185,7 +186,7 @@ function calibrationUnits(input: ChatCalibrationV2Input): CalibrationUnit[] {
   if (input.referenceSrt === null) {
     return input.transcript.segments.map((segment) => ({
       unit_id: segment.segment_id,
-      original_text: segment.text,
+      original_text: normalizeCalibrationUnitText(segment.text),
       start_ms: segment.start_ms,
       end_ms: segment.end_ms,
       asr_segment_refs: [segment.segment_id],
@@ -219,7 +220,7 @@ function calibrationUnits(input: ChatCalibrationV2Input): CalibrationUnit[] {
     const useReferenceTimeline = input.mode === 'text-only' || (relations.length === 0 && evidence.length === 0);
     return {
       unit_id: segment.reference_segment_id,
-      original_text: segment.text,
+      original_text: normalizeCalibrationUnitText(segment.text),
       start_ms: useReferenceTimeline
         ? segment.start_ms
         : relations.length > 0

@@ -31,6 +31,7 @@ import {
   resolveVolcengineCredentialReference,
 } from './models.js';
 import {
+  normalizeReferenceSrtForCalibration,
   parseReferenceSrt,
   runSubtitleCore,
   type CalibratedTranscript,
@@ -728,12 +729,15 @@ export async function executeCalibrationTaskV2(
       await finishReport(root, task, snapshot, null, null);
       return cancelledAfterAsr;
     }
-    const reference = task.inputs.reference_srt
+    const referenceEvidence = task.inputs.reference_srt
       ? await readFile(
           file(root, task.inputs.reference_srt.workspace_copy_path),
           'utf8',
         )
       : null;
+    const reference = referenceEvidence === null
+      ? null
+      : normalizeReferenceSrtForCalibration(referenceEvidence);
     const preflightAt = at(now);
     const initial = runSubtitleCore({
       transcript,
