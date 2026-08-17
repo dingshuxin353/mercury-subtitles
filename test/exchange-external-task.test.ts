@@ -1641,6 +1641,11 @@ describe('Exchange v1 external transcript task', () => {
     const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
     let review = await readVerifiedV5Review(directory);
     expect(review.counts.pending).toBe(3); expect(await lstat(business).catch(() => null)).toBeNull();
+    const pendingManifest = await directoryManifest(directory); const rejectedOutput: string[] = [];
+    expect(await runCli(['task', 'deliver', submitted.task.identity.task_id, '--json'], { homeDirectory: input.home, stdout: (value) => rejectedOutput.push(value), stderr: () => undefined })).toBe(3);
+    expect(JSON.parse(rejectedOutput[0]!).error).toMatchObject({ code: 'DELIVERY_NOT_READY', category: 'conflict', retryability: 'after_user_action' });
+    expect((await readV5Task(directory)).delivery?.status).toBe('pending_review');
+    expect(await directoryManifest(directory)).toEqual(pendingManifest); expect(await lstat(business).catch(() => null)).toBeNull();
     review = await decideV5ReviewChange(directory, { changeId: review.changes[0]!.change_id, decision: 'accepted', actor: 'user_via_cli' });
     review = await decideV5ReviewChange(directory, { changeId: review.changes[1]!.change_id, decision: 'rejected', actor: 'user_via_cli' });
     review = await decideV5ReviewChange(directory, { changeId: review.changes[2]!.change_id, decision: 'edited', text: '丙人工确认', actor: 'user_via_cli' });

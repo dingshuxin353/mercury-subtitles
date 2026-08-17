@@ -176,10 +176,10 @@ export async function deliverApprovedSrt(
     let task = await readV5Task(root);
     if (!task.delivery?.requested_directory) throw asMercuryError(deliveryError('DELIVERY_NOT_REQUESTED', '此任务没有请求业务目录交付。', 'input'));
     if (task.status !== 'completed') throw asMercuryError(deliveryError('DELIVERY_NOT_READY', '只有 completed 且批准稿已形成的任务才能交付。', 'conflict'));
+    const approved = await verifyApproved(root, task, review);
+    const revision = reviewRevision(review);
+    const target = finalPath(task.delivery.requested_directory, task, review);
     try {
-      const approved = await verifyApproved(root, task, review);
-      const revision = reviewRevision(review);
-      const target = finalPath(task.delivery.requested_directory, task, review);
       if (task.delivery.status === 'delivered'
         && task.delivery.review_revision === revision
         && task.delivery.final_path === target
