@@ -250,10 +250,20 @@ export async function isV5TaskDirectory(directory: string): Promise<boolean> {
 
 async function stableEvents(directory: string): Promise<ExchangeEventV1[]> {
   let source: string;
-  try { source = await readFile(path.join(directory, 'events.jsonl'), 'utf8'); } catch (error) {
+  const target = path.join(directory, 'events.jsonl');
+  let handle;
+  try {
+    const entry = await lstat(target);
+    if (!entry.isFile() || entry.isSymbolicLink()) throw new MercuryError('EVENT_LOG_INVALID', '稳定事件日志必须是 Mercury 管理的普通文件。');
+    handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.dev !== entry.dev || opened.ino !== entry.ino) throw new MercuryError('EVENT_LOG_INVALID', '稳定事件日志在读取期间被替换。');
+    source = await handle.readFile('utf8');
+  } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
-    throw error;
-  }
+    if (error instanceof MercuryError) throw error;
+    throw new MercuryError('EVENT_LOG_INVALID', '稳定事件日志无法安全读取。');
+  } finally { await handle?.close().catch(() => undefined); }
   const lines = source.endsWith('\n') ? source.slice(0, -1).split('\n').filter(Boolean) : source.slice(0, source.lastIndexOf('\n') + 1).split('\n').filter(Boolean);
   const events = lines.map((line, index) => {
     try { return assertExchangeContract('event', JSON.parse(line)); } catch { throw new MercuryError('EVENT_LOG_INVALID', `稳定事件日志第 ${index + 1} 行损坏。`); }
@@ -2104,6 +2114,7 @@ async function archiveRetryArtifacts(directory: string, task: TaskRecordV5): Pro
 
 async function appendRetryAttemptFacts(directory: string, task: TaskRecordV5, plan: ExchangeRetryPlanV1, nextAttemptId: string, at: string): Promise<void> {
   const target = path.join(directory, 'attempts.jsonl');
+  await repairTrailingJsonlFragment(target);
   const records = await readFile(target, 'utf8').then((source) => source.split('\n').filter(Boolean).map((line) => JSON.parse(line) as { contract?: string; attempt_id?: string; plan_id?: string })).catch((error) => {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
     throw error;

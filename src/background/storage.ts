@@ -8,7 +8,6 @@ import {
   readFile,
   readdir,
   rm,
-  truncate,
 } from 'node:fs/promises';
 import path from 'node:path';
 import { MercuryError } from '../errors.js';
@@ -250,14 +249,23 @@ export async function appendTaskEvent(
       data: input.data ?? {},
     };
     assertV4Contract('task-event', event);
-    const eventHandle = await open(target, constants.O_CREAT | constants.O_APPEND | constants.O_WRONLY, 0o600);
+    const before = await lstat(target).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    });
+    if (before && (!before.isFile() || before.isSymbolicLink())) throw new MercuryError('EVENT_LOG_INVALID', '任务事件记录必须是 Mercury 管理的普通文件。');
+    const eventHandle = await open(target, constants.O_CREAT | constants.O_APPEND | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0), 0o600);
     try {
+      const opened = await eventHandle.stat();
+      if (!opened.isFile() || (before && (opened.dev !== before.dev || opened.ino !== before.ino))) {
+        throw new MercuryError('EVENT_LOG_INVALID', '任务事件记录在追加期间被替换。');
+      }
       await eventHandle.writeFile(`${JSON.stringify(event)}\n`, 'utf8');
+      await eventHandle.chmod(0o600);
       await eventHandle.sync();
     } finally {
       await eventHandle.close();
     }
-    await chmod(target, 0o600);
     return event;
   }, {
     waitMs: 5_000,
@@ -267,13 +275,19 @@ export async function appendTaskEvent(
 }
 
 async function readEventSource(target: string): Promise<string | null> {
+  let handle;
   try {
     const entry = await lstat(target);
     if (!entry.isFile() || entry.isSymbolicLink()) throw new Error('not a regular file');
-    return await readFile(target, 'utf8');
+    handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.dev !== entry.dev || opened.ino !== entry.ino) throw new Error('event file replaced');
+    return await handle.readFile('utf8');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw new MercuryError('EVENT_LOG_INVALID', '任务事件记录不可读。');
+  } finally {
+    await handle?.close().catch(() => undefined);
   }
 }
 
@@ -292,17 +306,25 @@ function splitRecoverableEventSource(source: string): { complete: string; traili
 }
 
 async function repairTrailingEventFragment(target: string): Promise<void> {
-  const source = await readEventSource(target);
-  if (source === null || source.endsWith('\n')) return;
-  const recovered = splitRecoverableEventSource(source);
-  if (recovered.trailingCompleteWithoutNewline) {
-    const handle = await open(target, constants.O_APPEND | constants.O_WRONLY);
-    try { await handle.writeFile('\n', 'utf8'); await handle.sync(); } finally { await handle.close(); }
-    return;
-  }
-  await truncate(target, Buffer.byteLength(recovered.complete, 'utf8'));
-  const handle = await open(target, constants.O_WRONLY);
-  try { await handle.sync(); } finally { await handle.close(); }
+  const entry = await lstat(target).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  });
+  if (!entry) return;
+  if (!entry.isFile() || entry.isSymbolicLink()) throw new MercuryError('EVENT_LOG_INVALID', '任务事件记录必须是 Mercury 管理的普通文件。');
+  const handle = await open(target, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.dev !== entry.dev || opened.ino !== entry.ino) throw new MercuryError('EVENT_LOG_INVALID', '任务事件记录在修复期间被替换。');
+    const bytes = await handle.readFile();
+    const source = bytes.toString('utf8');
+    if (source.endsWith('\n')) return;
+    const recovered = splitRecoverableEventSource(source);
+    if (recovered.trailingCompleteWithoutNewline) await handle.write('\n', bytes.length, 'utf8');
+    else await handle.truncate(Buffer.byteLength(recovered.complete, 'utf8'));
+    await handle.chmod(0o600);
+    await handle.sync();
+  } finally { await handle.close(); }
 }
 
 export async function readTaskEvents(taskDirectory: string, afterSequence = 0): Promise<TaskEventV1[]> {

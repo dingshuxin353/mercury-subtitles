@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
-import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm, truncate } from 'node:fs/promises';
+import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { MercuryError } from '../errors.js';
 
@@ -70,32 +70,48 @@ export async function readStableJson(filePath: string, errorCode = 'CONTRACT_INV
 }
 
 export async function repairTrailingJsonlFragment(filePath: string): Promise<boolean> {
-  let source: Buffer;
-  try { source = await readFile(filePath); } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+  const before = await lstat(filePath).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw error;
+  });
+  if (!before) return false;
+  if (!before.isFile() || before.isSymbolicLink()) throw new MercuryError('EVENT_LOG_INVALID', 'JSONL 日志必须是 Mercury 管理的普通文件。');
+  const handle = await open(filePath, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) throw new MercuryError('EVENT_LOG_INVALID', 'JSONL 日志在读取期间被替换。');
+    const source = await handle.readFile();
+    if (source.length === 0 || source.at(-1) === 0x0a) return false;
+    const finalNewline = source.lastIndexOf(0x0a);
+    const prefix = finalNewline < 0 ? Buffer.alloc(0) : source.subarray(0, finalNewline + 1);
+    for (const [index, line] of prefix.toString('utf8').split('\n').filter(Boolean).entries()) {
+      try { JSON.parse(line); } catch { throw new MercuryError('EVENT_LOG_INVALID', `事件日志中间第 ${index + 1} 行损坏，不能自动跳过。`); }
+    }
+    await handle.truncate(finalNewline + 1);
+    await handle.chmod(0o600);
+    await handle.sync();
+    return true;
+  } finally {
+    await handle.close();
   }
-  if (source.length === 0 || source.at(-1) === 0x0a) return false;
-  const finalNewline = source.lastIndexOf(0x0a);
-  const prefix = finalNewline < 0 ? Buffer.alloc(0) : source.subarray(0, finalNewline + 1);
-  for (const [index, line] of prefix.toString('utf8').split('\n').filter(Boolean).entries()) {
-    try { JSON.parse(line); } catch { throw new MercuryError('EVENT_LOG_INVALID', `事件日志中间第 ${index + 1} 行损坏，不能自动跳过。`); }
-  }
-  await truncate(filePath, finalNewline + 1);
-  const handle = await open(filePath, constants.O_RDWR);
-  try { await handle.sync(); } finally { await handle.close(); }
-  return true;
 }
 
 export async function appendStableJsonLine(filePath: string, value: unknown): Promise<void> {
   await mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
   await repairTrailingJsonlFragment(filePath);
-  const handle = await open(filePath, constants.O_CREAT | constants.O_APPEND | constants.O_WRONLY, 0o600);
+  const before = await lstat(filePath).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  });
+  if (before && (!before.isFile() || before.isSymbolicLink())) throw new MercuryError('EVENT_LOG_INVALID', 'JSONL 日志必须是 Mercury 管理的普通文件。');
+  const handle = await open(filePath, constants.O_CREAT | constants.O_APPEND | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0), 0o600);
   try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || (before && (opened.dev !== before.dev || opened.ino !== before.ino))) throw new MercuryError('EVENT_LOG_INVALID', 'JSONL 日志在追加期间被替换。');
     await handle.writeFile(`${JSON.stringify(JSON.parse(canonicalJson(value)))}\n`, 'utf8');
+    await handle.chmod(0o600);
     await handle.sync();
   } finally { await handle.close(); }
-  await chmod(filePath, 0o600);
 }
 
 export async function assertPathInsideRealRoot(root: string, candidate: string): Promise<string> {

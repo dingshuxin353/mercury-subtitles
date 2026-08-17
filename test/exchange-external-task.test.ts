@@ -2036,6 +2036,61 @@ describe('Exchange v1 external transcript task', () => {
     expect(calls).toEqual(['chat']);
   });
 
+  it('rejects a symlinked retry ledger without changing its external target or creating an attempt', async () => {
+    const input = await prepared(); input.request.request_id = 'request-alpha2-retry-ledger-symlink';
+    const submitted = await submitExchangeRequest(input.workspace, input.request); const calls: string[] = [];
+    await runWorker(input.workspace, { chatRuntime: knownFailureChat(calls) });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory); const failed = await readV5Task(directory);
+    const plan = await planV5Retry(directory, failed);
+    const attemptsPath = path.join(directory, 'attempts.jsonl');
+    const outside = path.join(input.home, 'outside-attempts.jsonl');
+    await writeFile(outside, await readFile(attemptsPath), { mode: 0o640 });
+    await rm(attemptsPath); await symlink(outside, attemptsPath);
+    const outsideBefore = { bytes: await readFile(outside), mode: (await stat(outside)).mode & 0o777 };
+    const taskBefore = await readFile(path.join(directory, 'task.json'));
+    const jobPath = path.join(input.workspace, 'runtime/jobs', `${failed.identity.task_id}.json`);
+    const jobBefore = await readFile(jobPath);
+    await expect(executeV5Retry(input.workspace, failed, plan.plan_id)).rejects.toMatchObject({ code: 'EVENT_LOG_INVALID' });
+    expect(await readFile(outside)).toEqual(outsideBefore.bytes);
+    expect((await stat(outside)).mode & 0o777).toBe(outsideBefore.mode);
+    expect(await readFile(path.join(directory, 'task.json'))).toEqual(taskBefore);
+    expect(await readFile(jobPath)).toEqual(jobBefore);
+    expect(calls).toEqual(['chat']);
+  });
+
+  it('rejects a symlinked v5 event log without reading or modifying the external target', async () => {
+    const input = await prepared(); input.request.request_id = 'request-alpha2-event-ledger-symlink';
+    const submitted = await submitExchangeRequest(input.workspace, input.request);
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const target = path.join(directory, 'events.jsonl'); const outside = path.join(input.home, 'outside-v5-events.jsonl');
+    await writeFile(outside, await readFile(target), { mode: 0o640 });
+    await rm(target); await symlink(outside, target);
+    const before = { bytes: await readFile(outside), mode: (await stat(outside)).mode & 0o777 };
+    await expect(appendV5Event(directory, await readV5Task(directory), 'test_event', 'must not escape')).rejects.toMatchObject({ code: 'EVENT_LOG_INVALID' });
+    await expect(readV5Events(directory)).rejects.toMatchObject({ code: 'EVENT_LOG_INVALID' });
+    expect(await readFile(outside)).toEqual(before.bytes);
+    expect((await stat(outside)).mode & 0o777).toBe(before.mode);
+  });
+
+  it('rejects a symlinked attempt archive directory without writing outside or creating an attempt', async () => {
+    const input = await prepared(); input.request.request_id = 'request-alpha2-retry-archive-symlink';
+    const submitted = await submitExchangeRequest(input.workspace, input.request); const calls: string[] = [];
+    await runWorker(input.workspace, { chatRuntime: knownFailureChat(calls) });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory); const failed = await readV5Task(directory);
+    const plan = await planV5Retry(directory, failed);
+    const outside = path.join(input.home, 'outside-history'); await mkdir(outside, { mode: 0o755 });
+    await writeFile(path.join(outside, 'keep.txt'), 'outside stays unchanged', { mode: 0o644 });
+    await symlink(outside, path.join(directory, 'work/attempt-history'));
+    const outsideBefore = await directoryManifest(outside);
+    const attemptsBefore = await readFile(path.join(directory, 'attempts.jsonl'));
+    await expect(executeV5Retry(input.workspace, failed, plan.plan_id)).rejects.toMatchObject({ code: 'RETRY_ARCHIVE_INVALID' });
+    expect(await directoryManifest(outside)).toEqual(outsideBefore);
+    expect(await readFile(path.join(directory, 'attempts.jsonl'))).toEqual(attemptsBefore);
+    expect((await readV5Task(directory)).status).toBe('failed');
+    expect((await readJob(input.workspace, failed.identity.task_id)).state).toBe('terminal');
+    expect(calls).toEqual(['chat']);
+  });
+
   it('keeps outcome_unknown retry plans read-only and rejects execution without replay', async () => {
     const input = await prepared(); input.request.request_id = 'request-alpha2-retry-unknown';
     const submitted = await submitExchangeRequest(input.workspace, input.request); const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);

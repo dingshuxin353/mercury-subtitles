@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -75,6 +75,21 @@ describe('V02-D002 crash recovery and query safety', () => {
     const source = await readFile(path.join(directory, 'events.jsonl'), 'utf8');
     await writeFile(path.join(directory, 'events.jsonl'), `${source.split('\n')[0]}\nnot-json\n${source.split('\n')[1]}\n`);
     await expect(readTaskEvents(directory)).rejects.toMatchObject({ code: 'EVENT_LOG_INVALID' });
+  });
+
+  it('rejects a symlinked event log without reading or modifying the external target', async () => {
+    const input = await prepared();
+    const submitted = await submitBackgroundTask({ workspaceRoot: input.workspace, audioPath: input.audio, requestId: 'event-symlink' });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.task_directory);
+    const target = path.join(directory, 'events.jsonl');
+    const outside = path.join(input.home, 'outside-events.jsonl');
+    await writeFile(outside, await readFile(target), { mode: 0o640 });
+    await rm(target); await symlink(outside, target);
+    const before = { bytes: await readFile(outside), mode: (await stat(outside)).mode & 0o777 };
+    await expect(appendTaskEvent(directory, { taskId: submitted.task.task_id, sequence: 2, type: 'stage_started', message: 'must not escape' })).rejects.toMatchObject({ code: 'EVENT_LOG_INVALID' });
+    await expect(readTaskEvents(directory)).rejects.toMatchObject({ code: 'EVENT_LOG_INVALID' });
+    expect(await readFile(outside)).toEqual(before.bytes);
+    expect((await stat(outside)).mode & 0o777).toBe(before.mode);
   });
 
   it('uses the durable event tail even when task.json was not updated after append', async () => {
