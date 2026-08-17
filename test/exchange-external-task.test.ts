@@ -683,6 +683,19 @@ describe('Exchange v1 external transcript task', () => {
     };
     misclassified.identity.revision += 1;
     await writeFile(path.join(directory, 'task.json'), canonicalJson(misclassified), { mode: 0o600 });
+    const historicalAttempts = (await readFile(path.join(directory, 'attempts.jsonl'), 'utf8'))
+      .trim().split('\n').map((line) => JSON.parse(line));
+    for (const entry of historicalAttempts) {
+      if (entry.contract === 'mercury.attempt-result/v1') {
+        entry.status = 'failed';
+        entry.safe_checkpoint = 'chat_response_persisted';
+      }
+    }
+    await writeFile(
+      path.join(directory, 'attempts.jsonl'),
+      `${historicalAttempts.map((entry) => JSON.stringify(entry)).join('\n')}\n`,
+      { mode: 0o600 },
+    );
     await runWorker(input.workspace, dependencies);
     const repaired = await readV5Task(directory);
     expect(repaired).toMatchObject({
@@ -690,6 +703,23 @@ describe('Exchange v1 external transcript task', () => {
       execution: { provider_calls: { chat: { state: 'in_flight', count: 1, outcome: 'outcome_unknown', evidence_ref: 'work/calibration-response.json' } } },
       error: { code: 'TASK_INTERRUPTED_PROVIDER_UNKNOWN', retryability: 'unsafe' },
     });
+    expect(providerCalls).toBe(1);
+    const attemptRecords = (await readFile(path.join(directory, 'attempts.jsonl'), 'utf8'))
+      .trim().split('\n').map((line) => JSON.parse(line));
+    expect(attemptRecords.filter((entry) => entry.contract === 'mercury.attempt-result/v1')).toEqual([
+      expect.objectContaining({ attempt_id: repaired.execution.attempt_id, status: 'failed' }),
+    ]);
+    expect(attemptRecords.filter((entry) => entry.contract === 'mercury.attempt-result-correction/v1')).toEqual([
+      expect.objectContaining({
+        attempt_id: repaired.execution.attempt_id,
+        supersedes_status: 'failed',
+        status: 'interrupted',
+        reason_code: 'TASK_INTERRUPTED_PROVIDER_UNKNOWN',
+      }),
+    ]);
+    await runWorker(input.workspace, dependencies);
+    const afterSecondAudit = (await readFile(path.join(directory, 'attempts.jsonl'), 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    expect(afterSecondAudit.filter((entry) => entry.contract === 'mercury.attempt-result-correction/v1')).toHaveLength(1);
     expect(providerCalls).toBe(1);
   });
 

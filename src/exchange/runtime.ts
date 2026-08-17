@@ -1279,6 +1279,49 @@ async function reconcileMisclassifiedChatOutcomeUnknown(
   }
 }
 
+async function ensureOutcomeUnknownAttemptCorrection(
+  directory: string,
+  task: TaskRecordV5,
+): Promise<void> {
+  const call = task.execution.provider_calls.chat;
+  const attemptId = task.execution.attempt_id;
+  if (task.status !== 'interrupted'
+    || !attemptId
+    || call.state !== 'in_flight'
+    || call.outcome !== 'outcome_unknown'
+    || !call.evidence_ref
+    || !call.evidence_sha256) return;
+  const attemptsPath = path.join(directory, 'attempts.jsonl');
+  const records = await readFile(attemptsPath, 'utf8').then((source) => source
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as { contract?: string; attempt_id?: string; status?: string }))
+    .catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
+    });
+  const misclassified = records.some((entry) => entry.contract === 'mercury.attempt-result/v1'
+    && entry.attempt_id === attemptId
+    && entry.status === 'failed');
+  const corrected = records.some((entry) => entry.contract === 'mercury.attempt-result-correction/v1'
+    && entry.attempt_id === attemptId);
+  if (!misclassified || corrected) return;
+  await appendStableJsonLine(attemptsPath, {
+    contract: 'mercury.attempt-result-correction/v1',
+    task_id: task.identity.task_id,
+    attempt_id: attemptId,
+    corrected_at: task.updated_at,
+    supersedes_status: 'failed',
+    status: 'interrupted',
+    reason_code: 'TASK_INTERRUPTED_PROVIDER_UNKNOWN',
+    provider_evidence_ref: call.evidence_ref,
+    provider_evidence_sha256: call.evidence_sha256,
+    asr_call_count: task.execution.provider_calls.asr.count,
+    chat_call_count: call.count,
+    safe_checkpoint: task.execution.safe_checkpoint,
+  });
+}
+
 export async function claimV5Job(workspace: string, job: BackgroundJobV1, workerId: string): Promise<TaskRecordV5 | null> {
   const directory = taskRoot(workspace, job.task_directory);
   return withTaskTransitionLock(directory, async () => {
@@ -1344,6 +1387,7 @@ export async function auditV5Job(workspace: string, listed: BackgroundJobV1): Pr
     if (eventRevision > task.identity.revision) { task.identity.revision = eventRevision; task.updated_at = new Date().toISOString(); await persistV5Task(directory, task); }
     if (TERMINAL.has(task.status)) {
       task = await reconcileMisclassifiedChatOutcomeUnknown(directory, task);
+      await ensureOutcomeUnknownAttemptCorrection(directory, task);
       let current = await ensureV5TerminalReport(directory, await readV5Task(directory));
       if (current.status === 'completed') {
         const reviewRuntime = await import('../review-v5.js');
