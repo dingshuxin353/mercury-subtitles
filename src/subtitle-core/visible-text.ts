@@ -12,7 +12,7 @@ interface Range {
 }
 
 const PROTECTED_PATTERNS = [
-  /\b(?:https?:\/\/|www\.)[^\s<>()\[\]{}"'“”‘’，。！？；：、（）【】《》]+/giu,
+  /\b(?:https?:\/\/|www\.)[^\s<>"'“”‘’，。！？；：、（）【】《》]+/giu,
   /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/giu,
   /\b[vV]?\d+(?:[.,]\d+)+(?:-[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)?\b/gu,
   /\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b/gu,
@@ -23,6 +23,35 @@ const PROTECTED_PATTERNS = [
   /[A-Za-z0-9]+(?:[-_\/+@&#=][A-Za-z0-9]+|[+#]{1,2})+/gu,
 ] as const;
 
+const URL_CLOSING_DELIMITERS = [
+  { open: '(', close: ')' },
+  { open: '[', close: ']' },
+  { open: '{', close: '}' },
+] as const;
+
+function occurrences(value: string, character: string): number {
+  return [...value].filter((candidate) => candidate === character).length;
+}
+
+function urlProtectedLength(value: string): number {
+  let protectedValue = value.replace(/[.,!;:?]+$/gu, '');
+  let changed = true;
+  while (changed && protectedValue.length > 0) {
+    changed = false;
+    for (const delimiter of URL_CLOSING_DELIMITERS) {
+      if (
+        protectedValue.endsWith(delimiter.close) &&
+        occurrences(protectedValue, delimiter.close) > occurrences(protectedValue, delimiter.open)
+      ) {
+        protectedValue = protectedValue.slice(0, -delimiter.close.length).replace(/[.,!;:?]+$/gu, '');
+        changed = true;
+        break;
+      }
+    }
+  }
+  return protectedValue.length;
+}
+
 function protectedRanges(text: string): Range[] {
   const ranges: Range[] = [];
   for (const pattern of PROTECTED_PATTERNS) {
@@ -30,7 +59,7 @@ function protectedRanges(text: string): Range[] {
     for (const match of text.matchAll(pattern)) {
       if (match.index === undefined || !match[0]) continue;
       const protectedLength = pattern === PROTECTED_PATTERNS[0]
-        ? match[0].replace(/[.,!;:]+$/gu, '').length
+        ? urlProtectedLength(match[0])
         : match[0].length;
       if (protectedLength > 0) ranges.push({ start: match.index, end: match.index + protectedLength });
     }

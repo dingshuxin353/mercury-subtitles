@@ -37,6 +37,10 @@ describe('V03-F017 visible subtitle style', () => {
     ["'https://example.com/a'", 'https://example.com/a'],
     ['访问 https://example.com/a).', '访问 https://example.com/a'],
     ['访问 https://example.com/a?x=1#fragment。', '访问 https://example.com/a?x=1#fragment'],
+    ['http://[::1]/a。', 'http://[::1]/a'],
+    ['https://en.wikipedia.org/wiki/Function_(mathematics)。', 'https://en.wikipedia.org/wiki/Function_(mathematics)'],
+    ['https://example.com/a?x=(1)#top。', 'https://example.com/a?x=(1)#top'],
+    ['https://example.com/a)]}。', 'https://example.com/a'],
   ])('protects only the URL body and removes surrounding separators: %s', (source, expected) => {
     expect(normalizeVisibleSubtitleText(source).text).toBe(expected);
   });
