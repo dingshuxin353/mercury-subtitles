@@ -56,10 +56,12 @@ describe('V02-D002 crash recovery and query safety', () => {
     const first = submitBackgroundTask({ workspaceRoot: input.workspace, audioPath: input.audio, requestId }, { createTask });
     await new Promise((resolve) => setTimeout(resolve, 50));
     const second = submitBackgroundTask({ workspaceRoot: input.workspace, audioPath: input.audio, requestId }, { createTask });
-    const [created, replayed] = await Promise.all([first, second]);
+    const results = await Promise.all([first, second]);
+    const created = results.find((result) => !result.replayed)!;
+    const replayed = results.find((result) => result.replayed)!;
     expect(createTask).toHaveBeenCalledTimes(1);
+    expect(results.map((result) => result.replayed).sort()).toEqual([false, true]);
     expect(created.task.task_id).toBe(replayed.task.task_id);
-    expect(replayed.replayed).toBe(true);
     expect((await readdir(path.join(input.workspace, 'runtime/jobs'))).filter((name) => name.endsWith('.json'))).toHaveLength(1);
     expect((await readdir(path.join(input.workspace, 'tasks'))).filter((name) => name.startsWith('tsk-'))).toHaveLength(1);
   }, 10_000);
