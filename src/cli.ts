@@ -66,6 +66,13 @@ import {
 import { acceptAllV5ReviewChanges, decideV5ReviewChange, finalizeV5Review, readVerifiedV5Review } from './review-v5.js';
 import { installSkill, skillStatus } from './skill.js';
 import { tryRunStableCli } from './stable-cli/index.js';
+import {
+  applyUpdate,
+  checkForUpdates,
+  runtimePackageRoot,
+  type UpdateCheckResult,
+  type UpdateDependencies,
+} from './update.js';
 
 export interface CliIo {
   stdout: (message: string) => void;
@@ -167,6 +174,25 @@ const TASK_LIST_HELP = `用法：
 
 function wantsHelp(args: string[]): boolean {
   return args.includes('--help') || args.includes('-h');
+}
+
+function updateCheckText(result: UpdateCheckResult): string {
+  const status = result.update_available
+    ? `发现 ${result.recommended_version}（${result.recommended_channel}）`
+    : result.status === 'up_to_date'
+      ? '当前已经是推荐版本'
+      : '远端渠道没有更高版本';
+  return [
+    `当前 CLI：${result.current_version}`,
+    `官方 stable（latest）：${result.latest_version}`,
+    `官方预发布（next）：${result.next_version}`,
+    `检查结果：${status}`,
+    `安装来源：${result.installation.reason}`,
+    `Node.js：${result.current_node_version}（目标要求 ${result.target_node_engine}，${result.node_compatible ? '兼容' : '不兼容'}）`,
+    `下一步：${result.next_action}`,
+    'Mercury Skill 独立管理；需要时运行 npx skills update mercury-subtitles。',
+    '',
+  ].join('\n');
 }
 
 function localTime(value: string): string {
@@ -1208,6 +1234,7 @@ export async function runCli(
   integrationDependencies: CoreIntegrationDependencies = {},
   backgroundDependencies: {
     startDetachedWorker?: typeof startDetachedWorker;
+    update?: UpdateDependencies;
   } = {},
 ): Promise<number> {
   const experimentalMachine = args.includes('--experimental');
@@ -1226,6 +1253,7 @@ export async function runCli(
         workspaceRoot,
         io,
         ...(backgroundDependencies.startDetachedWorker ? { startDetachedWorker: backgroundDependencies.startDetachedWorker } : {}),
+        ...(backgroundDependencies.update ? { updateDependencies: backgroundDependencies.update } : {}),
       });
       if (stable !== null) return stable;
     }
@@ -1247,6 +1275,57 @@ export async function runCli(
         );
       io.stdout(`${await readProductVersion()}\n`);
       return 0;
+    }
+    if (args[0] === 'update' && !args.includes('--json')) {
+      if (args.length > 1 && !(args.length === 2 && args[1] === '--check')) {
+        throw new MercuryError('CLI_ARGUMENT_INVALID', '人类更新流程只接受 mercury update 或 mercury update --check。', {
+          exitCode: 2,
+          remediation: '机器调用请使用 mercury update check --json；查看用法请运行 mercury help update。',
+        });
+      }
+      const dependencies = backgroundDependencies.update ?? {};
+      const packageRoot = dependencies.packageRoot ?? await runtimePackageRoot();
+      const executablePath = dependencies.executablePath ?? process.argv[1] ?? path.join(packageRoot, 'dist/src/bin.js');
+      const currentVersion = dependencies.currentVersion ?? await readProductVersion();
+      const nodeVersion = dependencies.nodeVersion ?? process.versions.node;
+      const checked = await checkForUpdates({
+        currentVersion,
+        nodeVersion,
+        packageRoot,
+        executablePath,
+        ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
+      });
+      io.stdout(updateCheckText(checked));
+      if (args[1] === '--check' || !checked.can_auto_apply) return 0;
+      if (!io.prompt && !process.stdin.isTTY) {
+        io.stdout(`这是非交互终端，未执行安装。确认后可运行：mercury update apply --version ${checked.recommended_version} --yes --json\n`);
+        return 0;
+      }
+      const terminal = io.prompt ? null : terminalPromptSession();
+      const ask = io.prompt ?? terminal!.prompt;
+      try {
+        const confirmed = (await ask(`确认安装 ${checked.recommended_version}？这只更新 CLI，不更新 Skill。[y/N] `)).trim().toLowerCase();
+        if (!['y', 'yes', '是'].includes(confirmed)) {
+          io.stderr('已取消，未执行安装。\n');
+          return 130;
+        }
+        const applied = await applyUpdate({
+          currentVersion,
+          nodeVersion,
+          packageRoot,
+          executablePath,
+          nodeExecutable: dependencies.nodeExecutable ?? process.execPath,
+          yes: true,
+          version: checked.recommended_version,
+          ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
+          ...(dependencies.spawnCommand ? { spawnCommand: dependencies.spawnCommand } : {}),
+          ...(dependencies.npmCliPath ? { npmCliPath: dependencies.npmCliPath } : {}),
+        });
+        io.stdout(`${applied.applied ? `CLI 已更新并验证为 ${applied.verified_version}。` : `CLI 已是 ${applied.verified_version}。`}\nSkill 仍需独立更新：npx skills update mercury-subtitles\n`);
+        return 0;
+      } finally {
+        terminal?.close();
+      }
     }
     if (args.length === 0) {
       if (!io.prompt && !process.stdin.isTTY) {
