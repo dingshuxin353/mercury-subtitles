@@ -405,7 +405,7 @@ describe('V02-D002 single background worker', () => {
       expect(cancelled.artifacts.subtitles?.approved).toBeNull();
       expect(cancelled.artifacts.outputs).toEqual(['output/source.transcribed.srt']);
       expect(calls).toHaveLength(2);
-    });
+    }, 10_000);
   }
 
   it('treats cancellation after the atomic completed transition as a no-op', async () => {

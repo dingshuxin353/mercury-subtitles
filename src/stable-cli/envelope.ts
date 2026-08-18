@@ -23,6 +23,10 @@ export function stableSuccess<T>(command: string, data: T, version: string): Sta
 }
 
 function category(code: string): ExchangeErrorV1['category'] {
+  if (/^UPDATE_(?:REDIRECT_UNSAFE|NPM_UNTRUSTED)$/u.test(code)) return 'security';
+  if (/^UPDATE_(?:REGISTRY_INVALID|REDIRECT_LIMIT|REGISTRY_TOO_LARGE)$/u.test(code)) return 'compatibility';
+  if (/^UPDATE_(?:CONFIRMATION_REQUIRED|TARGET_REQUIRED|VERSION_NOT_FOUND|CHANNEL_OLDER)$/u.test(code)) return 'input';
+  if (/^UPDATE_(?:NODE_INCOMPATIBLE|INSTALLATION_NOT_WRITABLE|NPM_UNAVAILABLE)$/u.test(code)) return 'config';
   if (/^DELIVERY_PATH_UNSAFE$/u.test(code)) return 'security';
   if (/^(?:DELIVERY_CONFLICT|DELIVERY_NOT_READY|REVIEW_NOT_READY)$/u.test(code)) return 'conflict';
   if (/^(?:DELIVERY_DIRECTORY_INVALID|DELIVERY_DIRECTORY_NOT_WRITABLE|DELIVERY_NOT_REQUESTED)$/u.test(code)) return 'input';
@@ -53,6 +57,8 @@ export function stableErrorFrom(error: unknown): { error: ExchangeErrorV1; exitC
         return sensitiveTextIssues(message).length > 0 ? '操作失败，原始错误包含敏感信息，已脱敏。' : message;
       })(),
       retryability: mercury.code === 'RETRY_UNSAFE_PROVIDER_OUTCOME' ? 'unsafe'
+        : /^(?:UPDATE_CHECK_OFFLINE|UPDATE_CHECK_TIMEOUT|UPDATE_REGISTRY_UNAVAILABLE)$/u.test(mercury.code) ? 'safe'
+        : /^(?:UPDATE_CONFIRMATION_REQUIRED|UPDATE_NODE_INCOMPATIBLE|UPDATE_INSTALLATION_NOT_WRITABLE|UPDATE_NPM_UNAVAILABLE|UPDATE_INSTALL_FAILED|UPDATE_VERIFY_FAILED)$/u.test(mercury.code) ? 'after_user_action'
         : /^(?:DELIVERY_|REVIEW_NOT_READY|TASK_RESUME_UNSAFE|RETRY_)/u.test(mercury.code) ? 'after_user_action' : 'not_applicable',
       provider_outcome: mercury.code === 'RETRY_UNSAFE_PROVIDER_OUTCOME' ? 'outcome_unknown' : 'not_applicable',
       remediation: [mercury.remediation ?? (mercury.code === 'RETRY_UNSAFE_PROVIDER_OUTCOME'

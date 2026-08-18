@@ -19,11 +19,14 @@ import { readMp3DurationMsFromBytes } from '../models.js';
 import { listJobsIsolated } from '../background/storage.js';
 import { acceptAllV5ReviewChanges, decideV5ReviewChange, finalizeV5Review, readVerifiedV5Review } from '../review-v5.js';
 import type { ReviewActor } from '../review.js';
+import { applyUpdate, checkForUpdates, runtimePackageRoot, type UpdateDependencies } from '../update.js';
+import { unknownCommandRemediation } from '../help.js';
 
 export interface StableCliContext {
   workspaceRoot: string;
   io: CliIo;
   startDetachedWorker?: typeof startDetachedWorker;
+  updateDependencies?: UpdateDependencies;
 }
 
 function output(io: CliIo, value: unknown): void {
@@ -77,6 +80,7 @@ function exactJson(args: string[], allowedValues: string[] = [], allowedFlags: s
 
 export async function tryRunStableCli(args: string[], context: StableCliContext): Promise<number | null> {
   const command = args[0] === 'protocol' && args[1] ? `protocol.${args[1]}`
+    : args[0] === 'update' && ['check', 'apply'].includes(args[1] ?? '') && args.includes('--json') ? `update.${args[1]}`
     : args[0] === 'input' && args[1] === 'inspect' ? 'input.inspect'
     : args[0] === 'dictionary' && args[1] ? `dictionary.${args[1]}`
     : args[0] === 'config' && args[1] === 'status' ? 'config.status'
@@ -89,14 +93,54 @@ export async function tryRunStableCli(args: string[], context: StableCliContext)
   const version = await readProductVersion();
   try {
     let data: unknown;
-    if (args[0] === 'protocol') {
+    if (args[0] === 'update') {
+      const dependencies = context.updateDependencies ?? {};
+      const packageRoot = dependencies.packageRoot ?? await runtimePackageRoot();
+      const executablePath = dependencies.executablePath ?? process.argv[1] ?? path.join(packageRoot, 'dist/src/bin.js');
+      const currentVersion = dependencies.currentVersion ?? version;
+      const nodeVersion = dependencies.nodeVersion ?? process.versions.node;
+      if (args[1] === 'check') {
+        exactJson(args.slice(2));
+        data = await checkForUpdates({
+          currentVersion,
+          nodeVersion,
+          packageRoot,
+          executablePath,
+          nodeExecutable: dependencies.nodeExecutable ?? process.execPath,
+          ...(dependencies.npmCliPath ? { npmCliPath: dependencies.npmCliPath } : {}),
+          ...(dependencies.spawnCommand ? { spawnCommand: dependencies.spawnCommand } : {}),
+          ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
+        });
+      } else {
+        exactJson(args.slice(2), ['--channel', '--version'], ['--yes']);
+        const channel = value(args.slice(2), '--channel');
+        if (channel && channel !== 'latest' && channel !== 'next') {
+          throw new MercuryError('CLI_ARGUMENT_INVALID', '--channel 只能是 latest 或 next。', { exitCode: 2 });
+        }
+        data = await applyUpdate({
+          currentVersion,
+          nodeVersion,
+          packageRoot,
+          executablePath,
+          nodeExecutable: dependencies.nodeExecutable ?? process.execPath,
+          yes: args.includes('--yes'),
+          ...(channel ? { channel: channel as 'latest' | 'next' } : {}),
+          ...(value(args.slice(2), '--version') ? { version: value(args.slice(2), '--version')! } : {}),
+          ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
+          ...(dependencies.spawnCommand ? { spawnCommand: dependencies.spawnCommand } : {}),
+          ...(dependencies.npmCliPath ? { npmCliPath: dependencies.npmCliPath } : {}),
+        });
+      }
+    } else if (args[0] === 'protocol') {
       exactJson(args.slice(2));
       if (args[1] === 'version') data = { protocol: 'v1', contracts: ['mercury.exchange.request/v1', 'mercury.task/v1', 'mercury.event/v1', 'mercury.result/v1', 'mercury.error/v1', 'mercury.transcript/v1', 'mercury.dictionary/v1', 'mercury.retry-plan/v1'] };
       else if (args[1] === 'capabilities') data = {
-        alpha: '0.3.0-alpha.2',
+        alpha: version,
+        release_stage: 'release_candidate',
         commands: {
           protocol: true, config_migration: true, external_srt: true, external_vtt: true, external_transcript_json: true,
           dictionary: true, approved_srt_delivery: true, worker_start: true, review: true,
+          update: true,
           dictionary_skill_management: false, pause: true, resume: true, retry: true, venus_adapter: false,
         },
         task_control: { cancel: true, pause: { supported: true, checkpoint_version: 'mercury.safe-checkpoint/v1' }, resume: { supported: true, same_attempt: true }, retry: { supported: true, plan_contract: 'mercury.retry-plan/v1', append_only_attempts: true } },
@@ -253,6 +297,9 @@ export async function tryRunStableCli(args: string[], context: StableCliContext)
       } else {
         const operation = args[1]!;
         const commandArgs = args.slice(2);
+      if (!['submit', 'list', 'watch', 'status', 'result', 'pause', 'resume', 'retry-plan', 'retry', 'cancel', 'deliver'].includes(operation)) {
+        throw new MercuryError('CLI_COMMAND_INVALID', `不支持的稳定任务命令：${operation}`, { exitCode: 2 });
+      }
       if (operation === 'submit') {
         exactJson(commandArgs, ['--request']);
         const requestPath = value(commandArgs, '--request');
@@ -340,7 +387,10 @@ export async function tryRunStableCli(args: string[], context: StableCliContext)
     output(context.io, stableSuccess(command, data, version));
     return 0;
   } catch (error) {
-    const failed = stableFailure(command, error, version);
+    const projected = error instanceof MercuryError && error.code === 'CLI_COMMAND_INVALID' && !error.remediation
+      ? new MercuryError(error.code, error.message, { exitCode: error.exitCode, remediation: unknownCommandRemediation(args) })
+      : error;
+    const failed = stableFailure(command, projected, version);
     output(context.io, failed.envelope);
     return failed.exitCode;
   }

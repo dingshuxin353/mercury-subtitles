@@ -11,7 +11,7 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 let temporaryRoot = '';
 let snapshotRoot = '';
 
-describe('Public Alpha release surface', () => {
+describe('public release candidate surface', () => {
   beforeAll(async () => {
     temporaryRoot = await mkdtemp(path.join(tmpdir(), 'mercury-public-release-'));
     snapshotRoot = path.join(temporaryRoot, 'snapshot');
@@ -32,7 +32,7 @@ describe('Public Alpha release surface', () => {
 
     expect(packageJson).toMatchObject({
       name: 'mercury-subtitles',
-      version: '0.3.0-alpha.2',
+      version: '0.3.0-rc.1',
       license: 'Apache-2.0',
       engines: { node: '>=24.0.0 <25.0.0' },
       bin: { mercury: './dist/src/bin.js' },
@@ -70,6 +70,9 @@ describe('Public Alpha release surface', () => {
       expect(readme).toContain(heading);
     }
     expect(readme).toContain('npm install --global mercury-subtitles@next');
+    expect(readme).toContain('`@next` 当前仍指向已经发布的 `0.3.0-alpha.2`');
+    expect(readme).toContain('`0.3.0-rc.1` 只是待验收候选');
+    expect(readme).not.toContain('公开候选渠道使用 npm dist-tag `next`');
     expect(readme).toContain('npx skills add dingshuxin353/mercury-subtitles');
     expect(readme).toContain('mercury task submit --request "/绝对路径/request.json" --json');
     expect(readme).not.toContain('mercury calibrate --audio "/绝对路径/访谈.mp3" --background --json');

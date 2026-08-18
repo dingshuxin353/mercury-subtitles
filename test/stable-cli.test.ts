@@ -23,7 +23,7 @@ describe('stable CLI v1 protocol and configuration', () => {
       expect(output.stderr).toEqual([]);
       expect(output.stdout).toHaveLength(1);
       const envelope = JSON.parse(output.stdout[0]!);
-      expect(envelope).toMatchObject({ contract: 'mercury.cli/v1', ok: true, error: null, meta: { cli_version: '0.3.0-alpha.2', protocol_versions: ['v1'] } });
+      expect(envelope).toMatchObject({ contract: 'mercury.cli/v1', ok: true, error: null, meta: { cli_version: '0.3.0-rc.1', protocol_versions: ['v1'] } });
     }
     const capabilities = JSON.parse(capture(home).stdout[0] ?? 'null');
     expect(capabilities).toBeNull();
@@ -209,14 +209,17 @@ describe('stable CLI v1 protocol and configuration', () => {
     await expect(lstat(path.join(home, 'mercury-workspace'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('places stable commands before deprecated commands in help', async () => {
+  it('keeps the main help task-oriented and moves deprecated commands to help legacy', async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), 'mercury-stable-help-'));
     const output = capture(home);
     expect(await runCli(['--help'], output.io)).toBe(0);
     const text = output.stdout.join('');
-    expect(text.indexOf('稳定非交互命令')).toBeLessThan(text.indexOf('deprecated'));
     expect(text).toContain('mercury protocol capabilities --json');
     expect(text).toContain('mercury task submit --request');
+    expect(text).not.toContain('mercury setup');
+    const legacy = capture(home);
+    expect(await runCli(['help', 'legacy'], legacy.io)).toBe(0);
+    expect(legacy.stdout.join('')).toContain('mercury setup');
   });
 
   it('projects historical tasks through stable read-only status/list/result and does not invent Alpha.2 controls', async () => {

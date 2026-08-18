@@ -1,6 +1,16 @@
 # Mercury Changelog
 
-## 0.3.0-alpha.2 — Unreleased
+## 0.3.0-rc.1 — Unreleased
+
+> This release candidate has not been published to npm. The public `next` tag still points to `0.3.0-alpha.2` until a separately authorized release completes.
+
+- Added a task-oriented one-screen help page, consistent group/command help, local typo suggestions, and human-readable recovery without exposing internal error codes.
+- Productized the interactive App home flow for subtitle tasks, recent results, model/service setup, dictionaries, update checks, and help without an accidental default task action.
+- Added bounded official-registry update checks, channel/exact-version decisions, verified install-source detection, Node engine preflight, and explicit-confirmation npm-global apply with post-install entry verification.
+- Kept CLI and Mercury Skill updates independent; the CLI never silently runs a third-party Skill update.
+- Preserved Exchange Protocol v1, historical task reads, background control, dictionaries, review, delivery, and the fixed-cue text-only subtitle contract from 0.3.0-alpha.2.
+
+## 0.3.0-alpha.2 — 2026-08-18
 
 - Added safe queued/running pause checkpoints and same-attempt resume without replaying persisted Provider responses.
 - Added deterministic read-only retry plans and append-only retry attempts with explicit Provider call estimates and unknown-outcome refusal.

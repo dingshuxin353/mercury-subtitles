@@ -65,7 +65,7 @@ describe('Mercury v2 CLI', () => {
   it('guides a brand-new user without exposing credential references', async () => {
     const home = await mkdtemp(path.join(tmpdir(), 'mercury-v2-new-user-'));
     const output = capture(home);
-    const answers = ['1', 'fixture-subtitle-app', '1', 'fixture-chat-model', 'https://chat.example/v1', 'y', 'n', '0'];
+    const answers = ['1', '1', 'fixture-subtitle-app', '1', 'fixture-chat-model', 'https://chat.example/v1', 'y', 'n', '0'];
     const secrets = ['fixture-asr-secret', 'fixture-chat-secret'];
     const io = {
       ...output.io,
@@ -96,6 +96,7 @@ describe('Mercury v2 CLI', () => {
     const output = capture(home);
     const answers = [
       '1',
+      '1',
       'cancelled-subtitle-app',
       '1',
       'fixture-chat-model',
@@ -125,7 +126,7 @@ describe('Mercury v2 CLI', () => {
     const home = await mkdtemp(path.join(tmpdir(), 'mercury-v2-invalid-'));
     const output = capture(home);
     const answers = [
-      '2', '1', '1', 'fixture-chat-model', 'http://unsafe.example/v1', 'y',
+      '1', '2', '1', '1', 'fixture-chat-model', 'http://unsafe.example/v1', 'y',
     ];
     const secrets = ['invalid-asr-secret', 'invalid-chat-secret'];
     const io = {
@@ -134,7 +135,9 @@ describe('Mercury v2 CLI', () => {
       secretPrompt: async () => secrets.shift() ?? '',
     };
     expect(await runCli([], io)).toBe(1);
-    expect(output.stderr.join('')).toContain('MODEL_SETUP_INVALID');
+    expect(output.stderr.join('')).toContain('未完成：');
+    expect(output.stderr.join('')).toContain('服务地址是否为 HTTPS');
+    expect(output.stderr.join('')).toContain('mercury help 查看可用命令');
     const workspace = path.join(home, 'mercury-workspace');
     expect(
       await readdir(path.join(workspace, 'config', 'secrets')).catch(() => []),
@@ -144,10 +147,11 @@ describe('Mercury v2 CLI', () => {
     const home = await mkdtemp(path.join(tmpdir(), 'mercury-v2-cli-'));
     const output = capture(home);
     expect(await runCli(['--help'], output.io)).toBe(0);
-    expect(output.stdout.join('').startsWith('mercury（推荐：打开交互式 App）')).toBe(true);
-    expect(output.stdout.join('')).toContain('高级 / 兼容命令');
-    expect(output.stdout.join('')).toContain('--asr-model');
-    expect(output.stdout.join('')).toContain('--chat-model');
+    expect(output.stdout.join('').startsWith('Mercury 0.3')).toBe(true);
+    expect(output.stdout.join('')).toContain('打开交互式 App（推荐）');
+    expect(output.stdout.join('')).toContain('创建字幕');
+    expect(output.stdout.join('')).not.toContain('mercury setup');
+    expect(output.stdout.join('')).not.toContain('--asr-model');
     expect(output.stdout.join('')).not.toContain('audio-verification');
     const rejected = capture(home);
     expect(
@@ -156,7 +160,8 @@ describe('Mercury v2 CLI', () => {
         rejected.io,
       ),
     ).toBe(2);
-    expect(rejected.stderr.join('')).toContain('VERIFY_AUDIO_REMOVED');
+    expect(rejected.stderr.join('')).toContain('--verify-audio 已移除');
+    expect(rejected.stderr.join('')).toContain('mercury help legacy');
     const tasks = path.join(home, 'mercury-workspace', 'tasks');
     expect(await readdir(tasks).catch(() => [])).toHaveLength(0);
   });
@@ -166,10 +171,12 @@ describe('Mercury v2 CLI', () => {
     expect(await runCli(['model', 'check', '--role', 'asr'], output.io)).toBe(
       2,
     );
-    expect(output.stderr.join('')).toContain('CLI_ARGUMENT_INVALID');
+    expect(output.stderr.join('')).toContain('不支持的参数：--role');
+    expect(output.stderr.join('')).toContain('mercury help model check');
     const missing = capture(home);
     expect(await runCli(['model', 'check'], missing.io)).toBe(2);
-    expect(missing.stderr.join('')).toContain('MODEL_ID_REQUIRED');
+    expect(missing.stderr.join('')).toContain('model check 必须提供 --model');
+    expect(missing.stderr.join('')).toContain('mercury help model check');
   });
   it('persists only ASR/Chat defaults and checks the selected Chat instance', async () => {
     const home = await mkdtemp(path.join(tmpdir(), 'mercury-v2-cli-'));
@@ -270,7 +277,7 @@ describe('Mercury v2 CLI', () => {
 
     const nonInteractive = capture(home);
     expect(await runCli(['model', 'add'], nonInteractive.io)).toBe(2);
-    expect(nonInteractive.stderr.join('')).toContain('INTERACTIVE_TTY_REQUIRED');
+    expect(nonInteractive.stderr.join('')).toContain('需要交互式终端');
     expect(nonInteractive.stderr.join('')).toContain('直接运行 mercury');
   });
 
@@ -306,7 +313,7 @@ describe('Mercury v2 CLI', () => {
     ).toBe(0);
     const output = capture(home);
     const answers = [
-      '2', '2', '1', '2', '', 'fixture-chat-edited',
+      '3', '2', '1', '2', '', 'fixture-chat-edited',
       'https://edited.example/v1', '我的校准', 'y', 'y', '0', '0', '0',
     ];
     expect(
@@ -483,7 +490,7 @@ describe('Mercury v2 CLI', () => {
     const output = capture(home);
     const asked: string[] = [];
     const answers = [
-      '2',
+      '3',
       'a', '1', '2', '', 'n', 'y',
       'a', '2', '1', 'backup-chat', 'https://backup.example/v1',
       '我的备用校准', 'y', 'y',
@@ -561,10 +568,11 @@ describe('Mercury v2 CLI', () => {
     ).toBe(0);
     const output = capture(home);
     const answers = ['1', '/tmp/not-yet-read.mp3', '', '0', '0'];
+    const questions: string[] = [];
     expect(
       await runCli([], {
         ...output.io,
-        prompt: async () => answers.shift() ?? '0',
+        prompt: async (question) => { questions.push(question); return answers.shift() ?? '0'; },
       }),
     ).toBe(0);
     const visible = `${output.stdout.join('')}\n${output.stderr.join('')}`;
@@ -572,6 +580,9 @@ describe('Mercury v2 CLI', () => {
     expect(visible).toContain('1. 现在检查');
     expect(visible).toContain('2. 打开模型中心');
     expect(visible).toContain('已取消任务');
+    expect(visible).toContain('校准只修改文字');
+    expect(questions.join('\n')).not.toContain('校准范围');
+    expect(questions.join('\n')).not.toContain('文字和断句');
     expect(visible).not.toContain('MODEL_CHECK_NOT_PASSED');
     expect(
       await readdir(path.join(home, 'mercury-workspace/tasks')),
@@ -692,7 +703,7 @@ describe('Mercury v2 CLI', () => {
       }),
     );
     const output = capture(home);
-    const answers = ['3', '1', '', '0', '0'];
+    const answers = ['2', '1', '', '0', '0'];
     expect(
       await runCli([], {
         ...output.io,
@@ -835,6 +846,7 @@ describe('Mercury v2 CLI', () => {
         output.io,
       ),
     ).toBe(1);
-    expect(output.stderr.join('')).toContain('MODEL_SETUP_INVALID');
+    expect(output.stderr.join('')).toContain('Vertex AI provider_config 包含不支持的字段：gcs_bucket');
+    expect(output.stderr.join('')).toContain('mercury help legacy');
   });
 });

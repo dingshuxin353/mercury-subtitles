@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import type {
+  ExchangeDictionaryV1,
   ModelConfigRegistryV2,
   ModelConfigV2,
 } from './contracts/index.js';
@@ -66,6 +67,15 @@ import {
 import { acceptAllV5ReviewChanges, decideV5ReviewChange, finalizeV5Review, readVerifiedV5Review } from './review-v5.js';
 import { installSkill, skillStatus } from './skill.js';
 import { tryRunStableCli } from './stable-cli/index.js';
+import {
+  applyUpdate,
+  checkForUpdates,
+  runtimePackageRoot,
+  type UpdateCheckResult,
+  type UpdateDependencies,
+} from './update.js';
+import { localCommandHelpRemediation, mainHelp, renderHelp, unknownCommandRemediation } from './help.js';
+import { runDictionaryCommand } from './stable-cli/dictionary.js';
 
 export interface CliIo {
   stdout: (message: string) => void;
@@ -75,60 +85,6 @@ export interface CliIo {
   prompt?: (question: string) => Promise<string>;
   secretPrompt?: (question: string) => Promise<string>;
 }
-
-const HELP = `mercury（推荐：打开交互式 App）
-
-Mercury 0.3 Alpha.2
-
-普通用户场景：
-  1. 第一次使用：运行 mercury，按向导添加语音转文字和内容校准服务
-  2. 日常任务：在主页选择“运行新字幕任务”，提供中文 MP3 和可选 SRT
-  3. 配置与找回：在主页进入“管理模型”或“查看最近任务”
-
-常用命令：
-  mercury --version
-  mercury --help
-
-稳定非交互命令（脚本、Agent 与外部软件）：
-  mercury protocol version --json
-  mercury protocol capabilities --json
-  mercury config status --json
-  mercury config migrate --check --json
-  mercury config migrate --plan <plan-id> --json
-  mercury input inspect --file <absolute-path> --format auto|mp3|srt|vtt|transcript-json --role media|transcript-source|reference --json
-  mercury task submit --request <absolute-request.json> --json
-  mercury task status|result <task-id> --json
-  mercury task list --limit <n> --json
-  mercury task watch <task-id> --after <sequence> --jsonl
-  mercury task deliver <task-id> --json
-  mercury task pause|resume <task-id> --json
-  mercury task retry-plan <task-id> --json
-  mercury task retry <task-id> --plan <plan-id> --json
-  mercury dictionary create|list|show ... --json
-  mercury dictionary entry add|edit|remove <dictionary-id> ... --json
-  mercury dictionary validate|import|export ... --json
-
-高级 / 兼容命令（旧实验合同，deprecated）：
-  mercury setup [--config <setup.json>] [--confirm-cloud-data]
-  mercury model check --model <model-id> [--audio <check.mp3>]
-  mercury model list
-  mercury model add | edit | enable | disable | default | delete --model <model-id>
-  mercury calibrate --audio <audio.mp3> [--srt <reference.srt>] [--mode text-only|text-and-segmentation] [--asr-model <model-id>] [--chat-model <model-id>]
-  mercury calibrate --audio <audio.mp3> [...] --background [--request-id <id>] [--json]
-  mercury request id --audio <audio.mp3> --intent <stable-label> [...] --json
-  mercury task status <task-id> [--json]
-  mercury task list [--json]
-  mercury task watch <task-id> [--jsonl] [--after <sequence>]
-  mercury task result <task-id> [--json]
-  mercury task cancel <task-id> [--json]
-  mercury worker status [--json]
-  mercury worker start [--json]
-  mercury review status|list|decide|accept-all|finalize <task-id> ... --json
-  npx skills add dingshuxin353/mercury-subtitles
-  mercury skill status [--json]
-  mercury skill install [--target <skills-directory>] [--json]  # 旧版兼容
-  旧实验机器输出临时兼容：在原机器命令后加 --experimental（至少保留一个 V0.3 Alpha）
-`;
 
 const SETUP_HELP = `用法：
   mercury setup [--config <setup.json>] [--confirm-cloud-data]
@@ -150,6 +106,7 @@ const CALIBRATE_HELP = `用法：
     [--chat-model <model-id>]
 
 创建字幕校准任务。每个新任务只选择一个 ASR 与一个 Chat，并只执行一次 Chat 校准。
+当前校验始终冻结纯转写 cue，只修改各 cue 内文字；text-and-segmentation 仅保留历史协议兼容，不会改变断句或时间轴。
 加 --background 后任务会持久化入队并立即返回；独立 Worker 会继续处理。
 `;
 
@@ -167,6 +124,25 @@ const TASK_LIST_HELP = `用法：
 
 function wantsHelp(args: string[]): boolean {
   return args.includes('--help') || args.includes('-h');
+}
+
+function updateCheckText(result: UpdateCheckResult): string {
+  const status = result.update_available
+    ? `发现 ${result.recommended_version}（${result.recommended_channel}）`
+    : result.status === 'up_to_date'
+      ? '当前已经是推荐版本'
+      : '远端渠道没有更高版本';
+  return [
+    `当前 CLI：${result.current_version}`,
+    `官方 stable（latest）：${result.latest_version}`,
+    `官方预发布（next）：${result.next_version}`,
+    `检查结果：${status}`,
+    `安装来源：${result.installation.reason}`,
+    `Node.js：${result.current_node_version}（目标要求 ${result.target_node_engine}，${result.node_compatible ? '兼容' : '不兼容'}）`,
+    `下一步：${result.next_action}`,
+    'Mercury Skill 独立管理；需要时运行 npx skills update mercury-subtitles。',
+    '',
+  ].join('\n');
 }
 
 function localTime(value: string): string {
@@ -193,6 +169,8 @@ function friendlyProviderError(code: string | undefined, message: string): strin
       '校准服务返回的内容无法解析。请检查该模型的结构化输出能力后重新创建任务。',
   };
   if (code && calibrationErrors[code]) return calibrationErrors[code];
+  if (code === 'MODEL_SETUP_INVALID' && /\/models\/\d+\/.*\bmust\b/iu.test(message))
+    return '模型配置不符合要求。请检查服务地址是否为 HTTPS，并确认必填项与模型类型一致。';
   if (
     code === 'VOLCENGINE_SUBTITLE_STATUS_1022' &&
     /vc\.async\.default|requested resource not granted|requested grant not found/iu.test(
@@ -732,7 +710,7 @@ async function statusText(
     `创建时间：${localTime(task.created_at)}`,
     `状态：${status}`,
     `当前阶段：${stage}`,
-    `输入：${task.input_config.has_reference_srt ? `MP3 + 参考 SRT（${task.input_config.mode === 'text-and-segmentation' ? '文字和断句' : '只改文字'}）` : '仅 MP3'}`,
+    `输入：${task.input_config.has_reference_srt ? `MP3 + 参考 SRT（${task.input_config.mode === 'text-and-segmentation' ? '历史兼容模式；当前仍只改文字、不改断句' : '只改文字、不改断句'}）` : '仅 MP3（只改文字、不改断句）'}`,
     `纯转写字幕（未经 Chat 校验）：${transcribedPath ?? '尚未生成'}`,
     `校验后字幕：${calibratedPath ?? '尚未生成'}`,
     `人工批准字幕：${approvedPath ?? (modern && task.execution.status === 'completed' ? '尚待审阅' : '尚未生成')}`,
@@ -1137,6 +1115,137 @@ async function interactiveTaskCenter(
   }
 }
 
+interface DictionaryListItem {
+  dictionary_id: string;
+  name: string;
+  scope: 'global' | 'project';
+  project_key: string | null;
+  revision: string;
+  entry_count: number;
+}
+
+async function interactiveDictionaryCenter(
+  workspaceRoot: string,
+  ask: (question: string) => Promise<string>,
+  io: CliIo,
+): Promise<void> {
+  for (;;) {
+    const listed = await runDictionaryCommand(workspaceRoot, ['list', '--json']) as { dictionaries: DictionaryListItem[] };
+    io.stdout('\n词典\n');
+    if (listed.dictionaries.length === 0) io.stdout('还没有词典。词典可让任务复用人名、品牌和产品写法。\n');
+    else io.stdout(`${listed.dictionaries.map((dictionary, index) =>
+      `${index + 1}. ${dictionary.name}｜${dictionary.scope === 'global' ? '所有项目' : `项目 ${dictionary.project_key}`}｜${dictionary.entry_count} 个词条`,
+    ).join('\n')}\n`);
+    io.stdout('A. 新建词典\n0. 返回主页\n');
+    const choice = (await ask('请选择词典或操作：')).trim().toLowerCase();
+    if (choice === '0' || choice === '') return;
+    try {
+      if (choice === 'a') {
+        const name = (await ask('词典名称：')).trim();
+        if (!name) {
+          io.stderr('词典名称不能为空；未进行更改。\n');
+          continue;
+        }
+        const scopeChoice = (await ask('使用范围：1 所有项目 / 2 指定项目 [1]：')).trim() || '1';
+        if (!['1', '2'].includes(scopeChoice)) {
+          io.stderr('请输入 1 或 2；未进行更改。\n');
+          continue;
+        }
+        const project = scopeChoice === '2' ? (await ask('项目标识：')).trim() : '';
+        if (scopeChoice === '2' && !project) {
+          io.stderr('指定项目时必须填写项目标识；未进行更改。\n');
+          continue;
+        }
+        const created = await runDictionaryCommand(workspaceRoot, [
+          'create', '--name', name, '--scope', scopeChoice === '2' ? 'project' : 'global',
+          ...(project ? ['--project', project] : []), '--json',
+        ]) as ExchangeDictionaryV1;
+        io.stdout(`已创建“${created.name}”。下一步：选择它并新增第一个词条。\n`);
+        continue;
+      }
+      const selected = listed.dictionaries[Number.parseInt(choice, 10) - 1];
+      if (!selected) {
+        io.stderr('请选择列表中的词典、A 或 0。\n');
+        continue;
+      }
+      for (;;) {
+        const dictionary = await runDictionaryCommand(workspaceRoot, ['show', selected.dictionary_id, '--json']) as ExchangeDictionaryV1;
+        io.stdout(`\n词典详情｜${dictionary.name}\n范围：${dictionary.scope === 'global' ? '所有项目' : `项目 ${dictionary.project_key}`}\n词条：${dictionary.entries.length} 个\n`);
+        if (dictionary.entries.length > 0) {
+          io.stdout(`${dictionary.entries.map((entry, index) => `${index + 1}. ${entry.canonical}${entry.variants.length ? `（也可能写作：${entry.variants.join('、')}）` : ''}`).join('\n')}\n`);
+        }
+        io.stdout('A. 新增词条\nE. 编辑词条\nD. 删除词条\n0. 返回词典列表\n');
+        const action = (await ask('请选择操作：')).trim().toLowerCase();
+        if (action === '0' || action === '') break;
+        if (action === 'a') {
+          const canonical = (await ask('希望统一使用的写法：')).trim();
+          if (!canonical) {
+            io.stderr('词条正文不能为空；未进行更改。\n');
+            continue;
+          }
+          const variants = (await ask('常见误写或其他写法（多个用逗号分隔，可留空）：')).split(/[，,]/u).map((item) => item.trim()).filter(Boolean);
+          await runDictionaryCommand(workspaceRoot, [
+            'entry', 'add', dictionary.dictionary_id, '--revision', dictionary.revision,
+            '--entry-id', `entry-${randomUUID()}`, '--canonical', canonical,
+            ...variants.flatMap((variant) => ['--variant', variant]), '--json',
+          ]);
+          io.stdout(`已新增“${canonical}”。\n`);
+          continue;
+        }
+        if (!['e', 'd'].includes(action)) {
+          io.stderr('请输入 A、E、D 或 0。\n');
+          continue;
+        }
+        if (dictionary.entries.length === 0) {
+          io.stderr('当前没有可编辑或删除的词条。\n');
+          continue;
+        }
+        const entryChoice = Number.parseInt((await ask('词条编号：')).trim(), 10) - 1;
+        const entry = dictionary.entries[entryChoice];
+        if (!entry) {
+          io.stderr('请选择列表中的词条编号。\n');
+          continue;
+        }
+        if (action === 'd') {
+          if (!yes(await ask(`删除词条“${entry.canonical}”？此操作会产生新的词典 revision。[y/N] `))) {
+            io.stdout('已取消删除。\n');
+            continue;
+          }
+          await runDictionaryCommand(workspaceRoot, [
+            'entry', 'remove', dictionary.dictionary_id, '--revision', dictionary.revision,
+            '--entry-id', entry.entry_id, '--json',
+          ]);
+          io.stdout(`已删除“${entry.canonical}”。历史任务仍使用原快照。\n`);
+          continue;
+        }
+        const canonical = (await ask(`统一写法 [${entry.canonical}]：`)).trim();
+        const variantsText = (await ask(`其他写法 [${entry.variants.join('、') || '无'}]（输入 - 清空）：`)).trim();
+        const variantArgs = variantsText === '-'
+          ? ['--clear-variants']
+          : variantsText
+            ? variantsText.split(/[，,]/u).map((item) => item.trim()).filter(Boolean).flatMap((variant) => ['--variant', variant])
+            : [];
+        await runDictionaryCommand(workspaceRoot, [
+          'entry', 'edit', dictionary.dictionary_id, '--revision', dictionary.revision,
+          '--entry-id', entry.entry_id, ...(canonical ? ['--canonical', canonical] : []), ...variantArgs, '--json',
+        ]);
+        io.stdout(`已更新“${canonical || entry.canonical}”。\n`);
+      }
+    } catch (error) {
+      if (cancellation(error)) {
+        io.stdout('已取消，未进行更改。\n');
+        continue;
+      }
+      if (error instanceof MercuryError) {
+        io.stderr(`${error.message}\n`);
+        if (error.remediation) io.stderr(`下一步：${error.remediation}\n`);
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
 function formatMilliseconds(value: number): string {
   const seconds = Math.floor(value / 1_000);
   return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}.${String(value % 1_000).padStart(3, '0')}`;
@@ -1208,24 +1317,34 @@ export async function runCli(
   integrationDependencies: CoreIntegrationDependencies = {},
   backgroundDependencies: {
     startDetachedWorker?: typeof startDetachedWorker;
+    update?: UpdateDependencies;
   } = {},
 ): Promise<number> {
-  const experimentalMachine = args.includes('--experimental');
-  if (experimentalMachine) {
-    if (!args.includes('--json') && !args.includes('--jsonl')) {
-      io.stderr('CLI_ARGUMENT_INVALID: --experimental 只用于旧 JSON/JSONL 机器合同。\n');
-      return 2;
-    }
-    args = args.filter((argument) => argument !== '--experimental');
-  }
-  const workspaceRoot = defaultWorkspaceRoot(io.homeDirectory ?? homedir());
-  const requestedMachineCommand = machineCommand(args);
+  let requestedMachineCommand: string | null = null;
   try {
+    const help = renderHelp(args, await readProductVersion());
+    if (help !== null) {
+      io.stdout(help);
+      return 0;
+    }
+    const experimentalMachine = args.includes('--experimental');
+    if (experimentalMachine) {
+      if (!args.includes('--json') && !args.includes('--jsonl')) {
+        throw new MercuryError('CLI_ARGUMENT_INVALID', '--experimental 只用于旧 JSON/JSONL 机器合同。', {
+          exitCode: 2,
+          remediation: '运行 mercury help legacy 查看兼容入口。',
+        });
+      }
+      args = args.filter((argument) => argument !== '--experimental');
+    }
+    const workspaceRoot = defaultWorkspaceRoot(io.homeDirectory ?? homedir());
+    requestedMachineCommand = machineCommand(args);
     if (!experimentalMachine) {
       const stable = await tryRunStableCli(args, {
         workspaceRoot,
         io,
         ...(backgroundDependencies.startDetachedWorker ? { startDetachedWorker: backgroundDependencies.startDetachedWorker } : {}),
+        ...(backgroundDependencies.update ? { updateDependencies: backgroundDependencies.update } : {}),
       });
       if (stable !== null) return stable;
     }
@@ -1248,12 +1367,65 @@ export async function runCli(
       io.stdout(`${await readProductVersion()}\n`);
       return 0;
     }
-    if (args.length === 0) {
+    if (args[0] === 'update' && !args.includes('--json')) {
+      if (args.length > 1 && !(args.length === 2 && args[1] === '--check')) {
+        throw new MercuryError('CLI_ARGUMENT_INVALID', '人类更新流程只接受 mercury update 或 mercury update --check。', {
+          exitCode: 2,
+          remediation: '机器调用请使用 mercury update check --json；查看用法请运行 mercury help update。',
+        });
+      }
+      const dependencies = backgroundDependencies.update ?? {};
+      const packageRoot = dependencies.packageRoot ?? await runtimePackageRoot();
+      const executablePath = dependencies.executablePath ?? process.argv[1] ?? path.join(packageRoot, 'dist/src/bin.js');
+      const currentVersion = dependencies.currentVersion ?? await readProductVersion();
+      const nodeVersion = dependencies.nodeVersion ?? process.versions.node;
+      const checked = await checkForUpdates({
+        currentVersion,
+        nodeVersion,
+        packageRoot,
+        executablePath,
+        nodeExecutable: dependencies.nodeExecutable ?? process.execPath,
+        ...(dependencies.npmCliPath ? { npmCliPath: dependencies.npmCliPath } : {}),
+        ...(dependencies.spawnCommand ? { spawnCommand: dependencies.spawnCommand } : {}),
+        ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
+      });
+      io.stdout(updateCheckText(checked));
+      if (args[1] === '--check' || !checked.can_auto_apply) return 0;
       if (!io.prompt && !process.stdin.isTTY) {
-        io.stdout(HELP);
+        io.stdout(`这是非交互终端，未执行安装。确认后可运行：mercury update apply --version ${checked.recommended_version} --yes --json\n`);
         return 0;
       }
-      await ensureWorkspace(workspaceRoot);
+      const terminal = io.prompt ? null : terminalPromptSession();
+      const ask = io.prompt ?? terminal!.prompt;
+      try {
+        const confirmed = (await ask(`确认安装 ${checked.recommended_version}？这只更新 CLI，不更新 Skill。[y/N] `)).trim().toLowerCase();
+        if (!['y', 'yes', '是'].includes(confirmed)) {
+          io.stderr('已取消，未执行安装。\n');
+          return 130;
+        }
+        const applied = await applyUpdate({
+          currentVersion,
+          nodeVersion,
+          packageRoot,
+          executablePath,
+          nodeExecutable: dependencies.nodeExecutable ?? process.execPath,
+          yes: true,
+          version: checked.recommended_version,
+          ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
+          ...(dependencies.spawnCommand ? { spawnCommand: dependencies.spawnCommand } : {}),
+          ...(dependencies.npmCliPath ? { npmCliPath: dependencies.npmCliPath } : {}),
+        });
+        io.stdout(`${applied.applied ? `CLI 已更新并验证为 ${applied.verified_version}。` : `CLI 已是 ${applied.verified_version}。`}\nSkill 仍需独立更新：npx skills update mercury-subtitles\n`);
+        return 0;
+      } finally {
+        terminal?.close();
+      }
+    }
+    if (args.length === 0) {
+      if (!io.prompt && !process.stdin.isTTY) {
+        io.stdout(mainHelp(await readProductVersion()));
+        return 0;
+      }
       const terminal = io.prompt ? null : terminalPromptSession();
       const ask = io.prompt ?? terminal!.prompt;
       const askSecret = io.secretPrompt ?? terminal?.secret ?? hiddenPrompt;
@@ -1263,13 +1435,36 @@ export async function runCli(
           registry = await loadModelRegistryV2(workspaceRoot, modelDependencies);
         } catch (error) {
           if (!(error instanceof MercuryError) || error.code !== 'MODEL_NOT_CONFIGURED') throw error;
-          io.stdout([
-            '欢迎使用 Mercury',
-            '把中文 MP3 变成可继续剪辑的校准字幕。',
-            `所有任务都保存在：${workspaceRoot}`,
-            '开始前将配置一个语音转文字服务和一个内容校准服务。',
-            '',
-          ].join('\n'));
+          for (;;) {
+            io.stdout([
+              '欢迎使用 Mercury',
+              '把中文 MP3 变成可继续剪辑的校准字幕。',
+              '',
+              '首次使用',
+              '1. 开始设置模型与服务',
+              '2. 检查 CLI 更新',
+              '3. 查看帮助',
+              '0. 退出',
+              '',
+            ].join('\n'));
+            const firstChoice = (await ask('请选择：')).trim();
+            if (firstChoice === '0') return 0;
+            if (firstChoice === '2') {
+              await runCli(['update', '--check'], io, modelDependencies, integrationDependencies, backgroundDependencies);
+              continue;
+            }
+            if (firstChoice === '3') {
+              io.stdout(`${mainHelp(await readProductVersion())}\n按回车返回首次使用首页。\n`);
+              await ask('');
+              continue;
+            }
+            if (firstChoice !== '1') {
+              io.stderr('请输入 0 到 3。\n');
+              continue;
+            }
+            break;
+          }
+          await ensureWorkspace(workspaceRoot);
           registry = await setupInteractiveV2(workspaceRoot, ask, askSecret, modelDependencies);
           io.stdout(setupResultText(workspaceRoot, registry));
           const checkNow = (await ask('现在用一段中文 MP3 检查两个模型？[Y/n] ')).trim().toLowerCase();
@@ -1294,15 +1489,18 @@ export async function runCli(
           io.stdout([
             '',
             'Mercury 主页',
-            '1. 运行新字幕任务（默认）',
-            '2. 管理模型',
-            '3. 查看最近任务',
+            '1. 创建字幕任务',
+            '2. 最近任务与结果',
+            '3. 模型与服务',
+            '4. 词典',
+            '5. 检查 CLI 更新',
+            '6. 帮助',
             '0. 退出',
             '',
           ].join('\n'));
-          const choice = (await ask('请选择 [默认 1]：')).trim() || '1';
+          const choice = (await ask('请选择：')).trim();
           if (choice === '0') return 0;
-          if (choice === '2') {
+          if (choice === '3') {
             await interactiveModelCenter(
               workspaceRoot,
               ask,
@@ -1312,21 +1510,31 @@ export async function runCli(
             );
             continue;
           }
-          if (choice === '3') {
+          if (choice === '2') {
             await interactiveTaskCenter(workspaceRoot, ask, io);
             continue;
           }
+          if (choice === '4') {
+            await interactiveDictionaryCenter(workspaceRoot, ask, io);
+            continue;
+          }
+          if (choice === '5') {
+            await runCli(['update', '--check'], io, modelDependencies, integrationDependencies, backgroundDependencies);
+            continue;
+          }
+          if (choice === '6') {
+            io.stdout(`${mainHelp(await readProductVersion())}\n按回车返回主页。\n`);
+            await ask('');
+            continue;
+          }
           if (choice !== '1') {
-            io.stderr('请输入 0、1、2 或 3。\n');
+            io.stderr('请输入 0 到 6。\n');
             continue;
           }
           const audio = (await ask('MP3 路径：')).trim();
           const srt = (await ask('参考 SRT 路径（没有可留空）：')).trim();
-          let mode: string[] = [];
-          if (srt) {
-            const modeChoice = (await ask('校准范围：1 只改文字 / 2 文字和断句 [1]：')).trim() || '1';
-            mode = ['--mode', modeChoice === '2' ? 'text-and-segmentation' : 'text-only'];
-          }
+          io.stdout('校准只修改文字；保持纯转写的 cue 数量、断句和时间轴不变。\n');
+          const mode = srt ? ['--mode', 'text-only'] : [];
           if (
             !(await ensureDefaultModelsReady(
               workspaceRoot,
@@ -1343,6 +1551,7 @@ export async function runCli(
             io,
             modelDependencies,
             integrationDependencies,
+            backgroundDependencies,
           );
           if (code !== 0)
             io.stderr(
@@ -1353,11 +1562,6 @@ export async function runCli(
         terminal?.close();
       }
     }
-    if (args[0] === '--help' || args[0] === '-h') {
-      io.stdout(HELP);
-      return 0;
-    }
-
     if (args[0] === 'setup' && wantsHelp(args.slice(1))) {
       if (args.length !== 2)
         throw new MercuryError(
@@ -1910,7 +2114,7 @@ export async function runCli(
     throw new MercuryError(
       'CLI_COMMAND_INVALID',
       `不支持的命令：${args.join(' ')}`,
-      { exitCode: 2, remediation: '执行 mercury --help 查看命令。' },
+      { exitCode: 2, remediation: unknownCommandRemediation(args) },
     );
   } catch (error) {
     if (cancellation(error)) {
@@ -1932,9 +2136,8 @@ export async function runCli(
       }));
       return mercuryError.exitCode;
     }
-    io.stderr(`${mercuryError.code}: ${mercuryError.message}\n`);
-    if (mercuryError.remediation)
-      io.stderr(`下一步：${mercuryError.remediation}\n`);
+    io.stderr(`未完成：${friendlyProviderError(mercuryError.code, mercuryError.message)}\n`);
+    io.stderr(`下一步：${mercuryError.remediation ?? localCommandHelpRemediation(args)}\n`);
     return mercuryError.exitCode;
   }
 }

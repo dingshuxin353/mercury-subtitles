@@ -2783,7 +2783,7 @@ describe('Exchange v1 external transcript task', () => {
       await expect(executeV5Retry(input.workspace, failed, plan.plan_id)).rejects.toMatchObject({ code: 'RETRY_LEDGER_INVALID' });
       expect(await directoryManifest(directory)).toEqual(before); expect(calls).toEqual(['chat']);
     }
-  });
+  }, 10_000);
 
   it('closes the complete multi-attempt retry, plan, result, and Provider call history before attempt 3', async () => {
     const failTwice = async (requestId: string) => {

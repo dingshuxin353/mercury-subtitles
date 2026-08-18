@@ -10,14 +10,14 @@
 [![Node 24](https://img.shields.io/badge/Node.js-24-3c873a)](https://nodejs.org/)
 [![CI](https://github.com/dingshuxin353/mercury-subtitles/actions/workflows/ci.yml/badge.svg)](https://github.com/dingshuxin353/mercury-subtitles/actions/workflows/ci.yml)
 [![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE)
-[![Public Alpha](https://img.shields.io/badge/status-Public%20Alpha-f59e0b)](https://github.com/dingshuxin353/mercury-subtitles/releases)
+[![Release Candidate](https://img.shields.io/badge/status-Release%20Candidate-f59e0b)](https://github.com/dingshuxin353/mercury-subtitles/releases)
 
 [三步开始](#三步开始) · [CLI / App](#方式一直接使用-cli--app) · [Agent Skill](#方式二让-agent-通过-skill-使用) · [隐私说明](#你的数据会去哪里) · [遇到问题](#常见问题)
 
 </div>
 
 > [!IMPORTANT]
-> Mercury 目前是 Public Alpha，适合愿意安装 Node.js 24 的早期用户。请先用副本测试，不要把它当作已稳定的桌面软件。
+> Mercury 目前是 `0.3.0-rc.1` 发布候选，适合愿意安装 Node.js 24 的早期用户。请先用副本测试；候选通过后才会形成 `0.3.0` 稳定版。
 
 ## 你会得到什么
 
@@ -53,11 +53,13 @@ node --version
 
 需要显示 `v24.x.x`。如果还是 Node 22，请先安装或切换到 [Node.js 24](https://nodejs.org/)，然后重新打开终端。
 
-### 2. 安装 Public Alpha
+### 2. 安装当前已发布版本
 
 ```bash
 npm install --global mercury-subtitles@next
 ```
+
+`@next` 当前仍指向已经发布的 `0.3.0-alpha.2`。本仓库的 `0.3.0-rc.1` 只是待验收候选，尚未获得 npm 发布授权；在真实发布完成前，上述命令不会安装 RC。
 
 ### 3. 打开 Mercury
 
@@ -114,7 +116,23 @@ mercury worker start --json
 
 查询状态不会偷偷启动 Worker，也不会重复提交任务。Provider 结果不确定时，Mercury 会停下来阻止自动重放，避免重复调用或计费。
 
-`0.3.0-alpha.2` 候选继续使用 Exchange Protocol v1：脚本可显式导入 SRT、VTT 或 transcript JSON 作为转写事实源（ASR 0 调用），也可用 `reference` 继续走 ASR；两种模式共用稳定任务、事件、结果、词典快照和审阅合同。新增安全暂停/同 attempt 恢复，以及只读 retry plan + append-only retry；Provider 结果不确定时仍禁止自动重放。全局/项目词典通过 `mercury dictionary ... --json` 管理，任务创建后固定 revision/hash。
+`0.3.0-rc.1` 继续使用 Exchange Protocol v1：脚本可显式导入 SRT、VTT 或 transcript JSON 作为转写事实源（ASR 0 调用），也可用 `reference` 继续走 ASR；两种模式共用稳定任务、事件、结果、词典快照和审阅合同。安全暂停/同 attempt 恢复，以及只读 retry plan + append-only retry 均保持兼容；Provider 结果不确定时仍禁止自动重放。全局/项目词典通过 `mercury dictionary ... --json` 管理，任务创建后固定 revision/hash。
+
+不知道命令时可从一屏帮助开始：
+
+```bash
+mercury --help
+mercury help task
+mercury help task submit
+```
+
+检查 CLI 更新不会修改配置、任务或 Skill：
+
+```bash
+mercury update --check
+```
+
+CLI 与 Skill 是两份独立安装事实。CLI 更新完成不代表 Skill 已更新；Skill 仍使用 `npx skills update mercury-subtitles` 单独管理。
 
 新任务的纯转写、AI 校验、人工批准与业务目录交付 SRT 统一采用无句读风格：句读位置替换为一个空格，连续空白会折叠。版本号、`B-roll`、URL、邮箱和技术缩写中的词法符号会保留，包裹 URL 的括号、方括号和引号不会被误当成 URL 本体。AI 校验只修正每个纯转写 cue 内的文字，不拆分、合并、移动或调整时间；即使请求使用历史 `text-and-segmentation` 模式，当前版本也会冻结原 cue。如果修正文字在固定 cue 内超过 24 字或两行，任务会明确停止而不偷偷改断句。Provider/raw 证据仍保持原样，历史任务不会被改写。
 
@@ -220,7 +238,13 @@ npm install --global mercury-subtitles@next
 <details>
 <summary><strong>如何升级或卸载</strong></summary>
 
-升级 CLI / App：
+先只读检查 CLI / App 更新：
+
+```bash
+mercury update --check
+```
+
+如果当前入口不是与同一个可信 npm global prefix 完整绑定、且该目录可写的全局安装，Mercury 会拒绝自动覆盖并给出适合该来源的手动动作，而不是修改项目、本地 npm exec 缓存或源码。自动升级会先显示目标并要求确认；机器模式必须显式使用 `--yes`。当前已发布预览版仍可手工安装：
 
 ```bash
 npm install --global mercury-subtitles@next
@@ -269,7 +293,7 @@ npm run verify
 
 ## 版本与反馈
 
-- 当前开发候选：`0.3.0-alpha.2`；尚未发布，已发布 Public Alpha 仍可通过 npm dist-tag `next` 安装。
+- 当前唯一开发候选：`0.3.0-rc.1`；尚未据此宣称 `0.3.0` 稳定版完成，也尚未发布到 npm。npm `next` 当前仍是已发布的 `0.3.0-alpha.2`，只有获得单独发布授权并完成真实发布后才会变化。
 - 版本变化：[CHANGELOG.md](./CHANGELOG.md)
 - 下载与校验：[GitHub Releases](https://github.com/dingshuxin353/mercury-subtitles/releases)
 - 安装或配置求助：[创建安装帮助](https://github.com/dingshuxin353/mercury-subtitles/issues/new?template=installation-help.yml)
