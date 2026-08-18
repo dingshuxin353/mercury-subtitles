@@ -17,7 +17,7 @@
 </div>
 
 > [!IMPORTANT]
-> Mercury 目前是 `0.3.0-rc.1` 发布候选，适合愿意安装 Node.js 24 的早期用户。请先用副本测试；候选通过后才会形成 `0.3.0` 稳定版。
+> Mercury 目前是 `0.3.0-rc.2` 发布候选，适合愿意安装 Node.js 24 的早期用户。请先用副本测试；候选通过后才会形成 `0.3.0` 稳定版。
 
 ## 你会得到什么
 
@@ -59,7 +59,21 @@ node --version
 npm install --global mercury-subtitles@next
 ```
 
-`@next` 当前仍指向已经发布的 `0.3.0-alpha.2`。本仓库的 `0.3.0-rc.1` 只是待验收候选，尚未获得 npm 发布授权；在真实发布完成前，上述命令不会安装 RC。
+`@next` 是 Mercury 的公开预发布渠道，不是稳定版 `latest`。安装后请运行 `mercury --version` 核对实际版本；需要精确安装本候选时，可在该版本发布后使用 `npm install --global mercury-subtitles@0.3.0-rc.2`。
+
+如果当前还是 `0.3.0-alpha.2`，旧版尚无 `mercury update` 命令。首次进入 RC 需要使用管理现有安装的同一个 npm、同一个 global prefix，显式安装确切版本：
+
+```bash
+npm install --global mercury-subtitles@0.3.0-rc.2
+```
+
+如果旧安装使用了自定义 `--prefix`，上述命令也必须带完全相同的 `--prefix`；不要使用 `sudo`，不要让 `npx` 修改另一套全局安装。该一次性动作是 bootstrap，不是旧版内置升级。从 `0.3.0-rc.1` 起才可使用 Mercury 内置更新，例如：
+
+```bash
+mercury update apply --version 0.3.0-rc.2 --yes --json
+```
+
+CLI 更新不会静默更新或删除 Skill；Skill 仍由 Skills CLI 单独管理。
 
 ### 3. 打开 Mercury
 
@@ -116,7 +130,7 @@ mercury worker start --json
 
 查询状态不会偷偷启动 Worker，也不会重复提交任务。Provider 结果不确定时，Mercury 会停下来阻止自动重放，避免重复调用或计费。
 
-`0.3.0-rc.1` 继续使用 Exchange Protocol v1：脚本可显式导入 SRT、VTT 或 transcript JSON 作为转写事实源（ASR 0 调用），也可用 `reference` 继续走 ASR；两种模式共用稳定任务、事件、结果、词典快照和审阅合同。安全暂停/同 attempt 恢复，以及只读 retry plan + append-only retry 均保持兼容；Provider 结果不确定时仍禁止自动重放。全局/项目词典通过 `mercury dictionary ... --json` 管理，任务创建后固定 revision/hash。
+`0.3.0-rc.2` 继续使用 Exchange Protocol v1：脚本可显式导入 SRT、VTT 或 transcript JSON 作为转写事实源（ASR 0 调用），也可用 `reference` 继续走 ASR；两种模式共用稳定任务、事件、结果、词典快照和审阅合同。安全暂停/同 attempt 恢复，以及只读 retry plan + append-only retry 均保持兼容；Provider 结果不确定时仍禁止自动重放。全局/项目词典通过 `mercury dictionary ... --json` 管理，任务创建后固定 revision/hash。
 
 不知道命令时可从一屏帮助开始：
 
@@ -293,7 +307,7 @@ npm run verify
 
 ## 版本与反馈
 
-- 当前唯一开发候选：`0.3.0-rc.1`；尚未据此宣称 `0.3.0` 稳定版完成，也尚未发布到 npm。npm `next` 当前仍是已发布的 `0.3.0-alpha.2`，只有获得单独发布授权并完成真实发布后才会变化。
+- 当前候选：`0.3.0-rc.2`；公开预发布通过 npm `next` 分发，`latest` 不随 RC 移动。该候选不等于 `0.3.0` 稳定版已经完成或发布；实际渠道版本请以 `npm view mercury-subtitles dist-tags --json` 为准。
 - 版本变化：[CHANGELOG.md](./CHANGELOG.md)
 - 下载与校验：[GitHub Releases](https://github.com/dingshuxin353/mercury-subtitles/releases)
 - 安装或配置求助：[创建安装帮助](https://github.com/dingshuxin353/mercury-subtitles/issues/new?template=installation-help.yml)

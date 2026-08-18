@@ -17,7 +17,7 @@ import {
 
 function metadata(input: { latest?: string; next?: string; versions?: Record<string, string> } = {}) {
   const latest = input.latest ?? '0.2.0-alpha.2';
-  const next = input.next ?? '0.3.0-rc.1';
+  const next = input.next ?? '0.3.0-rc.2';
   const versions = input.versions ?? { [latest]: '>=24.0.0 <25.0.0', [next]: '>=24.0.0 <25.0.0' };
   return {
     name: UPDATE_PACKAGE_NAME,
@@ -74,7 +74,7 @@ async function fakeNode(root: string) {
 
 function boundSpawn(
   install: Awaited<ReturnType<typeof installation>>,
-  version = '0.3.0-rc.1',
+  version = '0.3.0-rc.2',
   options: { installCode?: number; verifyVersion?: string } = {},
 ): { calls: Array<{ command: string; args: string[] }>; spawnCommand: SpawnCommand } {
   const calls: Array<{ command: string; args: string[] }> = [];
@@ -99,6 +99,7 @@ function capture(home: string) {
 describe('safe CLI update contract', () => {
   it('compares strict semver and evaluates the published Node engine without executing commands', () => {
     expect(compareVersions('0.3.0-alpha.2', '0.3.0-rc.1')).toBeLessThan(0);
+    expect(compareVersions('0.3.0-rc.1', '0.3.0-rc.2')).toBeLessThan(0);
     expect(compareVersions('0.3.0-rc.1', '0.3.0')).toBeLessThan(0);
     expect(compareVersions('0.3.0', '0.3.0')).toBe(0);
     expect(nodeSatisfiesEngine('24.19.0', '>=24.0.0 <25.0.0')).toBe(true);
@@ -110,7 +111,7 @@ describe('safe CLI update contract', () => {
     const next = await checkForUpdates({
       currentVersion: '0.3.0-alpha.2', nodeVersion: '24.19.0', ...source, fetch: registry(),
     });
-    expect(next).toMatchObject({ recommended_channel: 'next', recommended_version: '0.3.0-rc.1', update_available: true, status: 'update_available', can_auto_apply: false });
+    expect(next).toMatchObject({ recommended_channel: 'next', recommended_version: '0.3.0-rc.2', update_available: true, status: 'update_available', can_auto_apply: false });
     const stable = await checkForUpdates({
       currentVersion: '0.3.0-alpha.2', nodeVersion: '24.19.0', ...source,
       fetch: registry(metadata({ latest: '0.3.0', next: '0.3.1-alpha.1' })),
@@ -136,7 +137,7 @@ describe('safe CLI update contract', () => {
     expect(output.stdout).toHaveLength(1);
     expect(JSON.parse(output.stdout[0]!)).toMatchObject({
       contract: 'mercury.cli/v1', command: 'update.check', ok: true,
-      data: { current_version: '0.3.0-alpha.2', latest_version: '0.2.0-alpha.2', next_version: '0.3.0-rc.1', installation: { kind: 'source' } },
+      data: { current_version: '0.3.0-alpha.2', latest_version: '0.2.0-alpha.2', next_version: '0.3.0-rc.2', installation: { kind: 'source' } },
     });
     await expect(readFile(path.join(home, 'mercury-workspace/config/model-config.json'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
@@ -183,16 +184,16 @@ describe('safe CLI update contract', () => {
     const node = await fakeNode(global.root);
     const bound = boundSpawn(global);
     const result = await applyUpdate({
-      currentVersion: '0.3.0-alpha.2', nodeVersion: '24.19.0', ...global, ...node,
+      currentVersion: '0.3.0-rc.1', nodeVersion: '24.19.0', ...global, ...node,
       yes: true, channel: 'next', fetch: registry(), spawnCommand: bound.spawnCommand,
     });
-    expect(result).toMatchObject({ applied: true, verified_version: '0.3.0-rc.1', requested: { direction: 'upgrade' } });
+    expect(result).toMatchObject({ applied: true, verified_version: '0.3.0-rc.2', requested: { direction: 'upgrade' } });
     expect(bound.calls).toHaveLength(4);
     expect(bound.calls[0]!.args).toEqual(['prefix', '--global']);
     expect(bound.calls[1]!.args).toEqual(['root', '--global']);
     expect(bound.calls[2]).toEqual({
       command: node.npmCliPath,
-      args: ['install', '--global', '--prefix', result.installation.npm_global_prefix!, 'mercury-subtitles@0.3.0-rc.1', '--registry', 'https://registry.npmjs.org/', '--no-audit', '--no-fund', '--ignore-scripts'],
+      args: ['install', '--global', '--prefix', result.installation.npm_global_prefix!, 'mercury-subtitles@0.3.0-rc.2', '--registry', 'https://registry.npmjs.org/', '--no-audit', '--no-fund', '--ignore-scripts'],
     });
     expect(bound.calls[2]!.args.join(' ')).not.toMatch(/sudo|[;&|`$()]/u);
     expect(bound.calls[3]).toEqual({ command: node.nodeExecutable, args: [global.executablePath, '--version'] });
@@ -274,7 +275,7 @@ describe('safe CLI update contract', () => {
       yes: true, channel: 'latest', fetch: registry(), spawnCommand: async () => ({ code: 0, stdout: '', stderr: '' }),
     })).rejects.toMatchObject({ code: 'UPDATE_CHANNEL_OLDER' });
     let calls = 0;
-    const mismatch = boundSpawn(global, '0.3.0-rc.1', { verifyVersion: '0.3.0-alpha.2' });
+    const mismatch = boundSpawn(global, '0.3.0-rc.2', { verifyVersion: '0.3.0-alpha.2' });
     await expect(applyUpdate({
       currentVersion: '0.3.0-alpha.2', nodeVersion: '24.19.0', ...global, ...node,
       yes: true, channel: 'next', fetch: registry(),
@@ -285,7 +286,7 @@ describe('safe CLI update contract', () => {
   it('keeps npm failure explicit and does not attempt post-install verification', async () => {
     const global = await installation('global');
     const node = await fakeNode(global.root);
-    const failed = boundSpawn(global, '0.3.0-rc.1', { installCode: 73 });
+    const failed = boundSpawn(global, '0.3.0-rc.2', { installCode: 73 });
     await expect(applyUpdate({
       currentVersion: '0.3.0-alpha.2', nodeVersion: '24.19.0', ...global, ...node,
       yes: true, channel: 'next', fetch: registry(),

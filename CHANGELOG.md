@@ -1,8 +1,12 @@
 # Mercury Changelog
 
-## 0.3.0-rc.1 — Unreleased
+## 0.3.0-rc.2 — 2026-08-18
 
-> This release candidate has not been published to npm. The public `next` tag still points to `0.3.0-alpha.2` until a separately authorized release completes.
+- Corrected the packaged README so public prerelease installation, npm `next` and the unchanged `latest` boundary remain accurate before and after publication.
+- Documented the one-time, same-npm/same-prefix bootstrap required by `0.3.0-alpha.2`, which predates the built-in update command.
+- Kept the CLI update runtime and all subtitle/task contracts byte-for-byte unchanged from RC.1; RC.1 users can use the built-in exact-version update to reach RC.2.
+
+## 0.3.0-rc.1 — 2026-08-18
 
 - Added a task-oriented one-screen help page, consistent group/command help, local typo suggestions, and human-readable recovery without exposing internal error codes.
 - Productized the interactive App home flow for subtitle tasks, recent results, model/service setup, dictionaries, update checks, and help without an accidental default task action.

@@ -32,7 +32,7 @@ describe('public release candidate surface', () => {
 
     expect(packageJson).toMatchObject({
       name: 'mercury-subtitles',
-      version: '0.3.0-rc.1',
+      version: '0.3.0-rc.2',
       license: 'Apache-2.0',
       engines: { node: '>=24.0.0 <25.0.0' },
       bin: { mercury: './dist/src/bin.js' },
@@ -70,9 +70,14 @@ describe('public release candidate surface', () => {
       expect(readme).toContain(heading);
     }
     expect(readme).toContain('npm install --global mercury-subtitles@next');
-    expect(readme).toContain('`@next` 当前仍指向已经发布的 `0.3.0-alpha.2`');
-    expect(readme).toContain('`0.3.0-rc.1` 只是待验收候选');
-    expect(readme).not.toContain('公开候选渠道使用 npm dist-tag `next`');
+    expect(readme).toContain('`@next` 是 Mercury 的公开预发布渠道');
+    expect(readme).toContain('旧版尚无 `mercury update` 命令');
+    expect(readme).toContain('npm install --global mercury-subtitles@0.3.0-rc.2');
+    expect(readme).toContain('mercury update apply --version 0.3.0-rc.2 --yes --json');
+    expect(readme).toContain('该一次性动作是 bootstrap，不是旧版内置升级');
+    expect(readme).toContain('`latest` 不随 RC 移动');
+    expect(readme).not.toContain('`@next` 当前仍指向已经发布的 `0.3.0-alpha.2`');
+    expect(readme).not.toContain('尚未获得 npm 发布授权');
     expect(readme).toContain('npx skills add dingshuxin353/mercury-subtitles');
     expect(readme).toContain('mercury task submit --request "/绝对路径/request.json" --json');
     expect(readme).not.toContain('mercury calibrate --audio "/绝对路径/访谈.mp3" --background --json');
