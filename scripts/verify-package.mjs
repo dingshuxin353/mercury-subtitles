@@ -42,7 +42,7 @@ if (packageJson.private === true) {
   throw new Error('The public package must not be marked private');
 }
 if (packageJson.packageManager !== 'npm@11.12.1') {
-  throw new Error('The D012 Alpha candidate requires npm 11.12.1');
+  throw new Error('The D014 release candidate requires npm 11.12.1');
 }
 if (
   packageJson.engines?.node !== '>=24.0.0 <25.0.0' ||
@@ -405,6 +405,9 @@ try {
     !packagedCommands.includes('Every entry ID must match `entry-[a-z0-9][a-z0-9-]{2,63}`') ||
     !packagedCommands.includes('Every successful mutation returns `data.dictionary.revision`') ||
     !packagedCommands.includes('`term|person|brand|product|acronym|other`') ||
+    !packagedCommands.includes('mercury update check --json') ||
+    !packagedCommands.includes('Do not add `--yes` on the user\'s behalf before confirmation') ||
+    !packagedCommands.includes('npx skills update mercury-subtitles') ||
     !packagedTroubleshooting.includes('If `approved_srt.exists` is false, do not call `task deliver`')
   ) {
     throw new Error('Installed package Skill is missing the rc4 model/action/delivery/dictionary safety guidance');
@@ -434,6 +437,10 @@ try {
     ['calibrate', '--help'],
     ['task', 'status', '--help'],
     ['task', 'list', '--help'],
+    ['help', 'task'],
+    ['help', 'update'],
+    ['help', 'dictionary', 'entry', 'add'],
+    ['update', 'apply', '--help', '--json'],
   ];
   const helpText = (
     await Promise.all(
@@ -447,6 +454,9 @@ try {
     '--chat-model <model-id>',
     'task status <task-id>',
     'task list',
+    '检查与更新 CLI',
+    'dictionary entry add',
+    '不调用 Provider',
   ]) {
     if (!helpText.includes(required)) {
       throw new Error(`Installed CLI help is missing ${required}`);
@@ -460,6 +470,22 @@ try {
     if (helpText.includes(forbidden)) {
       throw new Error(`Installed CLI help contains legacy option ${forbidden}`);
     }
+  }
+  if (/\u001b\[/u.test(helpText)) {
+    throw new Error('Installed CLI help unexpectedly contains ANSI escapes');
+  }
+  if (await pathExists(path.join(isolatedHome, 'mercury-workspace'))) {
+    throw new Error('Version, Skill status and help unexpectedly created a Mercury workspace');
+  }
+  try {
+    await runCli(['update', 'apply', '--channel', 'next', '--json']);
+    throw new Error('Update apply unexpectedly ran without explicit confirmation');
+  } catch (error) {
+    const envelope = JSON.parse(String(error.stdout ?? 'null'));
+    if (envelope.error?.code !== 'UPDATE_CONFIRMATION_REQUIRED') throw error;
+  }
+  if (await pathExists(path.join(isolatedHome, 'mercury-workspace'))) {
+    throw new Error('Rejected update apply created a Mercury workspace');
   }
 
   const { stdout: taskList } = await runCli(['task', 'list']);

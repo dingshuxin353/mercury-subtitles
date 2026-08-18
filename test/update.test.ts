@@ -1,7 +1,7 @@
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { runCli } from '../src/cli.js';
 import {
   applyUpdate,
@@ -239,6 +239,61 @@ describe('safe CLI update contract', () => {
     await expect(fetchRegistryFacts(async () => new Response('{}', { status: 200, headers: { 'content-length': String(5 * 1024 * 1024) } }))).rejects.toMatchObject({ code: 'UPDATE_REGISTRY_TOO_LARGE' });
     await expect(fetchRegistryFacts(registry({ name: UPDATE_PACKAGE_NAME, 'dist-tags': { latest: 'bad', next: '0.3.0-rc.1' }, versions: {} }))).rejects.toMatchObject({ code: 'UPDATE_REGISTRY_INVALID' });
     await expect(fetchRegistryFacts(async () => { throw new Error('offline'); })).rejects.toMatchObject({ code: 'UPDATE_CHECK_OFFLINE' });
+  });
+
+  it('times out a silent registry, rejects a redirect loop, and stops a streamed oversized response', async () => {
+    vi.useFakeTimers();
+    try {
+      const pending = fetchRegistryFacts(async (_url, init) => await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+      }));
+      const timedOut = expect(pending).rejects.toMatchObject({ code: 'UPDATE_CHECK_TIMEOUT' });
+      await vi.advanceTimersByTimeAsync(5_001);
+      await timedOut;
+    } finally {
+      vi.useRealTimers();
+    }
+
+    await expect(fetchRegistryFacts(async () => new Response(null, {
+      status: 302,
+      headers: { location: 'https://registry.npmjs.org/mercury-subtitles' },
+    }))).rejects.toMatchObject({ code: 'UPDATE_REDIRECT_LIMIT' });
+
+    const chunk = new Uint8Array(1024 * 1024);
+    let sent = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent < 5) {
+          controller.enqueue(chunk);
+          sent += 1;
+        } else controller.close();
+      },
+    });
+    await expect(fetchRegistryFacts(async () => new Response(body))).rejects.toMatchObject({ code: 'UPDATE_REGISTRY_TOO_LARGE' });
+  });
+
+  it('rejects malicious versions and engines before invoking npm', async () => {
+    const global = await installation('global');
+    const node = await fakeNode(global.root);
+    let spawns = 0;
+    await expect(applyUpdate({
+      currentVersion: '0.3.0-alpha.2', nodeVersion: '24.19.0', ...global, ...node,
+      yes: true, version: '0.3.0;touch-pwned', fetch: registry(),
+      spawnCommand: async () => { spawns += 1; return { code: 0, stdout: '', stderr: '' }; },
+    })).rejects.toMatchObject({ code: 'UPDATE_VERSION_NOT_FOUND' });
+    await expect(fetchRegistryFacts(registry(metadata({
+      latest: '0.3.0', next: '0.3.0-rc.1',
+      versions: { '0.3.0': '>=24 <25 || >=99', '0.3.0-rc.1': '>=24 <25' },
+    })))).rejects.toMatchObject({ code: 'UPDATE_REGISTRY_INVALID' });
+    expect(spawns).toBe(0);
+  });
+
+  it('does not auto-apply from a global-looking directory that is not writable', async () => {
+    const global = await installation('global');
+    await chmod(path.dirname(global.packageRoot), 0o555);
+    const origin = await detectInstallationOrigin(global.packageRoot, global.executablePath);
+    expect(origin).toMatchObject({ kind: 'npm_global', auto_apply: false });
+    expect(origin.reason).toContain('不可写');
   });
 
   it('does not trust a package root when the actual executable is outside it', async () => {

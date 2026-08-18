@@ -132,7 +132,8 @@ export async function tryRunStableCli(args: string[], context: StableCliContext)
       exactJson(args.slice(2));
       if (args[1] === 'version') data = { protocol: 'v1', contracts: ['mercury.exchange.request/v1', 'mercury.task/v1', 'mercury.event/v1', 'mercury.result/v1', 'mercury.error/v1', 'mercury.transcript/v1', 'mercury.dictionary/v1', 'mercury.retry-plan/v1'] };
       else if (args[1] === 'capabilities') data = {
-        alpha: '0.3.0-alpha.2',
+        alpha: version,
+        release_stage: 'release_candidate',
         commands: {
           protocol: true, config_migration: true, external_srt: true, external_vtt: true, external_transcript_json: true,
           dictionary: true, approved_srt_delivery: true, worker_start: true, review: true,

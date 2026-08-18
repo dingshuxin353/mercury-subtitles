@@ -11,7 +11,7 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 let temporaryRoot = '';
 let snapshotRoot = '';
 
-describe('Public Alpha release surface', () => {
+describe('public release candidate surface', () => {
   beforeAll(async () => {
     temporaryRoot = await mkdtemp(path.join(tmpdir(), 'mercury-public-release-'));
     snapshotRoot = path.join(temporaryRoot, 'snapshot');
@@ -32,7 +32,7 @@ describe('Public Alpha release surface', () => {
 
     expect(packageJson).toMatchObject({
       name: 'mercury-subtitles',
-      version: '0.3.0-alpha.2',
+      version: '0.3.0-rc.1',
       license: 'Apache-2.0',
       engines: { node: '>=24.0.0 <25.0.0' },
       bin: { mercury: './dist/src/bin.js' },

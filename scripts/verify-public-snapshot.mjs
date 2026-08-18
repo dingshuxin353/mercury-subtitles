@@ -142,7 +142,7 @@ const lockJson = JSON.parse(await readFile(path.join(snapshotRoot, 'package-lock
 const version = (await readFile(path.join(snapshotRoot, 'VERSION'), 'utf8')).trim();
 if (
   packageJson.name !== 'mercury-subtitles' ||
-  packageJson.version !== '0.3.0-alpha.2' ||
+  packageJson.version !== '0.3.0-rc.1' ||
   packageJson.version !== version ||
   lockJson.name !== packageJson.name ||
   lockJson.version !== packageJson.version ||
@@ -166,7 +166,7 @@ for (const required of [
   'mercury-subtitles@next',
   'mercury task submit --request "/绝对路径/request.json" --json',
   'npx skills add dingshuxin353/mercury-subtitles',
-  'Public Alpha',
+  'Release Candidate',
 ]) {
   if (!readme.includes(required)) {
     throw new Error(`Public README is missing required beginner content: ${required}`);
