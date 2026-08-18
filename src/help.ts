@@ -1,6 +1,6 @@
 import { MercuryError } from './errors.js';
 
-type Effect = 'none' | 'local_read' | 'local_write' | 'registry_read' | 'cli_install' | 'provider_now' | 'provider_background';
+type Effect = 'none' | 'local_read' | 'local_write' | 'conditional_local_write' | 'registry_read' | 'cli_install' | 'provider_now' | 'provider_background';
 
 export interface CommandFact {
   name: string;
@@ -57,7 +57,7 @@ const GROUPS: CommandGroup[] = [
       { name: 'entry edit', summary: '按 revision 编辑已有词条。', usage: 'mercury dictionary entry edit <dictionary-id> --revision <rev> --entry-id <entry-id> [字段] --json', example: 'mercury dictionary entry edit dict-product-terms --revision rev-abc123 --entry-id entry-wan-3-0 --variant "千问万3.0" --json', required: ['dictionary-id、--revision、--entry-id'], effects: ['local_write'], next: '保存新 revision；冲突时重新 show，不要覆盖他人修改。' },
       { name: 'entry remove', summary: '按 revision 删除词条。', usage: 'mercury dictionary entry remove <dictionary-id> --revision <rev> --entry-id <entry-id> --json', example: 'mercury dictionary entry remove dict-product-terms --revision rev-abc123 --entry-id entry-old --json', required: ['dictionary-id、--revision、--entry-id'], effects: ['local_write'], next: '确认新 revision 与剩余条目。' },
       { name: 'validate', summary: '只读验证 JSON/CSV 词典文件。', usage: 'mercury dictionary validate --file <绝对路径> --json', example: 'mercury dictionary validate --file "/tmp/terms.csv" --json', required: ['--file'], effects: ['local_read'], next: '通过后先运行 import --dry-run。' },
-      { name: 'import', summary: '先 dry-run，再用 plan ID 确认导入。', usage: 'mercury dictionary import --dictionary <id> --file <绝对路径> --format json|csv --dry-run --json', example: 'mercury dictionary import --dictionary dict-product-terms --file "/tmp/terms.csv" --format csv --dry-run --json', required: ['--dictionary、--file、--format'], optional: ['写入时用 --confirm <plan-id> 替代 --dry-run'], effects: ['local_read', 'local_write'], next: '核对 dry-run 后，用同一文件和 --confirm plan-id 写入。' },
+      { name: 'import', summary: '先 dry-run，再用 plan ID 确认导入。', usage: 'mercury dictionary import --dictionary <id> --file <绝对路径> --format json|csv --dry-run --json', example: 'mercury dictionary import --dictionary dict-product-terms --file "/tmp/terms.csv" --format csv --dry-run --json', required: ['--dictionary、--file、--format'], optional: ['写入时用 --confirm <plan-id> 替代 --dry-run'], effects: ['local_read', 'conditional_local_write'], next: '核对 dry-run 后，用同一文件和 --confirm plan-id 写入。' },
       { name: 'export', summary: '导出一个不可覆盖的 JSON/CSV 文件。', usage: 'mercury dictionary export <dictionary-id> --format json|csv --output <绝对路径> --json', example: 'mercury dictionary export dict-product-terms --format json --output "/tmp/terms.json" --json', required: ['dictionary-id、--format、--output'], effects: ['local_read', 'local_write'], next: '保存输出 hash；Mercury 不覆盖已有文件。' },
     ],
   },
@@ -85,7 +85,7 @@ const GROUPS: CommandGroup[] = [
   {
     name: 'config', title: '配置状态', summary: '只读发现配置，或显式迁移旧配置。', commands: [
       { name: 'status', summary: '只读返回模型 ID、默认项与就绪状态。', usage: 'mercury config status --json', example: 'mercury config status --json', effects: ['local_read'], next: '未配置时运行 mercury，进入“模型与服务”并隐藏输入密钥。' },
-      { name: 'migrate', summary: '先只读 check，再用 plan ID 显式迁移。', usage: 'mercury config migrate --check --json | mercury config migrate --plan <plan-id> --json', example: 'mercury config migrate --check --json', effects: ['local_read', 'local_write'], next: '核对计划后才执行 --plan；失败会保留 0600 备份。' },
+      { name: 'migrate', summary: '先只读 check，再用 plan ID 显式迁移。', usage: 'mercury config migrate --check --json | mercury config migrate --plan <plan-id> --json', example: 'mercury config migrate --check --json', effects: ['local_read', 'conditional_local_write'], next: '核对计划后才执行 --plan；失败会保留 0600 备份。' },
     ],
   },
   {
@@ -166,7 +166,8 @@ function effectsText(effects: Effect[]): string {
   if (effects.includes('provider_background')) details.push('会持久化任务/控制意图并可能启动 Worker，随后可能调用 Provider');
   if (!effects.some((effect) => ['registry_read', 'cli_install', 'provider_now', 'provider_background'].includes(effect))) details.push('不联网');
   if (!effects.some((effect) => ['provider_now', 'provider_background'].includes(effect))) details.push('不调用 Provider');
-  if (effects.includes('local_write') && !effects.includes('provider_now') && !effects.includes('provider_background'))
+  if (effects.includes('conditional_local_write')) details.push('预检只读，只有显式确认后才写入本地目标');
+  else if (effects.includes('local_write') && !effects.includes('provider_now') && !effects.includes('provider_background'))
     details.push('会写入命令明确的本地目标');
   else if (!effects.includes('local_write')) details.push('不写入本地业务状态');
   return `${details.join('；')}。`;

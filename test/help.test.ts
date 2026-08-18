@@ -178,6 +178,12 @@ describe('static human help router', () => {
     const apply = capture(home);
     expect(await runCli(['help', 'update', 'apply'], apply.io)).toBe(0);
     expect(apply.stdout.join('')).toContain('确认后由已验证 npm 安装 CLI');
+
+    for (const args of [['help', 'dictionary', 'import'], ['help', 'config', 'migrate']] as const) {
+      const output = capture(home);
+      expect(await runCli([...args], output.io)).toBe(0);
+      expect(output.stdout.join('')).toContain('预检只读，只有显式确认后才写入本地目标');
+    }
   });
 
   it('offers setup, update, help and exit before creating a first workspace', async () => {
