@@ -23,7 +23,7 @@ describe('stable CLI v1 protocol and configuration', () => {
       expect(output.stderr).toEqual([]);
       expect(output.stdout).toHaveLength(1);
       const envelope = JSON.parse(output.stdout[0]!);
-      expect(envelope).toMatchObject({ contract: 'mercury.cli/v1', ok: true, error: null, meta: { cli_version: '0.3.0-rc.1', protocol_versions: ['v1'] } });
+      expect(envelope).toMatchObject({ contract: 'mercury.cli/v1', ok: true, error: null, meta: { cli_version: '0.3.0-rc.2', protocol_versions: ['v1'] } });
     }
     const capabilities = JSON.parse(capture(home).stdout[0] ?? 'null');
     expect(capabilities).toBeNull();

@@ -65,7 +65,7 @@ if (digest(await readFile(approved)) !== digest(await readFile(delivered)) || di
 const cli = path.join(packageRoot, 'dist/src/bin.js');
 const environment = { ...process.env, HOME: home };
 const version = await execute(process.execPath, [cli, '--version'], { env: environment });
-if (version.stdout.trim() !== '0.3.0-rc.1') throw new Error('installed CLI version mismatch');
+if (version.stdout.trim() !== '0.3.0-rc.2') throw new Error('installed CLI version mismatch');
 for (const command of [
   ['task', 'status', task.identity.task_id, '--json'],
   ['task', 'result', task.identity.task_id, '--json'],

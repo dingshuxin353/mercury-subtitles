@@ -142,7 +142,7 @@ const lockJson = JSON.parse(await readFile(path.join(snapshotRoot, 'package-lock
 const version = (await readFile(path.join(snapshotRoot, 'VERSION'), 'utf8')).trim();
 if (
   packageJson.name !== 'mercury-subtitles' ||
-  packageJson.version !== '0.3.0-rc.1' ||
+  packageJson.version !== '0.3.0-rc.2' ||
   packageJson.version !== version ||
   lockJson.name !== packageJson.name ||
   lockJson.version !== packageJson.version ||
