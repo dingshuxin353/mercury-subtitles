@@ -14,10 +14,12 @@ import {
 } from '../src/contracts/index.js';
 import {
   appendStableJsonLine,
+  DEFAULT_STABLE_JSON_MAX_NODES,
   projectMachineTaskToExchangeResult,
   projectMachineTaskToExchangeTask,
   readStableJson,
   repairTrailingJsonlFragment,
+  TRANSCRIPT_STABLE_JSON_MAX_NODES,
   writeStableJsonAtomic,
 } from '../src/exchange/index.js';
 import type { MachineTaskView } from '../src/background/types.js';
@@ -131,6 +133,41 @@ describe('Exchange Protocol v1 contracts', () => {
     const result = validateExchangeContract('transcript', bad);
     expect(result.valid).toBe(false);
     if (!result.valid) expect(result.issues.map((entry) => entry.path)).toEqual(expect.arrayContaining(['/text', '/segments/1/index', '/segments/1/start_ms', '/segments/0/words/0']));
+  });
+
+  it('accepts a bounded long transcript above the generic 20,000-node budget while generic extensions remain capped', async () => {
+    const long = transcript();
+    long.duration_ms = 9_000;
+    long.segments = Array.from({ length: 441 }, (_, index) => {
+      const start = index * 20;
+      const wordCount = index < 34 ? 10 : 9;
+      return {
+        segment_id: `seg-${index.toString(16).padStart(8, '0')}`,
+        index,
+        start_ms: start,
+        end_ms: start + 19,
+        text: `第${index + 1}段`,
+        words: Array.from({ length: wordCount }, (_entry, wordIndex) => ({
+          text: '字', start_ms: start + wordIndex, end_ms: start + wordIndex + 1, confidence: null,
+        })),
+      };
+    }) as ExchangeTranscriptV1['segments'];
+    long.text = long.segments.map((segment) => segment.text).join('\n');
+    expect(long.segments.reduce((total, segment) => total + segment.words.length, 0)).toBe(4_003);
+    expect(validateExchangeContract('transcript', long).valid).toBe(true);
+
+    const root = await mkdtemp(path.join(os.tmpdir(), 'mercury-exchange-long-transcript-'));
+    roots.push(root);
+    const target = path.join(root, 'transcript.json');
+    await writeStableJsonAtomic(target, long);
+    await expect(readStableJson(target)).rejects.toMatchObject({ code: 'CONTRACT_INVALID' });
+    expect(DEFAULT_STABLE_JSON_MAX_NODES).toBe(20_000);
+    expect(await readStableJson(target, 'CONTRACT_INVALID', { maxNodes: TRANSCRIPT_STABLE_JSON_MAX_NODES })).toEqual(long);
+
+    const generic = request({ extensions: { 'com.example': { values: Array.from({ length: 21_000 }, () => 0) } } });
+    const genericResult = validateExchangeContract('request', generic);
+    expect(genericResult.valid).toBe(false);
+    if (!genericResult.valid) expect(genericResult.issues.some((entry) => entry.message.includes('20,000'))).toBe(true);
   });
 
   it('rejects dictionary identity conflicts and project scope mismatch', () => {

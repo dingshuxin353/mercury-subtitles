@@ -17,7 +17,7 @@ import { legacyAsrEntry } from '../core-integration-v2.js';
 import { normalizeReferenceSrtForCalibration, normalizeVisibleSubtitleText, parseReferenceSrt, runSubtitleCore, type CalibratedTranscript } from '../subtitle-core/index.js';
 import { serializeCalibratedSrt, validateSrtFile } from '../output-report/srt.js';
 import { createTaskId, safeAudioStem, sha256File } from '../tasks.js';
-import { appendStableJsonLine, canonicalJson, readStableJson, repairTrailingJsonlFragment, writeStableJsonAtomic } from './storage.js';
+import { appendStableJsonLine, canonicalJson, readStableJson, repairTrailingJsonlFragment, TRANSCRIPT_STABLE_JSON_MAX_NODES, writeStableJsonAtomic } from './storage.js';
 import { ensureWorkspace } from '../workspace.js';
 import { ensureRuntimeLayout, jsonFingerprint, readJob, readRequest, requestIdHash, reserveRequest, withRequestLease, withTaskTransitionLock, writeJob, writeRequest } from '../background/storage.js';
 import { JOB_CONTRACT_VERSION, REQUEST_CONTRACT_VERSION, type BackgroundJobV1, type BackgroundRequestV1 } from '../background/types.js';
@@ -29,6 +29,8 @@ type ProviderCall = TaskRecordV5['execution']['provider_calls']['chat'];
 export type V5FaultPoint =
   | 'after_dispatch_persisted'
   | 'after_asr_query_checkpointed'
+  | 'before_asr_response_commit'
+  | 'before_chat_response_commit'
   | 'after_response_persisted'
   | 'after_hints_snapshot_written'
   | 'after_dictionary_matches_snapshot_written'
@@ -788,7 +790,7 @@ async function readPinnedEvidence(directory: string, call: ProviderCall, code: s
   if (!call.evidence_ref || !call.evidence_sha256) throw new MercuryError(code, '已持久化 Provider 响应缺少路径或内容 hash。');
   const target = managed(directory, call.evidence_ref);
   if (await sha256File(target).catch(() => null) !== call.evidence_sha256) throw new MercuryError(code, '已持久化 Provider 响应 hash 不一致；不会采纳或重放 Provider。');
-  return readStableJson(target, code);
+  return readStableJson(target, code, { maxNodes: TRANSCRIPT_STABLE_JSON_MAX_NODES });
 }
 
 function assertAsrEvidenceIdentity(candidate: unknown, task: TaskRecordV5, snapshot: ModelSnapshotV3, media: NonNullable<TaskRecordV5['inputs']['media']>, duration: number): TranscriptRaw {
@@ -879,7 +881,7 @@ async function assertCalibrationSourceEvidence(
   const transcriptPath = managed(directory, transcriptSource.path);
   await regular(transcriptPath, 'CALIBRATION_SOURCE_INVALID');
   if (await sha256File(transcriptPath) !== transcriptSource.sha256) throw new MercuryError('CALIBRATION_SOURCE_INVALID', '校准 transcript 来源 hash 不一致；不会调用 Provider。');
-  const pinnedTranscript = await readStableJson(transcriptPath, 'CALIBRATION_SOURCE_INVALID');
+  const pinnedTranscript = await readStableJson(transcriptPath, 'CALIBRATION_SOURCE_INVALID', { maxNodes: TRANSCRIPT_STABLE_JSON_MAX_NODES });
   if (canonicalJson(pinnedTranscript) !== canonicalJson(legacy)) throw new MercuryError('CALIBRATION_SOURCE_INVALID', '校准 transcript 来源与当前任务转录不一致；不会调用 Provider。');
 
   const referenceSource = task.calibration_sources.reference;
@@ -900,7 +902,7 @@ export async function verifyV5CalibrationSources(directory: string, taskInput?: 
   if (await sha256File(managed(directory, task.artifacts.transcript.path)).catch(() => null) !== task.artifacts.transcript.sha256) {
     throw new MercuryError('CALIBRATION_SOURCE_INVALID', '规范化转录来源缺失或 hash 不一致。');
   }
-  const transcript = assertExchangeContract('transcript', await readStableJson(managed(directory, task.artifacts.transcript.path), 'CALIBRATION_SOURCE_INVALID'));
+  const transcript = assertExchangeContract('transcript', await readStableJson(managed(directory, task.artifacts.transcript.path), 'CALIBRATION_SOURCE_INVALID', { maxNodes: TRANSCRIPT_STABLE_JSON_MAX_NODES }));
   const snapshot = await readVerifiedV5ModelSnapshot(directory, task);
   let legacy: TranscriptRaw;
   if (task.input_config.transcription_mode === 'provided') {
@@ -910,7 +912,7 @@ export async function verifyV5CalibrationSources(directory: string, taskInput?: 
   } else {
     const media = task.inputs.media;
     if (!media || !task.calibration_sources.transcript) throw new MercuryError('CALIBRATION_SOURCE_INVALID', 'provider 任务缺少固定的 ASR 校准来源。');
-    const rawCandidate = await readStableJson(managed(directory, task.calibration_sources.transcript.path), 'CALIBRATION_SOURCE_INVALID');
+    const rawCandidate = await readStableJson(managed(directory, task.calibration_sources.transcript.path), 'CALIBRATION_SOURCE_INVALID', { maxNodes: TRANSCRIPT_STABLE_JSON_MAX_NODES });
     const rawValue = validateContract('transcript.raw', rawCandidate);
     if (!rawValue.valid) throw new MercuryError('CALIBRATION_SOURCE_INVALID', rawValue.issues.map((entry) => `${entry.path} ${entry.message}`).join('; '));
     legacy = assertAsrEvidenceIdentity(rawValue.value, task, snapshot, media, rawValue.value.audio.duration_ms);
@@ -1183,6 +1185,58 @@ async function checkpointV5AsrQuery(
   });
 }
 
+async function commitV5ProviderResponse(
+  directory: string,
+  role: 'asr' | 'chat',
+  expectedCallId: string | null,
+  modelSnapshotEntryRef: string,
+  evidenceRef: string,
+  evidenceSha256: string,
+): Promise<TaskRecordV5> {
+  return withTaskTransitionLock(directory, async () => {
+    const current = await readV5Task(directory);
+    const call = current.execution.provider_calls[role];
+    if (
+      call.state === 'response_persisted'
+      && call.outcome === 'response_persisted'
+      && call.call_id === expectedCallId
+      && call.model_snapshot_entry_ref === modelSnapshotEntryRef
+      && call.evidence_ref === evidenceRef
+      && call.evidence_sha256 === evidenceSha256
+    ) return current;
+    if (
+      !['running', 'pausing'].includes(current.status)
+      || expectedCallId === null
+      || call.state !== 'in_flight'
+      || call.outcome !== 'outcome_unknown'
+      || call.call_id !== expectedCallId
+      || call.model_snapshot_entry_ref !== modelSnapshotEntryRef
+      || call.count < 1
+    ) {
+      throw new MercuryError('PROVIDER_RESPONSE_COMMIT_INVALID', `${role} 响应不能提交到当前 Provider 调用。`);
+    }
+    const at = new Date().toISOString();
+    current.execution.provider_calls[role] = {
+      ...call,
+      state: 'response_persisted',
+      outcome: 'response_persisted',
+      evidence_ref: evidenceRef,
+      evidence_sha256: evidenceSha256,
+      response_persisted_at: at,
+      terminal_at: null,
+    };
+    if (role === 'asr') {
+      current.calibration_sources.transcript = { path: evidenceRef, sha256: evidenceSha256, validation: 'passed' };
+      current.execution.safe_checkpoint = 'asr_response_persisted';
+    } else {
+      current.execution.safe_checkpoint = 'chat_response_persisted';
+    }
+    current.updated_at = at;
+    await persistV5Task(directory, current);
+    return current;
+  });
+}
+
 async function prepareProviderTranscript(
   directory: string,
   taskInput: TaskRecordV5,
@@ -1309,14 +1363,15 @@ async function prepareProviderTranscript(
     }
     await writeStableJsonAtomic(path.join(directory, 'work/transcript.raw.json'), raw);
     const evidenceSha256 = await sha256File(path.join(directory, 'work/transcript.raw.json'));
-    task = await readV5Task(directory);
-    task.execution.provider_calls.asr = {
-      ...task.execution.provider_calls.asr, state: 'response_persisted', count: task.execution.provider_calls.asr.count,
-      outcome: 'response_persisted', evidence_ref: 'work/transcript.raw.json', evidence_sha256: evidenceSha256,
-      response_persisted_at: new Date().toISOString(), terminal_at: null,
-    };
-    task.calibration_sources.transcript = { path: 'work/transcript.raw.json', sha256: evidenceSha256, validation: 'passed' };
-    task.execution.safe_checkpoint = 'asr_response_persisted'; await persistV5Task(directory, task);
+    await crashFault(fault, 'before_asr_response_commit', task);
+    task = await commitV5ProviderResponse(
+      directory,
+      'asr',
+      task.execution.provider_calls.asr.call_id ?? null,
+      snapshot.models.asr.snapshot_entry_id,
+      'work/transcript.raw.json',
+      evidenceSha256,
+    );
     await syncAttemptProviderCallFacts(directory, task, 'asr', snapshot.models.asr.snapshot_entry_id);
     await crashFault(fault, 'after_response_persisted', task);
     if (await controlV5AtBoundary(directory)) return null;
@@ -1368,7 +1423,7 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
     task = prepared.task; transcript = prepared.transcript; legacy = prepared.legacy;
   } else {
     if (!task.artifacts.transcript || await sha256File(managed(directory, task.artifacts.transcript.path)) !== task.artifacts.transcript.sha256) throw new MercuryError('TRANSCRIPT_IMPORT_INVALID', '规范化转录缺失或 hash 不一致。');
-    transcript = assertExchangeContract('transcript', await readStableJson(managed(directory, task.artifacts.transcript.path), 'TRANSCRIPT_IMPORT_INVALID'));
+    transcript = assertExchangeContract('transcript', await readStableJson(managed(directory, task.artifacts.transcript.path), 'TRANSCRIPT_IMPORT_INVALID', { maxNodes: TRANSCRIPT_STABLE_JSON_MAX_NODES }));
     legacy = legacyTranscript(task, transcript, snapshot);
   }
   let calibration: CalibrationResultV3 | null = null;
@@ -1467,12 +1522,15 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
         );
         return commitTerminalThenDerive(directory, task, snapshot, calibration, fault);
       }
-      task.execution.provider_calls.chat = {
-        ...task.execution.provider_calls.chat, state: 'response_persisted', count: task.execution.provider_calls.chat.count,
-        outcome: 'response_persisted', evidence_ref: 'work/calibration-response.json', evidence_sha256: evidenceSha256,
-        response_persisted_at: new Date().toISOString(), terminal_at: null,
-      };
-      task.execution.safe_checkpoint = 'chat_response_persisted'; await persistV5Task(directory, task);
+      await crashFault(fault, 'before_chat_response_commit', task);
+      task = await commitV5ProviderResponse(
+        directory,
+        'chat',
+        task.execution.provider_calls.chat.call_id ?? null,
+        snapshot.models.chat.snapshot_entry_id,
+        'work/calibration-response.json',
+        evidenceSha256,
+      );
       await syncAttemptProviderCallFacts(directory, task, 'chat', snapshot.models.chat.snapshot_entry_id);
       await crashFault(fault, 'after_response_persisted', task);
       {

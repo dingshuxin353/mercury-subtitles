@@ -6,11 +6,11 @@ import { describe, expect, it, vi } from 'vitest';
 import { ensureWorkspace } from '../src/workspace.js';
 import { loadModelRegistryV2 } from '../src/models-v2.js';
 import { runWorker } from '../src/background/worker.js';
-import { appendV5Event, auditV5Job, cancelV5Task, claimV5Job, executeV5Retry, pauseV5Task, persistV5Task, planV5Retry, readV5Events, readV5Task, resumeV5Task, submitExchangeRequest } from '../src/exchange/runtime.js';
+import { appendV5Event, auditV5Job, cancelV5Task, claimV5Job, executeV5Retry, heartbeatV5Task, pauseV5Task, persistV5Task, planV5Retry, readV5Events, readV5Task, resumeV5Task, submitExchangeRequest } from '../src/exchange/runtime.js';
 import { assertStableReviewReady, findTaskReadOnly, stablePauseTask, stableTaskResult, stableTaskView } from '../src/stable-cli/tasks.js';
 import { createDictionary, makeDictionaryEntry, mutateDictionary } from '../src/dictionary.js';
 import { runCli } from '../src/cli.js';
-import type { AsrAdapter, AsrHintsCapableAdapter, ExchangeRequestV1 } from '../src/contracts/index.js';
+import type { AsrAdapter, AsrHintsCapableAdapter, ExchangeRequestV1, TranscriptRaw } from '../src/contracts/index.js';
 import { VolcengineAsrAdapter } from '../src/adapters/volcengine-asr.js';
 import { VolcengineSubtitleAsrAdapter } from '../src/adapters/volcengine-subtitle-asr.js';
 import { canonicalJson } from '../src/exchange/storage.js';
@@ -868,6 +868,119 @@ describe('Exchange v1 external transcript task', () => {
       expect(calls).toEqual(['subtitle-submit', 'subtitle-query']);
     }
   });
+
+  it('commits ASR and Chat responses monotonically when a heartbeat advances the task revision first', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'response-heartbeat-race.mp3');
+    const bytes = Buffer.alloc(417 * 80);
+    for (let offset = 0; offset < bytes.length; offset += 417) bytes.set([0xff, 0xfb, 0x90, 0x64], offset);
+    await writeFile(audio, bytes);
+    const registry = await loadModelRegistryV2(input.workspace);
+    const submitted = await submitExchangeRequest(input.workspace, {
+      ...input.request,
+      request_id: 'request-response-heartbeat-race',
+      inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: null },
+      transcription_mode: 'provider',
+      models: { asr: registry.defaults.asr, chat: registry.defaults.chat },
+    });
+    const calls: string[] = [];
+    const twoStageAsr: AsrAdapter = {
+      adapterId: 'volcengine_subtitle_asr',
+      async run(adapterInput) {
+        await adapterInput.beforeProviderDispatch?.('volcengine_subtitle_submit');
+        calls.push('subtitle-submit');
+        await adapterInput.beforeProviderDispatch?.('volcengine_subtitle_query');
+        calls.push('subtitle-query');
+        const { beforeProviderDispatch: _checkpoint, ...withoutCheckpoint } = adapterInput;
+        return fixtureAsr([]).run(withoutCheckpoint);
+      },
+    };
+    const raced = new Set<string>();
+    await runWorker(input.workspace, { asrAdapter: twoStageAsr, fetch: fixtureFetch(calls), readCredential: async () => 'fixture-secret' }, {
+      v5Fault: async (point, task) => {
+        if (!['before_asr_response_commit', 'before_chat_response_commit'].includes(point) || raced.has(point)) return;
+        raced.add(point);
+        await heartbeatV5Task(input.workspace, task.identity.task_id, task.execution.worker_id!, new Date(Date.now() + 5_000).toISOString());
+      },
+    });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const task = await readV5Task(directory);
+    expect(task.status, JSON.stringify(task.error)).toBe('completed');
+    expect(task.execution.provider_calls).toMatchObject({
+      asr: { state: 'terminal', count: 1, outcome: 'response_persisted' },
+      chat: { state: 'terminal', count: 1, outcome: 'response_persisted' },
+    });
+    expect(raced).toEqual(new Set(['before_asr_response_commit', 'before_chat_response_commit']));
+    expect(calls).toEqual(['subtitle-submit', 'subtitle-query', 'chat']);
+    const facts = (await readFile(path.join(directory, 'attempts.jsonl'), 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    for (const role of ['asr', 'chat']) {
+      const roleFacts = facts.filter((entry) => entry.contract === 'mercury.provider-call/v1' && entry.role === role);
+      expect(roleFacts.map((entry) => entry.phase)).toEqual(['dispatched', 'response_persisted', 'terminal']);
+      expect(new Set(roleFacts.map((entry) => entry.call_id)).size).toBe(1);
+    }
+  });
+
+  it('projects a 441-segment and 4,003-word ASR artifact before Chat without exceeding stable resource limits', async () => {
+    const input = await prepared();
+    const audio = path.join(input.home, 'long-transcript-resource.mp3');
+    const bytes = Buffer.alloc(417 * 500);
+    for (let offset = 0; offset < bytes.length; offset += 417) bytes.set([0xff, 0xfb, 0x90, 0x64], offset);
+    await writeFile(audio, bytes);
+    const registry = await loadModelRegistryV2(input.workspace);
+    const submitted = await submitExchangeRequest(input.workspace, {
+      ...input.request,
+      request_id: 'request-long-transcript-resource',
+      inputs: { media: { path: audio, sha256: sha(bytes), mime_type: 'audio/mpeg' }, transcript: null },
+      transcription_mode: 'provider',
+      models: { asr: registry.defaults.asr, chat: registry.defaults.chat },
+    });
+    const calls: string[] = [];
+    const longAsr: AsrAdapter = {
+      adapterId: 'volcengine_subtitle_asr',
+      async run(adapterInput) {
+        await adapterInput.beforeProviderDispatch?.('volcengine_subtitle_submit');
+        calls.push('subtitle-submit');
+        await adapterInput.beforeProviderDispatch?.('volcengine_subtitle_query');
+        calls.push('subtitle-query');
+        const at = new Date().toISOString();
+        const segments = Array.from({ length: 441 }, (_, index) => {
+          const start = index * 20;
+          const wordCount = index < 34 ? 10 : 9;
+          return {
+            segment_id: `seg-long-${index.toString().padStart(4, '0')}`,
+            index, start_ms: start, end_ms: start + 19, text: `第${index + 1}段`, confidence: null,
+            words: Array.from({ length: wordCount }, (_entry, wordIndex) => ({
+              word_id: `word-${index.toString().padStart(4, '0')}-${wordIndex.toString().padStart(2, '0')}`,
+              index: wordIndex,
+              text: '字', start_ms: start + wordIndex, end_ms: start + wordIndex + 1, confidence: null,
+            })),
+          };
+        }) as unknown as TranscriptRaw['segments'];
+        return { kind: 'artifact', artifact: {
+          schema_version: '1.0.0', task_id: adapterInput.taskId, created_at: at,
+          audio: { path_ref: adapterInput.audio.pathRef, sha256: adapterInput.audio.sha256, duration_ms: adapterInput.audio.durationMs, language: 'zh-CN', mime_type: 'audio/mpeg' },
+          full_text: segments.map((segment) => segment.text).join('\n'), segments,
+          model_snapshot_ref: adapterInput.modelSnapshotRef,
+          call: { call_id: 'fixture-long-asr', model_snapshot_entry_ref: adapterInput.model.snapshot_entry_id, started_at: at, ended_at: at, outcome: 'completed', error_ref: null },
+          raw_response_ref: null, warnings: [], errors: [],
+        } };
+      },
+    };
+    await runWorker(input.workspace, { asrAdapter: longAsr, chatRuntime: knownFailureChat(calls) });
+    const directory = path.join(input.workspace, 'tasks', submitted.task.identity.task_directory);
+    const task = await readV5Task(directory);
+    expect(task.status).toBe('failed');
+    expect(task.error?.code, JSON.stringify(task.error)).toBe('FIXTURE_KNOWN_CHAT');
+    expect(task.execution.provider_calls).toMatchObject({
+      asr: { state: 'terminal', count: 1, outcome: 'response_persisted' },
+      chat: { state: 'terminal', count: 1, outcome: 'known_terminal' },
+    });
+    expect(task.artifacts.transcribed).not.toBeNull();
+    expect(calls).toEqual(['subtitle-submit', 'subtitle-query', 'chat']);
+    const normalized = JSON.parse(await readFile(path.join(directory, 'work/transcript.normalized.json'), 'utf8'));
+    expect(normalized.segments).toHaveLength(441);
+    expect(normalized.segments.reduce((total: number, segment: any) => total + segment.words.length, 0)).toBe(4_003);
+  }, 60_000);
 
   it('rejects non-MP3 media at stable request preflight without creating a task or Provider call', async () => {
     const input = await prepared();

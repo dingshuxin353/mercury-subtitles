@@ -4,6 +4,9 @@ import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm } from 'node:
 import path from 'node:path';
 import { MercuryError } from '../errors.js';
 
+export const DEFAULT_STABLE_JSON_MAX_NODES = 20_000;
+export const TRANSCRIPT_STABLE_JSON_MAX_NODES = 500_000;
+
 export function canonicalJson(value: unknown): string {
   const seen = new Set<object>();
   const normalize = (candidate: unknown): unknown => {
@@ -45,7 +48,11 @@ export async function writeStableJsonAtomic(filePath: string, value: unknown): P
   }
 }
 
-export async function readStableJson(filePath: string, errorCode = 'CONTRACT_INVALID'): Promise<unknown> {
+export async function readStableJson(
+  filePath: string,
+  errorCode = 'CONTRACT_INVALID',
+  options: { maxNodes?: number } = {},
+): Promise<unknown> {
   try {
     const entry = await lstat(filePath);
     if (!entry.isFile() || entry.isSymbolicLink()) throw new Error('not regular');
@@ -53,12 +60,13 @@ export async function readStableJson(filePath: string, errorCode = 'CONTRACT_INV
     const source = await readFile(filePath, 'utf8');
     if (!source.endsWith('\n')) throw new Error('missing newline');
     const parsed = JSON.parse(source) as unknown;
+    const maxNodes = options.maxNodes ?? DEFAULT_STABLE_JSON_MAX_NODES;
     const queue: Array<{ value: unknown; depth: number }> = [{ value: parsed, depth: 0 }];
     let nodes = 0;
     while (queue.length > 0) {
       const current = queue.pop()!;
       nodes += 1;
-      if (nodes > 20_000 || current.depth > 20) throw new Error('stable json resource limit exceeded');
+      if (nodes > maxNodes || current.depth > 20) throw new Error('stable json resource limit exceeded');
       if (Array.isArray(current.value)) current.value.forEach((value) => queue.push({ value, depth: current.depth + 1 }));
       else if (typeof current.value === 'object' && current.value !== null) Object.values(current.value).forEach((value) => queue.push({ value, depth: current.depth + 1 }));
     }

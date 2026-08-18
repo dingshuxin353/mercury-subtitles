@@ -70,15 +70,22 @@ function issue(path: string, message: string): ExchangeValidationIssue {
   return { path, message };
 }
 
-export function exchangeJsonResourceIssues(value: unknown): ExchangeValidationIssue[] {
+export const DEFAULT_EXCHANGE_JSON_MAX_NODES = 20_000;
+export const TRANSCRIPT_EXCHANGE_JSON_MAX_NODES = 500_000;
+
+export function exchangeJsonResourceIssues(
+  value: unknown,
+  options: { maxNodes?: number } = {},
+): ExchangeValidationIssue[] {
   const issues: ExchangeValidationIssue[] = [];
   const queue: Array<{ value: unknown; path: string; depth: number }> = [{ value, path: '/', depth: 0 }];
+  const maxNodes = options.maxNodes ?? DEFAULT_EXCHANGE_JSON_MAX_NODES;
   let nodes = 0;
   let stringBytes = 0;
   while (queue.length > 0) {
     const current = queue.pop()!;
     nodes += 1;
-    if (nodes > 20_000) { issues.push(issue(current.path, '合同 JSON 节点总量超过 20,000')); break; }
+    if (nodes > maxNodes) { issues.push(issue(current.path, `合同 JSON 节点总量超过 ${maxNodes.toLocaleString('en-US')}`)); break; }
     if (current.depth > 20) { issues.push(issue(current.path, '合同 JSON 递归深度超过 20')); continue; }
     if (typeof current.value === 'string') {
       stringBytes += Buffer.byteLength(current.value, 'utf8');
@@ -231,7 +238,9 @@ export function validateExchangeContract<N extends ExchangeContractName>(
   name: N,
   value: unknown,
 ): ExchangeValidationResult<ExchangeContractTypeMap[N]> {
-  const resources = exchangeJsonResourceIssues(value);
+  const resources = exchangeJsonResourceIssues(value, {
+    maxNodes: name === 'transcript' ? TRANSCRIPT_EXCHANGE_JSON_MAX_NODES : DEFAULT_EXCHANGE_JSON_MAX_NODES,
+  });
   if (resources.length > 0) return { valid: false, value: null, issues: resources };
   const security = sensitiveInformationIssues(value).map((entry) => issue(entry.path, entry.message));
   if (security.length > 0) return { valid: false, value: null, issues: security };
