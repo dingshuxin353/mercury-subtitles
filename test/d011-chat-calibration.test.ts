@@ -14,12 +14,17 @@ import type {
   ModelCapabilityProfileV2,
   ModelConfigRegistryV2,
   ModelConfigV2,
+  TranscriptRaw,
 } from '../src/contracts/index.js';
 import { computeModelConfigFingerprintV2 } from '../src/contracts/index.js';
 import { createCalibrationTaskV2, readTaskRecordV2 } from '../src/tasks-v2.js';
 import { executeCalibrationTaskV2 } from '../src/core-integration-v2.js';
 import { runCli } from '../src/cli.js';
 import { ensureWorkspace } from '../src/workspace.js';
+import {
+  calibrationBaseOutputBudget,
+  calibrationOutputBudget,
+} from '../src/adapters/chat-calibration-v2.js';
 
 const roots: string[] = [];
 const TIMED_TEXT = ['您好世界，和平发展。', '共同创造美好未来。'] as const;
@@ -258,6 +263,51 @@ function timedAsr(): AsrAdapter {
     },
   };
 }
+function manyUnitAsr(unitCount: number): AsrAdapter {
+  return {
+    adapterId: 'volcengine_asr',
+    async run(input) {
+      const segments = Array.from({ length: unitCount }, (_, index) => ({
+        segment_id: `seg-${index + 1}`,
+        index,
+        start_ms: index * 2,
+        end_ms: index === unitCount - 1 ? input.audio.durationMs : (index + 1) * 2,
+        text: `单元${index + 1}`,
+        confidence: 0.99,
+        words: [],
+      })) as unknown as TranscriptRaw['segments'];
+      return {
+        kind: 'artifact',
+        artifact: {
+          schema_version: '1.0.0',
+          task_id: input.taskId,
+          created_at: '2030-01-01T00:00:01.000Z',
+          audio: {
+            path_ref: input.audio.pathRef,
+            sha256: input.audio.sha256,
+            duration_ms: input.audio.durationMs,
+            language: 'zh-CN',
+            mime_type: 'audio/mpeg',
+          },
+          full_text: segments.map((segment) => segment.text).join('\n'),
+          segments,
+          model_snapshot_ref: input.modelSnapshotRef,
+          call: {
+            call_id: 'call-asr-many',
+            model_snapshot_entry_ref: input.model.snapshot_entry_id,
+            started_at: '2030-01-01T00:00:00.000Z',
+            ended_at: '2030-01-01T00:00:01.000Z',
+            outcome: 'completed',
+            error_ref: null,
+          },
+          raw_response_ref: null,
+          warnings: [],
+          errors: [],
+        },
+      };
+    },
+  };
+}
 function promptPayload(prompt: string) {
   return JSON.parse(prompt.slice(prompt.lastIndexOf('\n') + 1)) as {
     calibration_units: Array<{ unit_id: string; original_text: string }>;
@@ -299,6 +349,83 @@ afterEach(async () => {
 });
 
 describe('V01-D011 C01-C09/C11', () => {
+  it('assigns an auditable Gemini-only output reserve and caps the total budget', () => {
+    expect(calibrationBaseOutputBudget(20)).toBe(4_096);
+    expect(calibrationOutputBudget(20, 'non_gemini')).toBe(4_096);
+    expect(calibrationOutputBudget(20, 'gemini')).toBe(12_288);
+    expect(calibrationBaseOutputBudget(160)).toBe(25_600);
+    expect(calibrationOutputBudget(160, 'gemini')).toBe(32_768);
+    expect(calibrationOutputBudget(10_000, 'gemini')).toBe(32_768);
+  });
+  it.each(['vertex_ai', 'developer_api'] as const)(
+    'sends and records 12288 tokens for a 20-unit Gemini %s request',
+    async (connection) => {
+      const input = await prepared(model('chat-gemini', 'chat', 'gemini', AUDIO, connection));
+      const srt = path.join(input.root, `twenty-${connection}.srt`);
+      const cues = Array.from({ length: 20 }, (_, index) => {
+        const start = index * 2;
+        const end = index === 19 ? 52 : (index + 1) * 2;
+        const stamp = (milliseconds: number) =>
+          `00:00:00,${String(milliseconds).padStart(3, '0')}`;
+        return `${index + 1}\n${stamp(start)} --> ${stamp(end)}\n单元${index + 1}`;
+      }).join('\n\n');
+      await writeFile(srt, `${cues}\n`);
+      const requests: any[] = [];
+      const complete = (request: any) => {
+        const sentPrompt = connection === 'developer_api'
+          ? request.input[0].text
+          : request.contents[0].parts[0].text;
+        return completeFromPrompt(sentPrompt);
+      };
+      const task = await createCalibrationTaskV2({
+        workspaceRoot: input.workspace,
+        audioPath: input.audio,
+        srtPath: srt,
+        mode: 'text-only',
+      });
+      const root = await taskDir(input.workspace, task);
+      const done = await executeCalibrationTaskV2(root, {
+        asrAdapter: manyUnitAsr(20),
+        captureRequest: (request) => requests.push(request),
+        readCredential: async () => 'fixture-key',
+        createDeveloperClient: () => ({
+          interactions: {
+            create: async (request: any) => ({
+              id: 'gemini-developer-20',
+              output_text: complete(request),
+              finishReason: 'STOP',
+            }),
+          },
+          models: { generateContent: async () => ({}) },
+        }),
+        createVertexClient: () => ({
+          interactions: { create: async () => ({}) },
+          models: {
+            generateContent: async (request: any) => ({
+              responseId: 'gemini-vertex-20',
+              text: complete(request),
+              finishReason: 'STOP',
+            }),
+          },
+        }),
+      });
+
+      expect(done.execution.status, JSON.stringify(done.error)).toBe('completed');
+      expect(requests).toHaveLength(1);
+      if (connection === 'developer_api') {
+        expect(requests[0].max_output_tokens).toBe(12_288);
+      } else {
+        expect(requests[0].config.maxOutputTokens).toBe(12_288);
+      }
+      const result = JSON.parse(await readFile(path.join(root, 'work/calibration-result.json'), 'utf8'));
+      expect(result.strategy).toMatchObject({
+        output_budget_tokens: 12_288,
+        input_unit_count: 20,
+        returned_unit_count: 20,
+        coverage_complete: true,
+      });
+    },
+  );
   it('maps Vertex permission failures to an actionable redacted error', async () => {
     const input = await prepared(model('chat-gemini', 'chat', 'gemini', AUDIO));
     const task = await createCalibrationTaskV2({
@@ -359,6 +486,45 @@ describe('V01-D011 C01-C09/C11', () => {
     expect(result.provider_outcome_certainty).toBe('known_terminal');
     expect(result.errors[0].retryable).toBe(retryable);
   });
+  it('keeps a Gemini MAX_TOKENS response known-terminal with the actual sent budget', async () => {
+    const input = await prepared(model('chat-gemini', 'chat', 'gemini', AUDIO));
+    const requests: any[] = [];
+    const generateContent = vi.fn(async () => ({
+      text: '{"corrected_units":[',
+      responseId: 'gemini-max-tokens',
+      finishReason: 'MAX_TOKENS',
+    }));
+    const task = await createCalibrationTaskV2({ workspaceRoot: input.workspace, audioPath: input.audio });
+    const root = await taskDir(input.workspace, task);
+    const done = await executeCalibrationTaskV2(root, {
+      asrAdapter: asr(),
+      captureRequest: (request) => requests.push(request),
+      createVertexClient: () => ({
+        interactions: { create: async () => ({}) },
+        models: { generateContent },
+      }),
+    });
+
+    expect(generateContent).toHaveBeenCalledTimes(1);
+    expect(requests).toHaveLength(1);
+    expect(requests[0].config.maxOutputTokens).toBe(12_288);
+    expect(done.execution.status).toBe('failed');
+    expect(done.error?.code).toBe('CALIBRATION_RESPONSE_TRUNCATED');
+    expect(done.artifacts.outputs).toEqual(['output/source.transcribed.srt']);
+    const result = JSON.parse(await readFile(path.join(root, 'work/calibration-result.json'), 'utf8'));
+    expect(result).toMatchObject({
+      status: 'failed',
+      provider_outcome_certainty: 'known_terminal',
+      strategy: {
+        output_budget_tokens: 12_288,
+        provider_finish_reason: 'MAX_TOKENS',
+        returned_unit_count: 0,
+        coverage_complete: false,
+      },
+    });
+    await expect(readFile(path.join(root, 'output/source.calibrated.srt'))).rejects.toThrow();
+    await expect(readFile(path.join(root, 'output/source.approved.srt'))).rejects.toThrow();
+  });
   it('C01 uses one selected ASR and one text Chat call without a verification stage or artifact', async () => {
     const input = await prepared(
       model('chat-text', 'chat', 'openai_chat_completions', TEXT),
@@ -404,6 +570,7 @@ describe('V01-D011 C01-C09/C11', () => {
       strategy: {
         prompt_version: 'mercury-alpha3-full-calibration-v2',
         response_contract_version: 'corrected-units-v1',
+        output_budget_tokens: 4_096,
         input_unit_count: 1,
         returned_unit_count: 1,
         coverage_complete: true,
@@ -662,7 +829,7 @@ describe('V01-D011 C01-C09/C11', () => {
     expect(done.execution.status).toBe('completed');
     expect(create).toHaveBeenCalledTimes(1);
     expect(requests).toHaveLength(1);
-    expect(requests[0]).toMatchObject({ store: false });
+    expect(requests[0]).toMatchObject({ store: false, max_output_tokens: 12_288 });
     expect(requests[0].input).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ type: 'text' }),
@@ -678,6 +845,7 @@ describe('V01-D011 C01-C09/C11', () => {
       input_modalities: ['text', 'audio'],
       audio: { bytes: 15_000_000 },
     });
+    expect(result.strategy.output_budget_tokens).toBe(12_288);
   });
   it('C03 uses one multimodal Vertex call and text-only preserves segment count, order, and every timestamp', async () => {
     const input = await prepared(model('chat-gemini', 'chat', 'gemini', AUDIO));
@@ -721,14 +889,16 @@ describe('V01-D011 C01-C09/C11', () => {
     expect(generateContent).toHaveBeenCalledTimes(1);
     expect(requests).toHaveLength(1);
     expect(JSON.stringify(requests[0])).toContain('inlineData');
+    expect(requests[0].config.maxOutputTokens).toBe(12_288);
     const sentPrompt = requests[0].contents[0].parts.find((part: any) => typeof part.text === 'string').text;
     const sentUnit = promptPayload(sentPrompt).calibration_units[0]!;
-    expect(sentUnit.original_text).toBe('您好世界， 和平发展。');
+    expect(sentUnit.original_text).toBe('您好世界，和平发展。');
     expect(sentUnit.original_text).not.toMatch(/[\r\n]/u);
     const result = JSON.parse(
       await readFile(path.join(root, 'work/calibration-result.json'), 'utf8'),
     );
     expect(result.request.evidence_mode).toBe('audio_multimodal');
+    expect(result.strategy.output_budget_tokens).toBe(12_288);
     const calibrated = JSON.parse(
       await readFile(
         path.join(root, 'work/transcript.calibrated.json'),
@@ -743,11 +913,11 @@ describe('V01-D011 C01-C09/C11', () => {
         item.text,
       ]),
     ).toEqual([
-      [0, 0, 26, '您好世界，和平与共同发展。'],
+      [0, 0, 26, '您好世界 和平与共同发展'],
       [1, 26, 52, '美好未来'],
     ]);
   });
-  it('C04 maps a complete reference unit onto traceable ASR timing and allowed splits', async () => {
+  it('C04 keeps transcribed units authoritative when reference uses one joined cue', async () => {
     const input = await prepared(model('chat-gemini', 'chat', 'gemini', AUDIO));
     const srt = path.join(input.root, 'source.srt');
     await writeFile(srt, REFERENCE_JOINED);
@@ -785,23 +955,13 @@ describe('V01-D011 C01-C09/C11', () => {
       evidence_mode: 'audio_multimodal',
     });
     expect(result.strategy).toMatchObject({
-      input_unit_count: 1,
-      returned_unit_count: 1,
+      input_unit_count: 2,
+      returned_unit_count: 2,
       coverage_complete: true,
     });
     expect(calibrated.segments).toHaveLength(2);
-    expect(calibrated.modifications).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: 'split',
-          start_ms: 0,
-          end_ms: 52,
-          evidence: expect.objectContaining({
-            asr_segment_refs: expect.arrayContaining(['seg-1', 'seg-2']),
-          }),
-        }),
-      ]),
-    );
+    expect(calibrated.segments.map((segment: any) => [segment.start_ms, segment.end_ms])).toEqual([[0, 26], [26, 52]]);
+    expect(calibrated.modifications.filter((item: any) => ['split', 'merge', 'segmentation', 'timing_adjustment'].includes(item.type))).toEqual([]);
   });
   it('C05/C06 freezes explicit non-default selections and historical artifacts after defaults change', async () => {
     const defaultChat = model(

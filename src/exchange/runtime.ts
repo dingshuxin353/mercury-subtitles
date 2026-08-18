@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
 import { chmod, copyFile, lstat, mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
-import type { AsrAdapter, AsrHintsCapableAdapter, AsrHintsDispatchEvidence, CalibrationResult, CalibrationResultV3, ExchangeEventV1, ExchangeRequestV1, ExchangeResultV1, ExchangeTaskV1, ExchangeTranscriptV1, ModelSnapshotEntryV2, TranscriptRaw } from '../contracts/index.js';
+import type { AsrAdapter, AsrHintsCapableAdapter, AsrHintsDispatchEvidence, CalibrationResult, CalibrationResultV3, ExchangeEventV1, ExchangeRequestV1, ExchangeResultV1, ExchangeRetryPlanV1, ExchangeTaskV1, ExchangeTranscriptV1, ModelSnapshotEntryV2, TranscriptRaw } from '../contracts/index.js';
 import type { TaskRecordV5 } from '../contracts/generated/task-record-v5.js';
 import { assertExchangeContract, validateContract, validateV3CalibrationResult } from '../contracts/index.js';
 import { assertV5TaskRecord } from '../contracts/v5.js';
@@ -14,10 +14,10 @@ import { CHAT_INLINE_AUDIO_LIMIT_BYTES, createChatCalibrationRuntimeV2, type Cha
 import { VolcengineAsrAdapter, type ResolvedVolcengineCredential } from '../adapters/volcengine-asr.js';
 import { VolcengineSubtitleAsrAdapter } from '../adapters/volcengine-subtitle-asr.js';
 import { legacyAsrEntry } from '../core-integration-v2.js';
-import { normalizeReferenceSrtForCalibration, parseReferenceSrt, runSubtitleCore, type CalibratedTranscript } from '../subtitle-core/index.js';
+import { normalizeReferenceSrtForCalibration, normalizeVisibleSubtitleText, parseReferenceSrt, runSubtitleCore, SEGMENTATION_POLICY_VERSION, VISIBLE_SUBTITLE_STYLE_VERSION, type CalibratedTranscript } from '../subtitle-core/index.js';
 import { serializeCalibratedSrt, validateSrtFile } from '../output-report/srt.js';
 import { createTaskId, safeAudioStem, sha256File } from '../tasks.js';
-import { appendStableJsonLine, canonicalJson, readStableJson, writeStableJsonAtomic } from './storage.js';
+import { appendStableJsonLine, canonicalJson, readStableJson, repairTrailingJsonlFragment, TRANSCRIPT_STABLE_JSON_MAX_NODES, writeStableJsonAtomic } from './storage.js';
 import { ensureWorkspace } from '../workspace.js';
 import { ensureRuntimeLayout, jsonFingerprint, readJob, readRequest, requestIdHash, reserveRequest, withRequestLease, withTaskTransitionLock, writeJob, writeRequest } from '../background/storage.js';
 import { JOB_CONTRACT_VERSION, REQUEST_CONTRACT_VERSION, type BackgroundJobV1, type BackgroundRequestV1 } from '../background/types.js';
@@ -28,11 +28,21 @@ import { sensitiveTextIssues } from '../contracts/validation/security.js';
 type ProviderCall = TaskRecordV5['execution']['provider_calls']['chat'];
 export type V5FaultPoint =
   | 'after_dispatch_persisted'
+  | 'after_asr_query_checkpointed'
+  | 'before_asr_response_commit'
+  | 'before_chat_response_commit'
   | 'after_response_persisted'
   | 'after_hints_snapshot_written'
   | 'after_dictionary_matches_snapshot_written'
   | 'after_terminal_report_written'
   | 'after_terminal_report_committed'
+  | 'after_pause_task_committed'
+  | 'after_pause_job_committed'
+  | 'after_resume_task_committed'
+  | 'after_resume_job_committed'
+  | 'after_retry_ledger_appended'
+  | 'after_retry_task_committed'
+  | 'after_retry_job_committed'
   | 'terminal_task_before_result';
 export class SimulatedV5Crash extends Error {
   constructor(readonly point: V5FaultPoint | 'after_claim' | 'after_execute' | 'after_review' | 'before_finish', readonly cause: unknown) {
@@ -94,6 +104,33 @@ async function readVerifiedMediaBytes(directory: string, media: NonNullable<Task
   }
 }
 
+async function verifyV5ImmutableInputs(directory: string, task: TaskRecordV5): Promise<void> {
+  if (task.inputs.media) await readVerifiedMediaBytes(directory, task.inputs.media);
+  if (task.inputs.transcript_source) {
+    const source = managed(directory, task.inputs.transcript_source.workspace_path);
+    await regular(source, 'TRANSCRIPT_IMPORT_INVALID');
+    if (await sha256File(source) !== task.inputs.transcript_source.sha256) throw new MercuryError('TRANSCRIPT_IMPORT_INVALID', '外部转录任务副本 hash 不一致。');
+  }
+  if (task.inputs.reference) {
+    const source = managed(directory, task.inputs.reference.workspace_path);
+    await regular(source, 'REFERENCE_INPUT_INVALID');
+    if (await sha256File(source) !== task.inputs.reference.sha256) throw new MercuryError('REFERENCE_INPUT_INVALID', '参考字幕任务副本 hash 不一致。');
+    if (!task.inputs.reference_normalized) throw new MercuryError('REFERENCE_INPUT_INVALID', '参考字幕缺少规范化快照。');
+    const normalized = managed(directory, task.inputs.reference_normalized.path);
+    await regular(normalized, 'REFERENCE_INPUT_INVALID');
+    if (await sha256File(normalized) !== task.inputs.reference_normalized.sha256) throw new MercuryError('REFERENCE_INPUT_INVALID', '规范化参考字幕 hash 不一致。');
+  }
+}
+
+async function verifyInternalArtifact(directory: string, artifactValue: TaskRecordV5['artifacts']['transcript'], code: string): Promise<void> {
+  if (!artifactValue) throw new MercuryError(code, '安全恢复所需的任务产物不存在。');
+  const target = managed(directory, artifactValue.path);
+  const entry = await lstat(target).catch(() => null);
+  if (!entry?.isFile() || entry.isSymbolicLink() || await sha256File(target) !== artifactValue.sha256) {
+    throw new MercuryError(code, '安全恢复所需的任务产物缺失、不是普通文件或 hash 不一致。');
+  }
+}
+
 export async function readV5Task(directory: string): Promise<TaskRecordV5> {
   const root = path.resolve(directory);
   const parent = await lstat(path.dirname(root)).catch(() => null);
@@ -123,16 +160,30 @@ export async function persistV5Task(directory: string, task: TaskRecordV5): Prom
         Object.assign(task, structuredClone(current));
         return;
       }
-      if (TERMINAL.has(current.status) && checked.status !== current.status) {
+      const startsRetryAttempt = ['failed', 'interrupted'].includes(current.status)
+        && checked.status === 'queued'
+        && checked.execution.attempt_count === current.execution.attempt_count + 1
+        && checked.execution.attempt_id !== current.execution.attempt_id;
+      const retryableProviderFact = Object.values(current.execution.provider_calls).some((call) => call.outcome === 'known_terminal')
+        || Object.values(current.execution.provider_calls).every((call) => call.state === 'not_started' && call.outcome === 'not_dispatched');
+      if (startsRetryAttempt && (!current.execution.control
+        || !checked.execution.control
+        || !checked.execution.attempt_id?.startsWith('att-retry-')
+        || (checked.execution.control.retry_count ?? 0) !== (current.execution.control.retry_count ?? 0) + 1
+        || !retryableProviderFact
+        || Object.values(current.execution.provider_calls).some((call) => call.state === 'in_flight' || call.state === 'response_persisted' || call.outcome === 'outcome_unknown'))) {
+        throw new MercuryError('RETRY_UNSAFE_PROVIDER_OUTCOME', '当前任务不满足安全 retry 的持久化前置条件。');
+      }
+      if (TERMINAL.has(current.status) && current.status !== 'interrupted' && checked.status !== current.status && !startsRetryAttempt) {
         throw new MercuryError('TASK_STATE_TRANSITION_INVALID', `任务终态不可从 ${current.status} 改写为 ${checked.status}。`);
       }
       const allowed: Record<string, Set<string>> = {
-        queued: new Set(['queued', 'running', 'cancelled', 'failed']),
-        running: new Set(['running', 'queued', 'completed', 'failed', 'cancelled', 'interrupted', 'needs_input']),
+        queued: new Set(['queued', 'running', 'paused', 'cancelled', 'failed']),
+        running: new Set(['running', 'pausing', 'paused', 'queued', 'completed', 'failed', 'cancelled', 'interrupted', 'needs_input']),
         pausing: new Set(['pausing', 'paused', 'cancelled', 'interrupted']),
         paused: new Set(['paused', 'queued', 'cancelled']),
-        needs_input: new Set(['needs_input']), completed: new Set(['completed']), failed: new Set(['failed']),
-        cancelled: new Set(['cancelled']), interrupted: new Set(['interrupted']),
+        needs_input: new Set(['needs_input']), completed: new Set(['completed']), failed: new Set(['failed', 'queued']),
+        cancelled: new Set(['cancelled']), interrupted: new Set(['interrupted', 'queued']),
       };
       if (!allowed[current.status]?.has(checked.status)) {
         throw new MercuryError('TASK_STATE_TRANSITION_INVALID', `任务状态不可从 ${current.status} 转换为 ${checked.status}。`);
@@ -141,17 +192,24 @@ export async function persistV5Task(directory: string, task: TaskRecordV5): Prom
       for (const role of ['asr', 'chat'] as const) {
         const before = current.execution.provider_calls[role];
         const after = checked.execution.provider_calls[role];
-        if (callRank[after.state] < callRank[before.state] || after.count < before.count) {
+        if ((!startsRetryAttempt && callRank[after.state] < callRank[before.state]) || after.count < before.count) {
           throw new MercuryError('PROVIDER_CHECKPOINT_REGRESSION', `${role} Provider 检查点不可回退。`);
         }
-        if (before.evidence_sha256 && (after.evidence_sha256 !== before.evidence_sha256 || after.evidence_ref !== before.evidence_ref)) {
+        if (!startsRetryAttempt && before.evidence_sha256 && (after.evidence_sha256 !== before.evidence_sha256 || after.evidence_ref !== before.evidence_ref)) {
           throw new MercuryError('PROVIDER_EVIDENCE_IMMUTABLE', `${role} 已固定的 Provider 响应证据不可替换。`);
+        }
+        if (!startsRetryAttempt) {
+          for (const field of ['call_id', 'capability', 'model_snapshot_entry_ref', 'dispatched_at', 'response_persisted_at', 'terminal_at'] as const) {
+            if (before[field] != null && after[field] !== before[field]) {
+              throw new MercuryError('PROVIDER_CHECKPOINT_REGRESSION', `${role} Provider 调用的 ${field} 事实不可清空或改写。`);
+            }
+          }
         }
       }
       for (const source of ['transcript', 'reference'] as const) {
         const before = current.calibration_sources[source];
         const after = checked.calibration_sources[source];
-        if (before && (!after || before.path !== after.path || before.sha256 !== after.sha256 || before.validation !== after.validation)) {
+        if (!startsRetryAttempt && before && (!after || before.path !== after.path || before.sha256 !== after.sha256 || before.validation !== after.validation)) {
           throw new MercuryError('CALIBRATION_SOURCE_IMMUTABLE', `已固定的校准 ${source} 来源不可替换或清空。`);
         }
       }
@@ -168,6 +226,15 @@ export async function persistV5Task(directory: string, task: TaskRecordV5): Prom
       }
       checked.identity.revision = Math.max(checked.identity.revision, current.identity.revision + 1);
       checked.execution.cancel_requested_at ??= current.execution.cancel_requested_at;
+      if (current.execution.control && checked.execution.control) {
+        const explicitResume = current.status === 'paused' && checked.status === 'queued';
+        if (!explicitResume) {
+          checked.execution.control.pause_requested_at ??= current.execution.control.pause_requested_at;
+          checked.execution.control.paused_at ??= current.execution.control.paused_at;
+        }
+        checked.execution.control.resume_count = Math.max(checked.execution.control.resume_count, current.execution.control.resume_count);
+        checked.execution.control.retry_count = Math.max(checked.execution.control.retry_count ?? 0, current.execution.control.retry_count ?? 0);
+      }
       if (current.status === 'running' && checked.status === 'running' && current.execution.worker_id === checked.execution.worker_id
         && (current.execution.heartbeat_at ?? '') > (checked.execution.heartbeat_at ?? '')) checked.execution.heartbeat_at = current.execution.heartbeat_at;
       if (current.updated_at > checked.updated_at) checked.updated_at = current.updated_at;
@@ -186,10 +253,20 @@ export async function isV5TaskDirectory(directory: string): Promise<boolean> {
 
 async function stableEvents(directory: string): Promise<ExchangeEventV1[]> {
   let source: string;
-  try { source = await readFile(path.join(directory, 'events.jsonl'), 'utf8'); } catch (error) {
+  const target = path.join(directory, 'events.jsonl');
+  let handle;
+  try {
+    const entry = await lstat(target);
+    if (!entry.isFile() || entry.isSymbolicLink()) throw new MercuryError('EVENT_LOG_INVALID', '稳定事件日志必须是 Mercury 管理的普通文件。');
+    handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.dev !== entry.dev || opened.ino !== entry.ino) throw new MercuryError('EVENT_LOG_INVALID', '稳定事件日志在读取期间被替换。');
+    source = await handle.readFile('utf8');
+  } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
-    throw error;
-  }
+    if (error instanceof MercuryError) throw error;
+    throw new MercuryError('EVENT_LOG_INVALID', '稳定事件日志无法安全读取。');
+  } finally { await handle?.close().catch(() => undefined); }
   const lines = source.endsWith('\n') ? source.slice(0, -1).split('\n').filter(Boolean) : source.slice(0, source.lastIndexOf('\n') + 1).split('\n').filter(Boolean);
   const events = lines.map((line, index) => {
     try { return assertExchangeContract('event', JSON.parse(line)); } catch { throw new MercuryError('EVENT_LOG_INVALID', `稳定事件日志第 ${index + 1} 行损坏。`); }
@@ -233,7 +310,11 @@ function srtFromSegments(segments: Array<{ start_ms: number; end_ms: number; tex
 }
 
 function srtFromTranscript(transcript: ExchangeTranscriptV1): string {
-  return srtFromSegments(transcript.segments);
+  return srtFromSegments(transcript.segments.map((segment, index) => {
+    const text = normalizeVisibleSubtitleText(segment.text).text;
+    if (!text) throw new MercuryError('VISIBLE_SUBTITLE_TEXT_EMPTY', `第 ${index + 1} 个转写片段清理句读标点后为空。`, { exitCode: 2 });
+    return { ...segment, text };
+  }));
 }
 
 interface ModelSnapshotV3 {
@@ -300,7 +381,11 @@ function evidence(chat: ModelSnapshotEntryV2, mediaBytes: number | null): { mode
 }
 
 function initialCall(outcome: ProviderCall['outcome'] = 'not_dispatched'): ProviderCall {
-  return { state: 'not_started', count: 0, outcome, evidence_ref: null, evidence_sha256: null };
+  return {
+    state: 'not_started', count: 0, outcome, evidence_ref: null, evidence_sha256: null,
+    call_id: null, capability: null, model_snapshot_entry_ref: null,
+    dispatched_at: null, response_persisted_at: null, terminal_at: null,
+  };
 }
 
 async function writeDictionarySnapshotVersion(directory: string, snapshot: ResolvedDictionarySnapshot): Promise<{ path: string; sha256: string }> {
@@ -393,7 +478,7 @@ async function createTaskDirectory(workspace: string, request: ExchangeRequestV1
       calibration_sources: { transcript: null, reference: normalizedReference },
       models: { asr: request.models.asr, chat: request.models.chat, snapshot_path: 'work/model-snapshot.json', snapshot_sha256: await sha256File(path.join(staging, 'work/model-snapshot.json')) },
       dictionary_snapshot: { ...dictionaryPointer, resolved: dictionarySnapshot.resolved },
-      execution: { queued_at: createdAt, started_at: null, ended_at: null, worker_id: null, heartbeat_at: null, attempt_id: null, attempt_count: 0, safe_checkpoint: 'queued', provider_calls: { asr: initialCall(), chat: initialCall() }, cancel_requested_at: null },
+      execution: { queued_at: createdAt, started_at: null, ended_at: null, worker_id: null, heartbeat_at: null, attempt_id: null, attempt_count: 0, safe_checkpoint: 'queued', provider_calls: { asr: initialCall(), chat: initialCall() }, cancel_requested_at: null, control: { checkpoint_version: 'mercury.safe-checkpoint/v1', pause_requested_at: null, paused_at: null, resume_count: 0, retry_count: 0 } },
       artifacts: {
         transcript: provided ? { path: 'work/transcript.normalized.json', sha256: await sha256File(path.join(staging, 'work/transcript.normalized.json')), validation: 'passed' as const } : null,
         transcribed: provided ? { path: transcribedRelative, sha256: await sha256File(path.join(staging, transcribedRelative)), validation: 'passed' as const } : null, calibrated: null, approved: null, report: null,
@@ -554,8 +639,9 @@ const REFERENCE_AUDIO_MISMATCH_ACTION = '参考字幕与音频正文不完整对
 const TEXT_ONLY_HARD_LIMIT_CODES = new Set([
   'CALIBRATED_HARD_LIMIT_INVALID_FOR_TEXT_ONLY',
   'REFERENCE_HARD_LIMIT_INVALID_FOR_TEXT_ONLY',
+  'CALIBRATED_HARD_LIMIT_INVALID_FOR_FIXED_TIMELINE',
 ]);
-const TEXT_ONLY_HARD_LIMIT_ACTION = '请依据真实时间边界把该 cue/segment 拆成不超过 24 字且不超过两行的合规片段，并使用新的 request ID 创建任务；不要重放当前任务。';
+const TEXT_ONLY_HARD_LIMIT_ACTION = '请保持纯转写的真实 cue 时间不变，按这些既有时间边界准备修正后的外部转录文字，并使用新的 request ID 创建任务；不要重放当前任务，也不要让校验阶段自动拆段。';
 
 function referenceAudioMismatchError(
   detail: string,
@@ -575,10 +661,13 @@ function textOnlyHardLimitError(
   detail: string,
   providerOutcome: NonNullable<TaskRecordV5['error']>['provider_outcome'],
 ): NonNullable<TaskRecordV5['error']> {
-  const calibrated = /Calibrated segment ([A-Za-z0-9._:-]+) exceeds the 24-character or two-line hard limit\.?/u.exec(detail);
+  const calibrated = /Calibrated segment ([A-Za-z0-9._:-]+) exceeds the 24-character or two-line hard limit/u.exec(detail);
   const reference = /Reference SRT block ([0-9]+) exceeds the 24-character or two-line hard limit\.?/u.exec(detail);
-  const message = calibrated
-    ? `校验后的字幕片段 ${calibrated[1]} 超过 24 字或两行限制，且当前没有可安全拆分的真实时间边界。`
+  const fixedTimeline = code === 'CALIBRATED_HARD_LIMIT_INVALID_FOR_FIXED_TIMELINE';
+  const message = calibrated && fixedTimeline
+    ? `校验后的固定字幕片段 ${calibrated[1]} 超过 24 字或两行限制；当前版本不会改动纯转写时间轴。`
+    : calibrated
+      ? `校验后的字幕片段 ${calibrated[1]} 超过 24 字或两行限制，且当前没有可安全拆分的真实时间边界。`
     : reference
       ? `参考字幕第 ${reference[1]} 个 cue 超过 24 字或两行限制，且当前没有可安全拆分的真实时间边界。`
       : '字幕片段超过 24 字或两行限制，且当前没有可安全拆分的真实时间边界。';
@@ -605,7 +694,7 @@ async function writeReport(directory: string, task: TaskRecordV5, snapshot: Mode
   const dictionary = await readStableJson(dictionaryPath, 'DICTIONARY_RECORD_INVALID') as ResolvedDictionarySnapshot;
   if (dictionary.contract !== 'mercury.dictionary-snapshot/v1' || dictionary.task_id !== task.identity.task_id) throw new MercuryError('DICTIONARY_RECORD_INVALID', '词典快照 identity 与任务不一致；未生成报告。');
   const source = task.input_config.transcription_mode === 'provided' ? '外部提供' : `${snapshot.models.asr?.name ?? 'ASR Provider'}`;
-  const text = ['# Mercury 字幕校准工作报告', '', `- 任务 ID：\`${task.identity.task_id}\``, `- 转写来源：${source}（ASR 调用数：${task.execution.provider_calls.asr.count}）`, `- 外部格式：${task.inputs.transcript_source?.format ?? task.inputs.reference?.format ?? '—'}`, `- 原件 SHA-256：${task.inputs.transcript_source?.sha256 ?? task.inputs.media?.sha256 ?? '—'}`, `- 规范化 SHA-256：${task.artifacts.transcript?.sha256 ?? '—'}`, `- Chat：${snapshot.models.chat.name} / ${snapshot.models.chat.provider_model}`, `- 校验证据：${task.input_config.evidence_mode === 'audio_multimodal' ? '完整转录 + 音频' : '完整转录'}`, `- Chat 调用：${task.execution.provider_calls.chat.count}`, `- 完整覆盖：${calibration ? `${calibration.strategy.input_unit_count}/${calibration.strategy.returned_unit_count} ${calibration.strategy.coverage_complete ? '通过' : '失败'}` : '未形成'}`, `- 词典快照：${task.dictionary_snapshot.sha256}`, `- 词典 revision：${dictionary.resolved.map((entry) => `${entry.dictionary_id}@${entry.revision}`).join('，') || '无'}`, `- 相关词典条目：${dictionary.matched_entry_ids.join('，') || '无'}`, `- ASR hints：${dictionary.asr_hints.status}（发送 ${dictionary.asr_hints.input_count}/${dictionary.asr_hints.available_count} 项${dictionary.asr_hints.truncated ? '，已按 Adapter 上限截断' : ''}）`, `- 警告：${task.warnings.join('；') || '无'}`, `- 错误：${task.error ? `${task.error.code}：${task.error.message}` : '无'}`, ''].join('\n');
+  const text = ['# Mercury 字幕校准工作报告', '', `- 任务 ID：\`${task.identity.task_id}\``, `- 转写来源：${source}（ASR 调用数：${task.execution.provider_calls.asr.count}）`, `- 外部格式：${task.inputs.transcript_source?.format ?? task.inputs.reference?.format ?? '—'}`, `- 原件 SHA-256：${task.inputs.transcript_source?.sha256 ?? task.inputs.media?.sha256 ?? '—'}`, `- 规范化 SHA-256：${task.artifacts.transcript?.sha256 ?? '—'}`, `- Chat：${snapshot.models.chat.name} / ${snapshot.models.chat.provider_model}`, `- 校验证据：${task.input_config.evidence_mode === 'audio_multimodal' ? '完整转录 + 音频' : '完整转录'}`, `- Chat 调用：${task.execution.provider_calls.chat.count}`, `- 完整覆盖：${calibration ? `${calibration.strategy.input_unit_count}/${calibration.strategy.returned_unit_count} ${calibration.strategy.coverage_complete ? '通过' : '失败'}` : '未形成'}`, `- 校验时间轴策略：${SEGMENTATION_POLICY_VERSION}`, `- 用户可见正文策略：${VISIBLE_SUBTITLE_STYLE_VERSION}`, '- 结构调整：0（校验只改文字）', `- 词典快照：${task.dictionary_snapshot.sha256}`, `- 词典 revision：${dictionary.resolved.map((entry) => `${entry.dictionary_id}@${entry.revision}`).join('，') || '无'}`, `- 相关词典条目：${dictionary.matched_entry_ids.join('，') || '无'}`, `- ASR hints：${dictionary.asr_hints.status}（发送 ${dictionary.asr_hints.input_count}/${dictionary.asr_hints.available_count} 项${dictionary.asr_hints.truncated ? '，已按 Adapter 上限截断' : ''}）`, `- 警告：${task.warnings.join('；') || '无'}`, `- 错误：${task.error ? `${task.error.code}：${task.error.message}` : '无'}`, ''].join('\n');
   await writeFile0600(path.join(directory, 'output/calibration-report.md'), text);
   task.artifacts.report = { path: 'output/calibration-report.md', sha256: await sha256File(path.join(directory, 'output/calibration-report.md')), validation: 'passed' };
 }
@@ -622,6 +711,8 @@ async function commitTerminalThenDerive(
   // fact. Reports, result projections and events are recoverable derivatives
   // and must never run before this commit.
   await persistV5Task(directory, task);
+  await syncAttemptProviderCallFacts(directory, task, 'asr', snapshot.models.asr?.snapshot_entry_id ?? null);
+  await syncAttemptProviderCallFacts(directory, task, 'chat', snapshot.models.chat.snapshot_entry_id);
   await crashFault(fault, 'terminal_task_before_result', task);
   await writeReport(directory, task, snapshot, calibration);
   await crashFault(fault, 'after_terminal_report_written', task);
@@ -703,7 +794,7 @@ async function readPinnedEvidence(directory: string, call: ProviderCall, code: s
   if (!call.evidence_ref || !call.evidence_sha256) throw new MercuryError(code, '已持久化 Provider 响应缺少路径或内容 hash。');
   const target = managed(directory, call.evidence_ref);
   if (await sha256File(target).catch(() => null) !== call.evidence_sha256) throw new MercuryError(code, '已持久化 Provider 响应 hash 不一致；不会采纳或重放 Provider。');
-  return readStableJson(target, code);
+  return readStableJson(target, code, { maxNodes: TRANSCRIPT_STABLE_JSON_MAX_NODES });
 }
 
 function assertAsrEvidenceIdentity(candidate: unknown, task: TaskRecordV5, snapshot: ModelSnapshotV3, media: NonNullable<TaskRecordV5['inputs']['media']>, duration: number): TranscriptRaw {
@@ -764,8 +855,10 @@ async function hasVerifiedReport(directory: string, task: TaskRecordV5): Promise
 export async function ensureV5TerminalReport(directory: string, taskInput?: TaskRecordV5): Promise<TaskRecordV5> {
   const task = taskInput ?? await readV5Task(directory);
   if (!['completed', 'failed', 'interrupted'].includes(task.status)) return task;
-  if (await hasVerifiedReport(directory, task)) return task;
   const snapshot = await readVerifiedV5ModelSnapshot(directory, task);
+  await syncAttemptProviderCallFacts(directory, task, 'asr', snapshot.models.asr?.snapshot_entry_id ?? null);
+  await syncAttemptProviderCallFacts(directory, task, 'chat', snapshot.models.chat.snapshot_entry_id);
+  if (await hasVerifiedReport(directory, task)) return task;
   let calibration: CalibrationResultV3 | null = null;
   if (task.execution.provider_calls.chat.evidence_ref) {
     calibration = assertChatEvidenceIdentity(
@@ -792,7 +885,7 @@ async function assertCalibrationSourceEvidence(
   const transcriptPath = managed(directory, transcriptSource.path);
   await regular(transcriptPath, 'CALIBRATION_SOURCE_INVALID');
   if (await sha256File(transcriptPath) !== transcriptSource.sha256) throw new MercuryError('CALIBRATION_SOURCE_INVALID', '校准 transcript 来源 hash 不一致；不会调用 Provider。');
-  const pinnedTranscript = await readStableJson(transcriptPath, 'CALIBRATION_SOURCE_INVALID');
+  const pinnedTranscript = await readStableJson(transcriptPath, 'CALIBRATION_SOURCE_INVALID', { maxNodes: TRANSCRIPT_STABLE_JSON_MAX_NODES });
   if (canonicalJson(pinnedTranscript) !== canonicalJson(legacy)) throw new MercuryError('CALIBRATION_SOURCE_INVALID', '校准 transcript 来源与当前任务转录不一致；不会调用 Provider。');
 
   const referenceSource = task.calibration_sources.reference;
@@ -813,7 +906,7 @@ export async function verifyV5CalibrationSources(directory: string, taskInput?: 
   if (await sha256File(managed(directory, task.artifacts.transcript.path)).catch(() => null) !== task.artifacts.transcript.sha256) {
     throw new MercuryError('CALIBRATION_SOURCE_INVALID', '规范化转录来源缺失或 hash 不一致。');
   }
-  const transcript = assertExchangeContract('transcript', await readStableJson(managed(directory, task.artifacts.transcript.path), 'CALIBRATION_SOURCE_INVALID'));
+  const transcript = assertExchangeContract('transcript', await readStableJson(managed(directory, task.artifacts.transcript.path), 'CALIBRATION_SOURCE_INVALID', { maxNodes: TRANSCRIPT_STABLE_JSON_MAX_NODES }));
   const snapshot = await readVerifiedV5ModelSnapshot(directory, task);
   let legacy: TranscriptRaw;
   if (task.input_config.transcription_mode === 'provided') {
@@ -823,7 +916,7 @@ export async function verifyV5CalibrationSources(directory: string, taskInput?: 
   } else {
     const media = task.inputs.media;
     if (!media || !task.calibration_sources.transcript) throw new MercuryError('CALIBRATION_SOURCE_INVALID', 'provider 任务缺少固定的 ASR 校准来源。');
-    const rawCandidate = await readStableJson(managed(directory, task.calibration_sources.transcript.path), 'CALIBRATION_SOURCE_INVALID');
+    const rawCandidate = await readStableJson(managed(directory, task.calibration_sources.transcript.path), 'CALIBRATION_SOURCE_INVALID', { maxNodes: TRANSCRIPT_STABLE_JSON_MAX_NODES });
     const rawValue = validateContract('transcript.raw', rawCandidate);
     if (!rawValue.valid) throw new MercuryError('CALIBRATION_SOURCE_INVALID', rawValue.issues.map((entry) => `${entry.path} ${entry.message}`).join('; '));
     legacy = assertAsrEvidenceIdentity(rawValue.value, task, snapshot, media, rawValue.value.audio.duration_ms);
@@ -869,7 +962,12 @@ async function settleReturnedArtifactInvalid(
   const task = await readV5Task(directory);
   const code = error instanceof MercuryError ? error.code : role === 'asr' ? 'ASR_ARTIFACT_INVALID' : 'CALIBRATION_RESULT_INVALID';
   const detail = error instanceof Error ? error.message : String(error);
-  task.execution.provider_calls[role] = { state: 'terminal', count: Math.max(1, task.execution.provider_calls[role].count), outcome: 'known_terminal', evidence_ref: null, evidence_sha256: null };
+  const dispatched = task.execution.provider_calls[role].state !== 'not_started';
+  task.execution.provider_calls[role] = {
+    ...task.execution.provider_calls[role], state: dispatched ? 'terminal' : 'not_started',
+    count: task.execution.provider_calls[role].count, outcome: dispatched ? 'known_terminal' : 'not_dispatched',
+    evidence_ref: null, evidence_sha256: null, terminal_at: dispatched ? new Date().toISOString() : null,
+  };
   task.status = 'failed'; task.stage = null; task.execution.ended_at = new Date().toISOString();
   task.error = exchangeError(code, `${role === 'asr' ? 'ASR' : 'Chat'} 已返回响应，但响应合同或任务身份无效；不会自动重放。`, 'known_terminal', detail);
   return commitTerminalThenDerive(directory, task, snapshot, null, fault);
@@ -883,6 +981,264 @@ function hintsDispatchEvidence(planned: Array<{ entryId: string }>, evidence: As
     throw new MercuryError('ASR_HINTS_DISPATCH_EVIDENCE_INVALID', 'ASR Adapter 未证明实际请求使用了计划中的词典条目；未调用 Provider。');
   }
   return evidence;
+}
+
+function hasTaskControl(task: TaskRecordV5): boolean {
+  return task.execution.control?.checkpoint_version === 'mercury.safe-checkpoint/v1';
+}
+
+async function setV5JobState(directory: string, state: BackgroundJobV1['state']): Promise<void> {
+  const task = await readV5Task(directory);
+  const workspace = path.dirname(path.dirname(directory));
+  const job = await readJob(workspace, task.identity.task_id);
+  job.state = state;
+  job.worker_id = state === 'claimed' ? job.worker_id : null;
+  job.claim_token = state === 'claimed' ? job.claim_token : null;
+  job.updated_at = new Date().toISOString();
+  await writeJob(workspace, job);
+}
+
+async function pauseV5AtBoundary(directory: string, task: TaskRecordV5, fault?: (point: V5FaultPoint, task: TaskRecordV5) => Promise<void> | void): Promise<TaskRecordV5> {
+  if (!task.execution.control) throw new MercuryError('TASK_RESUME_UNSAFE', '此任务没有 Alpha.2 安全检查点记录，不能暂停。', { exitCode: 3 });
+  const at = new Date().toISOString();
+  task.status = 'paused';
+  task.stage = null;
+  task.execution.worker_id = null;
+  task.execution.heartbeat_at = null;
+  task.execution.control.paused_at = at;
+  task.updated_at = at;
+  await persistV5Task(directory, task);
+  await crashFault(fault, 'after_pause_task_committed', task);
+  await setV5JobState(directory, 'paused');
+  await crashFault(fault, 'after_pause_job_committed', task);
+  await appendV5Event(directory, task, 'task_paused', `任务已在安全检查点 ${task.execution.safe_checkpoint} 暂停。`, {
+    checkpoint: task.execution.safe_checkpoint,
+    checkpoint_version: task.execution.control.checkpoint_version,
+    attempt_id: task.execution.attempt_id,
+  });
+  return readV5Task(directory);
+}
+
+async function ensurePausedEvent(directory: string, taskInput: TaskRecordV5): Promise<TaskRecordV5> {
+  let task = taskInput;
+  if (task.status !== 'paused') return task;
+  const exists = (await stableEvents(directory)).some((event) => event.type === 'task_paused'
+    && event.attempt_id === task.execution.attempt_id
+    && (event.data as Record<string, unknown>).checkpoint === task.execution.safe_checkpoint);
+  if (!exists) {
+    await appendV5Event(directory, task, 'task_paused', `任务已在安全检查点 ${task.execution.safe_checkpoint} 暂停。`, {
+      checkpoint: task.execution.safe_checkpoint,
+      checkpoint_version: task.execution.control?.checkpoint_version ?? null,
+      attempt_id: task.execution.attempt_id,
+    });
+    task = await readV5Task(directory);
+  }
+  return task;
+}
+
+async function ensureResumedEvent(directory: string, taskInput: TaskRecordV5): Promise<TaskRecordV5> {
+  let task = taskInput;
+  const resumeCount = task.execution.control?.resume_count ?? 0;
+  if (resumeCount < 1) return task;
+  const exists = (await stableEvents(directory)).some((event) => event.type === 'task_resumed'
+    && event.attempt_id === task.execution.attempt_id
+    && (event.data as Record<string, unknown>).resume_count === resumeCount);
+  if (!exists) {
+    await appendV5Event(directory, task, 'task_resumed', `任务将从安全检查点 ${task.execution.safe_checkpoint} 继续；不会重放已持久化的 Provider 响应。`, {
+      checkpoint: task.execution.safe_checkpoint,
+      checkpoint_version: task.execution.control?.checkpoint_version ?? null,
+      attempt_id: task.execution.attempt_id,
+      resume_count: resumeCount,
+    });
+    task = await readV5Task(directory);
+  }
+  return task;
+}
+
+async function controlV5AtBoundary(directory: string): Promise<TaskRecordV5 | null> {
+  return withTaskTransitionLock(directory, async () => {
+    const current = await readV5Task(directory);
+    if (TERMINAL.has(current.status) || current.status === 'paused') return current;
+    if (current.execution.cancel_requested_at) {
+      const cancelled = await cancelV5AtBoundary(directory, current);
+      await setV5JobState(directory, 'terminal');
+      return cancelled;
+    }
+    if (current.execution.control?.pause_requested_at) return pauseV5AtBoundary(directory, current);
+    return null;
+  });
+}
+
+type ProviderCallLedgerPhase = 'dispatched' | 'response_persisted' | 'terminal';
+
+function providerCallLedgerIdentity(task: TaskRecordV5, role: 'asr' | 'chat'): string {
+  const attemptId = task.execution.attempt_id;
+  const call = task.execution.provider_calls[role];
+  const count = call.count;
+  if (!attemptId || count < 1) throw new MercuryError('ATTEMPT_LEDGER_INVALID', 'Provider 调用缺少稳定 attempt 或调用序号。');
+  return call.call_id ?? `pcl-${digest(`${task.identity.task_id}\n${attemptId}\n${role}\n${count}`).slice(0, 24)}`;
+}
+
+async function syncAttemptProviderCallFacts(
+  directory: string,
+  task: TaskRecordV5,
+  role: 'asr' | 'chat',
+  modelSnapshotEntryRef: string | null,
+): Promise<void> {
+  if (!hasTaskControl(task)) return;
+  const call = task.execution.provider_calls[role];
+  if (call.count < 1 || call.state === 'not_started') return;
+  if (!modelSnapshotEntryRef) throw new MercuryError('ATTEMPT_LEDGER_INVALID', `${role} Provider 调用缺少固定模型快照引用。`);
+  const target = path.join(directory, 'attempts.jsonl');
+  await repairTrailingJsonlFragment(target);
+  const records: Array<{ contract?: string; call_id?: string; phase?: string }> = await readFile(target, 'utf8').then((source) => source.split('\n').filter(Boolean).map((line) => {
+    try { return JSON.parse(line) as { contract?: string; call_id?: string; phase?: string }; }
+    catch { throw new MercuryError('ATTEMPT_LEDGER_INVALID', 'attempt 账本损坏；不会继续或重放 Provider。'); }
+  })).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  });
+  const callId = providerCallLedgerIdentity(task, role);
+  const phases: ProviderCallLedgerPhase[] = ['dispatched'];
+  if (call.state === 'response_persisted' || (call.state === 'terminal' && call.evidence_ref)) phases.push('response_persisted');
+  if (call.state === 'terminal' || (task.status === 'interrupted' && call.state === 'in_flight')) phases.push('terminal');
+  for (const phase of phases) {
+    if (records.some((entry) => entry.contract === 'mercury.provider-call/v1' && entry.call_id === callId && entry.phase === phase)) continue;
+    const at = phase === 'dispatched'
+      ? call.dispatched_at ?? task.updated_at
+      : phase === 'response_persisted'
+        ? call.response_persisted_at ?? task.updated_at
+        : call.terminal_at ?? task.execution.ended_at ?? task.updated_at;
+    await appendStableJsonLine(target, {
+      contract: 'mercury.provider-call/v1',
+      task_id: task.identity.task_id,
+      attempt_id: task.execution.attempt_id,
+      call_id: callId,
+      call_number: call.count,
+      role,
+      capability: role === 'asr' ? 'transcription' : 'calibration',
+      model_id: task.models[role],
+      model_snapshot_entry_ref: modelSnapshotEntryRef,
+      phase,
+      dispatched_at: phase === 'dispatched' ? at : null,
+      response_persisted_at: phase === 'response_persisted' ? at : null,
+      terminal_at: phase === 'terminal' ? at : null,
+      outcome: phase === 'terminal' ? call.outcome : phase === 'response_persisted' ? 'response_persisted' : null,
+      evidence_ref: phase === 'dispatched' ? null : call.evidence_ref,
+      evidence_sha256: phase === 'dispatched' ? null : call.evidence_sha256,
+    });
+    records.push({ contract: 'mercury.provider-call/v1', call_id: callId, phase });
+  }
+}
+
+async function beginV5ProviderDispatch(
+  directory: string,
+  role: 'asr' | 'chat',
+  modelSnapshotEntryRef: string,
+  beforePersist?: (task: TaskRecordV5) => Promise<void>,
+): Promise<TaskRecordV5> {
+  return withTaskTransitionLock(directory, async () => {
+    let current = await readV5Task(directory);
+    if (current.execution.cancel_requested_at) {
+      current = await cancelV5AtBoundary(directory, current);
+      await setV5JobState(directory, 'terminal');
+      throw new MercuryError('TASK_CANCELLED', '任务已在 Provider 调用前取消。');
+    }
+    if (current.execution.control?.pause_requested_at) {
+      await pauseV5AtBoundary(directory, current);
+      throw new MercuryError('TASK_PAUSED_AT_SAFE_CHECKPOINT', '任务已在 Provider 调用前安全暂停。');
+    }
+    await beforePersist?.(current);
+    const count = current.execution.provider_calls[role].count + 1;
+    const dispatchedAt = new Date().toISOString();
+    current.execution.provider_calls[role] = {
+      state: 'in_flight', count, outcome: 'outcome_unknown', evidence_ref: null, evidence_sha256: null,
+      call_id: `pcl-${digest(`${current.identity.task_id}\n${current.execution.attempt_id}\n${role}\n${count}`).slice(0, 24)}`,
+      capability: role === 'asr' ? 'transcription' : 'calibration', model_snapshot_entry_ref: modelSnapshotEntryRef,
+      dispatched_at: dispatchedAt, response_persisted_at: null, terminal_at: null,
+    };
+    current.updated_at = dispatchedAt;
+    await persistV5Task(directory, current);
+    await syncAttemptProviderCallFacts(directory, current, role, modelSnapshotEntryRef);
+    return current;
+  });
+}
+
+async function checkpointV5AsrQuery(
+  directory: string,
+  modelSnapshotEntryRef: string,
+): Promise<TaskRecordV5> {
+  return withTaskTransitionLock(directory, async () => {
+    const current = await readV5Task(directory);
+    const call = current.execution.provider_calls.asr;
+    if (
+      !['running', 'pausing'].includes(current.status)
+      || call.state !== 'in_flight'
+      || call.outcome !== 'outcome_unknown'
+      || call.count < 1
+      || call.model_snapshot_entry_ref !== modelSnapshotEntryRef
+      || call.call_id === null
+      || call.dispatched_at === null
+    ) {
+      throw new MercuryError(
+        'PROVIDER_QUERY_CHECKPOINT_INVALID',
+        'ASR query 只能继续同一条已持久化的 in-flight Provider 调用。',
+      );
+    }
+    return current;
+  });
+}
+
+async function commitV5ProviderResponse(
+  directory: string,
+  role: 'asr' | 'chat',
+  expectedCallId: string | null,
+  modelSnapshotEntryRef: string,
+  evidenceRef: string,
+  evidenceSha256: string,
+): Promise<TaskRecordV5> {
+  return withTaskTransitionLock(directory, async () => {
+    const current = await readV5Task(directory);
+    const call = current.execution.provider_calls[role];
+    if (
+      call.state === 'response_persisted'
+      && call.outcome === 'response_persisted'
+      && call.call_id === expectedCallId
+      && call.model_snapshot_entry_ref === modelSnapshotEntryRef
+      && call.evidence_ref === evidenceRef
+      && call.evidence_sha256 === evidenceSha256
+    ) return current;
+    if (
+      !['running', 'pausing'].includes(current.status)
+      || expectedCallId === null
+      || call.state !== 'in_flight'
+      || call.outcome !== 'outcome_unknown'
+      || call.call_id !== expectedCallId
+      || call.model_snapshot_entry_ref !== modelSnapshotEntryRef
+      || call.count < 1
+    ) {
+      throw new MercuryError('PROVIDER_RESPONSE_COMMIT_INVALID', `${role} 响应不能提交到当前 Provider 调用。`);
+    }
+    const at = new Date().toISOString();
+    current.execution.provider_calls[role] = {
+      ...call,
+      state: 'response_persisted',
+      outcome: 'response_persisted',
+      evidence_ref: evidenceRef,
+      evidence_sha256: evidenceSha256,
+      response_persisted_at: at,
+      terminal_at: null,
+    };
+    if (role === 'asr') {
+      current.calibration_sources.transcript = { path: evidenceRef, sha256: evidenceSha256, validation: 'passed' };
+      current.execution.safe_checkpoint = 'asr_response_persisted';
+    } else {
+      current.execution.safe_checkpoint = 'chat_response_persisted';
+    }
+    current.updated_at = at;
+    await persistV5Task(directory, current);
+    return current;
+  });
 }
 
 async function prepareProviderTranscript(
@@ -901,11 +1257,12 @@ async function prepareProviderTranscript(
   const duration = readMp3DurationMsFromBytes(verifiedAudioBytes);
   task.stage = 'transcribing'; task.execution.safe_checkpoint = 'asr_not_started'; task.updated_at = new Date().toISOString(); await persistV5Task(directory, task);
   task = await readV5Task(directory);
-  if (task.execution.cancel_requested_at) { await cancelV5AtBoundary(directory, task); return null; }
+  if (await controlV5AtBoundary(directory)) return null;
   const evidenceRef = task.execution.provider_calls.asr.evidence_ref;
   let raw: TranscriptRaw;
   if (evidenceRef && ['response_persisted', 'terminal'].includes(task.execution.provider_calls.asr.state)) {
     raw = assertAsrEvidenceIdentity(await readPinnedEvidence(directory, task.execution.provider_calls.asr, 'ASR_ARTIFACT_INVALID'), task, snapshot, media, duration);
+    await syncAttemptProviderCallFacts(directory, task, 'asr', snapshot.models.asr.snapshot_entry_id);
   } else {
     const asr = dependencies.asrAdapter ?? (snapshot.models.asr.plugin_id === 'volcengine_subtitle_asr'
       ? new VolcengineSubtitleAsrAdapter({ readCredential: dependencies.readCredential ?? readCredentialReference, ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}) })
@@ -938,32 +1295,47 @@ async function prepareProviderTranscript(
         taskId: task.identity.task_id, modelSnapshotRef: snapshot.snapshot_id, model: legacyAsrEntry(snapshot.models.asr) as any,
         audio: { sourcePath: audioPath, verifiedBytes: verifiedAudioBytes, pathRef: media.workspace_path, sha256: media.sha256, durationMs: duration, mimeType: 'audio/mpeg', language: 'zh-CN' },
         asrHints: { entries: hintEntries },
-        beforeProviderDispatch: async (_operation, dispatchEvidence) => {
-          task = await readV5Task(directory);
-          if (task.execution.cancel_requested_at) throw new MercuryError('TASK_CANCELLED', '任务已请求取消，未调用 ASR。');
-          if (hintEntries.length > 0) {
-            const confirmed = hintsDispatchEvidence(hintEntries, dispatchEvidence?.asrHints);
-            const currentDictionary = await readStableJson(managed(directory, task.dictionary_snapshot.path), 'DICTIONARY_RECORD_INVALID') as ResolvedDictionarySnapshot;
-            currentDictionary.asr_hints = {
-              status: 'used', adapter_id: asr.adapterId, entry_ids: [...confirmed.entryIds], available_count: currentDictionary.entries.length,
-              input_count: confirmed.entryIds.length, truncated: confirmed.entryIds.length < currentDictionary.entries.length,
-            input_hash: confirmed.inputHash, reason: null,
-          };
-          const usedSnapshot = await writeDictionarySnapshotVersion(directory, currentDictionary);
-          await crashFault(fault, 'after_hints_snapshot_written', task);
-          task.dictionary_snapshot.path = usedSnapshot.path;
-            task.dictionary_snapshot.sha256 = usedSnapshot.sha256;
-            task.dictionary_snapshot.resolved = currentDictionary.resolved;
-            Object.assign(dictionarySnapshot, currentDictionary);
+        beforeProviderDispatch: async (operation, dispatchEvidence) => {
+          if (operation === 'volcengine_subtitle_query') {
+            task = await checkpointV5AsrQuery(directory, snapshot.models.asr!.snapshot_entry_id);
+            await appendV5Event(
+              directory,
+              task,
+              'provider_subrequest_checkpointed',
+              '新字幕 ASR submit 已返回；blocking query 将继续同一条逻辑调用。',
+              {
+                capability: 'transcription',
+                operation: 'volcengine_subtitle_query',
+                count: task.execution.provider_calls.asr.count,
+              },
+            );
+            await crashFault(fault, 'after_asr_query_checkpointed', task);
+            return;
           }
-          task.execution.provider_calls.asr = { state: 'in_flight', count: 1, outcome: 'outcome_unknown', evidence_ref: null, evidence_sha256: null };
-          task.updated_at = new Date().toISOString(); await persistV5Task(directory, task);
+          task = await beginV5ProviderDispatch(directory, 'asr', snapshot.models.asr!.snapshot_entry_id, async (current) => {
+            if (hintEntries.length > 0) {
+              const confirmed = hintsDispatchEvidence(hintEntries, dispatchEvidence?.asrHints);
+              const currentDictionary = await readStableJson(managed(directory, current.dictionary_snapshot.path), 'DICTIONARY_RECORD_INVALID') as ResolvedDictionarySnapshot;
+              currentDictionary.asr_hints = {
+                status: 'used', adapter_id: asr.adapterId, entry_ids: [...confirmed.entryIds], available_count: currentDictionary.entries.length,
+                input_count: confirmed.entryIds.length, truncated: confirmed.entryIds.length < currentDictionary.entries.length,
+                input_hash: confirmed.inputHash, reason: null,
+              };
+              const usedSnapshot = await writeDictionarySnapshotVersion(directory, currentDictionary);
+              await crashFault(fault, 'after_hints_snapshot_written', current);
+              current.dictionary_snapshot.path = usedSnapshot.path;
+              current.dictionary_snapshot.sha256 = usedSnapshot.sha256;
+              current.dictionary_snapshot.resolved = currentDictionary.resolved;
+              Object.assign(dictionarySnapshot, currentDictionary);
+            }
+          });
           await crashFault(fault, 'after_dispatch_persisted', task);
-          await appendV5Event(directory, task, 'provider_dispatched', 'ASR 转写请求已发送。', { capability: 'transcription', count: 1 });
+          await appendV5Event(directory, task, 'provider_dispatched', 'ASR 转写请求已发送。', { capability: 'transcription', count: task.execution.provider_calls.asr.count });
         },
       });
     } catch (error) {
       task = await readV5Task(directory);
+      if (task.status === 'paused' || task.status === 'cancelled') return null;
       if (task.execution.cancel_requested_at && task.execution.provider_calls.asr.state === 'not_started') {
         await cancelV5AtBoundary(directory, task);
         return null;
@@ -972,12 +1344,17 @@ async function prepareProviderTranscript(
     }
     if (result.kind === 'failure') {
       task = await readV5Task(directory);
+      if (task.status === 'paused' || task.status === 'cancelled') return null;
       if (task.execution.cancel_requested_at && task.execution.provider_calls.asr.state === 'not_started') {
         await cancelV5AtBoundary(directory, task);
         return null;
       }
       const certainty = result.failure.provider_outcome_certainty ?? (task.execution.provider_calls.asr.state === 'in_flight' ? 'outcome_unknown' : 'not_dispatched');
-      task.execution.provider_calls.asr = { state: certainty === 'outcome_unknown' ? 'in_flight' : 'terminal', count: task.execution.provider_calls.asr.count, outcome: certainty, evidence_ref: null, evidence_sha256: null };
+      task.execution.provider_calls.asr = {
+        ...task.execution.provider_calls.asr, state: certainty === 'outcome_unknown' ? 'in_flight' : certainty === 'not_dispatched' ? 'not_started' : 'terminal',
+        count: task.execution.provider_calls.asr.count, outcome: certainty, evidence_ref: null, evidence_sha256: null,
+        terminal_at: certainty === 'known_terminal' ? new Date().toISOString() : null,
+      };
       task.status = certainty === 'outcome_unknown' ? 'interrupted' : 'failed'; task.stage = null; task.execution.ended_at = new Date().toISOString();
       task.error = exchangeError(certainty === 'outcome_unknown' ? 'TASK_INTERRUPTED_PROVIDER_UNKNOWN' : result.failure.errors[0]!.code, result.failure.errors[0]!.message, certainty, result.failure.errors[0]!.message);
       await commitTerminalThenDerive(directory, task, snapshot, null, fault); return null;
@@ -990,11 +1367,18 @@ async function prepareProviderTranscript(
     }
     await writeStableJsonAtomic(path.join(directory, 'work/transcript.raw.json'), raw);
     const evidenceSha256 = await sha256File(path.join(directory, 'work/transcript.raw.json'));
-    task = await readV5Task(directory);
-    task.execution.provider_calls.asr = { state: 'response_persisted', count: 1, outcome: 'response_persisted', evidence_ref: 'work/transcript.raw.json', evidence_sha256: evidenceSha256 };
-    task.calibration_sources.transcript = { path: 'work/transcript.raw.json', sha256: evidenceSha256, validation: 'passed' };
-    task.execution.safe_checkpoint = 'asr_response_persisted'; await persistV5Task(directory, task);
+    await crashFault(fault, 'before_asr_response_commit', task);
+    task = await commitV5ProviderResponse(
+      directory,
+      'asr',
+      task.execution.provider_calls.asr.call_id ?? null,
+      snapshot.models.asr.snapshot_entry_id,
+      'work/transcript.raw.json',
+      evidenceSha256,
+    );
+    await syncAttemptProviderCallFacts(directory, task, 'asr', snapshot.models.asr.snapshot_entry_id);
     await crashFault(fault, 'after_response_persisted', task);
+    if (await controlV5AtBoundary(directory)) return null;
   }
   const transcript = exchangeTranscriptFromProvider(task, raw, snapshot);
   await writeStableJsonAtomic(path.join(directory, 'work/transcript.normalized.json'), transcript);
@@ -1009,8 +1393,13 @@ async function prepareProviderTranscript(
   task.dictionary_snapshot.resolved = dictionarySnapshot.resolved;
   task.artifacts.transcript = { path: 'work/transcript.normalized.json', sha256: await sha256File(path.join(directory, 'work/transcript.normalized.json')), validation: 'passed' };
   task.artifacts.transcribed = { path: transcribedRelative, sha256: await sha256File(path.join(directory, transcribedRelative)), validation: 'passed' };
-  task.execution.provider_calls.asr = { state: 'terminal', count: 1, outcome: 'response_persisted', evidence_ref: 'work/transcript.raw.json', evidence_sha256: task.execution.provider_calls.asr.evidence_sha256 };
+  task.execution.provider_calls.asr = {
+    ...task.execution.provider_calls.asr, state: 'terminal', count: task.execution.provider_calls.asr.count,
+    outcome: 'response_persisted', evidence_ref: 'work/transcript.raw.json', evidence_sha256: task.execution.provider_calls.asr.evidence_sha256,
+    terminal_at: new Date().toISOString(),
+  };
   task.updated_at = new Date().toISOString(); await persistV5Task(directory, task);
+  await syncAttemptProviderCallFacts(directory, task, 'asr', snapshot.models.asr.snapshot_entry_id);
   return { task, transcript, legacy: raw };
 }
 
@@ -1038,7 +1427,7 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
     task = prepared.task; transcript = prepared.transcript; legacy = prepared.legacy;
   } else {
     if (!task.artifacts.transcript || await sha256File(managed(directory, task.artifacts.transcript.path)) !== task.artifacts.transcript.sha256) throw new MercuryError('TRANSCRIPT_IMPORT_INVALID', '规范化转录缺失或 hash 不一致。');
-    transcript = assertExchangeContract('transcript', await readStableJson(managed(directory, task.artifacts.transcript.path), 'TRANSCRIPT_IMPORT_INVALID'));
+    transcript = assertExchangeContract('transcript', await readStableJson(managed(directory, task.artifacts.transcript.path), 'TRANSCRIPT_IMPORT_INVALID', { maxNodes: TRANSCRIPT_STABLE_JSON_MAX_NODES }));
     legacy = legacyTranscript(task, transcript, snapshot);
   }
   let calibration: CalibrationResultV3 | null = null;
@@ -1056,9 +1445,13 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
     await writeStableJsonAtomic(path.join(directory, 'work/alignment.json'), initial.alignment);
     task.stage = 'calibrating'; task.execution.safe_checkpoint = 'chat_not_started'; task.updated_at = new Date().toISOString(); await persistV5Task(directory, task);
     task = await readV5Task(directory);
-    if (task.execution.cancel_requested_at) return cancelV5AtBoundary(directory, task);
+    {
+      const controlled = await controlV5AtBoundary(directory);
+      if (controlled) return controlled;
+    }
     if (task.execution.provider_calls.chat.evidence_ref && ['response_persisted', 'terminal'].includes(task.execution.provider_calls.chat.state)) {
       calibration = assertChatEvidenceIdentity(await readPinnedEvidence(directory, task.execution.provider_calls.chat, 'CALIBRATION_RESULT_INVALID'), task, snapshot);
+      await syncAttemptProviderCallFacts(directory, task, 'chat', snapshot.models.chat.snapshot_entry_id);
     } else {
       const runtime = dependencies.chatRuntime ?? createChatCalibrationRuntimeV2(snapshot.models.chat, { ...dependencies, readCredential: dependencies.readCredential ?? readCredentialReference });
       const media = task.inputs.media;
@@ -1075,14 +1468,13 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
         },
         audio: verifiedAudioBytes && media ? { sourcePath: managed(directory, media.workspace_path), verifiedBytes: verifiedAudioBytes, pathRef: media.workspace_path, sha256: media.sha256, bytes: media.bytes, durationMs: legacy.audio.duration_ms, mimeType: 'audio/mpeg' } : null,
         beforeProviderDispatch: async () => {
-          task = await readV5Task(directory);
-          if (task.execution.cancel_requested_at) throw new MercuryError('TASK_CANCELLED', '任务已请求取消，未调用 Chat。');
-          task.execution.provider_calls.chat = { state: 'in_flight', count: 1, outcome: 'outcome_unknown', evidence_ref: null, evidence_sha256: null };
-          task.updated_at = new Date().toISOString(); await persistV5Task(directory, task);
+          task = await beginV5ProviderDispatch(directory, 'chat', snapshot.models.chat.snapshot_entry_id);
           await crashFault(fault, 'after_dispatch_persisted', task);
-          await appendV5Event(directory, task, 'provider_dispatched', `Chat 校验请求已发送；ASR 调用数为 ${task.execution.provider_calls.asr.count}。`, { capability: 'calibration', count: 1, asr_call_count: task.execution.provider_calls.asr.count });
+          await appendV5Event(directory, task, 'provider_dispatched', `Chat 校验请求已发送；ASR 调用数为 ${task.execution.provider_calls.asr.count}。`, { capability: 'calibration', count: task.execution.provider_calls.chat.count, asr_call_count: task.execution.provider_calls.asr.count });
         },
       });
+      task = await readV5Task(directory);
+      if (task.status === 'paused' || task.status === 'cancelled') return task;
       if (result.kind === 'failure') {
         task = await readV5Task(directory);
         if (task.execution.cancel_requested_at && task.execution.provider_calls.chat.state === 'not_started') {
@@ -1090,7 +1482,11 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
         }
         const reportedCertainty = result.failure.provider_outcome_certainty;
         const certainty = reportedCertainty ?? (task.execution.provider_calls.chat.state === 'in_flight' ? 'outcome_unknown' : result.failure.call ? 'known_terminal' : 'not_dispatched');
-        task.execution.provider_calls.chat = { state: certainty === 'outcome_unknown' ? 'in_flight' : 'terminal', count: task.execution.provider_calls.chat.count, outcome: certainty, evidence_ref: null, evidence_sha256: null };
+        task.execution.provider_calls.chat = {
+          ...task.execution.provider_calls.chat, state: certainty === 'outcome_unknown' ? 'in_flight' : certainty === 'not_dispatched' ? 'not_started' : 'terminal',
+          count: task.execution.provider_calls.chat.count, outcome: certainty, evidence_ref: null, evidence_sha256: null,
+          terminal_at: certainty === 'known_terminal' ? new Date().toISOString() : null,
+        };
         task.status = certainty === 'outcome_unknown' ? 'interrupted' : 'failed'; task.stage = null; task.execution.ended_at = new Date().toISOString();
         task.error = exchangeError(certainty === 'outcome_unknown' ? 'TASK_INTERRUPTED_PROVIDER_UNKNOWN' : result.failure.errors[0]!.code, result.failure.errors[0]!.message, certainty, result.failure.errors[0]!.message);
         return commitTerminalThenDerive(directory, task, snapshot, null, fault);
@@ -1110,11 +1506,13 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
         // evidence while the Provider call remains in_flight/outcome_unknown,
         // and terminate the task as unsafe to replay.
         task.execution.provider_calls.chat = {
+          ...task.execution.provider_calls.chat,
           state: 'in_flight',
-          count: 1,
+          count: task.execution.provider_calls.chat.count,
           outcome: 'outcome_unknown',
           evidence_ref: 'work/calibration-response.json',
           evidence_sha256: evidenceSha256,
+          terminal_at: null,
         };
         task.execution.safe_checkpoint = null;
         task.status = 'interrupted';
@@ -1128,11 +1526,27 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
         );
         return commitTerminalThenDerive(directory, task, snapshot, calibration, fault);
       }
-      task.execution.provider_calls.chat = { state: 'response_persisted', count: 1, outcome: 'response_persisted', evidence_ref: 'work/calibration-response.json', evidence_sha256: evidenceSha256 };
-      task.execution.safe_checkpoint = 'chat_response_persisted'; await persistV5Task(directory, task);
+      await crashFault(fault, 'before_chat_response_commit', task);
+      task = await commitV5ProviderResponse(
+        directory,
+        'chat',
+        task.execution.provider_calls.chat.call_id ?? null,
+        snapshot.models.chat.snapshot_entry_id,
+        'work/calibration-response.json',
+        evidenceSha256,
+      );
+      await syncAttemptProviderCallFacts(directory, task, 'chat', snapshot.models.chat.snapshot_entry_id);
       await crashFault(fault, 'after_response_persisted', task);
+      {
+        const controlled = await controlV5AtBoundary(directory);
+        if (controlled) return controlled;
+      }
       if (calibration.status === 'failed') {
-        task.execution.provider_calls.chat = { state: 'terminal', count: 1, outcome: 'response_persisted', evidence_ref: 'work/calibration-response.json', evidence_sha256: evidenceSha256 };
+        task.execution.provider_calls.chat = {
+          ...task.execution.provider_calls.chat, state: 'terminal', count: task.execution.provider_calls.chat.count,
+          outcome: 'response_persisted', evidence_ref: 'work/calibration-response.json', evidence_sha256: evidenceSha256,
+          terminal_at: new Date().toISOString(),
+        };
         task.status = 'failed';
         task.stage = null; task.execution.ended_at = new Date().toISOString();
         const issue = calibration.errors[0]! as { code: string; message: string };
@@ -1143,7 +1557,10 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
       }
     }
     task = await readV5Task(directory);
-    if (task.execution.cancel_requested_at) return cancelV5AtBoundary(directory, task);
+    {
+      const controlled = await controlV5AtBoundary(directory);
+      if (controlled) return controlled;
+    }
     if (!calibration || calibration.status !== 'completed') throw new MercuryError('CALIBRATION_RESULT_INVALID', 'Chat 未形成完整可用的校验正文。');
     const subtitle = runSubtitleCore({
       transcript: legacy,
@@ -1168,25 +1585,33 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
     const stem = path.basename(task.artifacts.transcribed!.path).replace(/\.transcribed\.srt$/u, '');
     const calibratedRelative = `output/${stem}.calibrated.srt`;
     await writeFile0600(path.join(directory, calibratedRelative), serializeCalibratedSrt(subtitle.artifact));
-    const audioDuration = task.inputs.media ? await readMp3DurationMs(managed(directory, task.inputs.media.workspace_path)) : (transcript.duration_ms ?? transcript.segments.at(-1)!.end_ms);
-    const parsedBaseline = referenceText ? parseReferenceSrt(referenceText) : null;
-    const textOnlyTimeline = parsedBaseline?.ok
-      ? parsedBaseline.segments
-      : task.input_config.transcription_mode === 'provided' && subtitle.artifact.mode === 'text-only'
-        ? legacy.segments.map((segment, index) => ({ reference_segment_id: segment.segment_id, sequence: index + 1, start_ms: segment.start_ms, end_ms: segment.end_ms, text: segment.text }))
-        : null;
+    const audioDuration = task.inputs.media ? readMp3DurationMsFromBytes(await readVerifiedMediaBytes(directory, task.inputs.media)) : (transcript.duration_ms ?? transcript.segments.at(-1)!.end_ms);
+    const textOnlyTimeline = legacy.segments.map((segment, index) => ({ reference_segment_id: segment.segment_id, sequence: index + 1, start_ms: segment.start_ms, end_ms: segment.end_ms, text: segment.text }));
     const validation = await validateSrtFile(path.join(directory, calibratedRelative), { audioDurationMs: audioDuration, expectedSegments: subtitle.artifact.segments, mode: subtitle.artifact.mode, referenceSegments: textOnlyTimeline });
     if (!validation.valid) throw new MercuryError('OUTPUT_VALIDATION_FAILED', validation.checks.filter((item) => item.status === 'failed').map((item) => item.message).join('; '));
     task = await readV5Task(directory);
+    {
+      const controlled = await controlV5AtBoundary(directory);
+      if (controlled) {
+        await rm(path.join(directory, calibratedRelative), { force: true });
+        return controlled;
+      }
+    }
+    task = await readV5Task(directory);
     task.artifacts.calibrated = { path: calibratedRelative, sha256: await sha256File(path.join(directory, calibratedRelative)), validation: 'passed' };
     task.status = 'completed'; task.stage = null; task.execution.ended_at = new Date().toISOString(); task.execution.safe_checkpoint = 'outputs_validated';
-    task.execution.provider_calls.chat = { state: 'terminal', count: Math.max(1, task.execution.provider_calls.chat.count), outcome: 'response_persisted', evidence_ref: task.execution.provider_calls.chat.evidence_ref, evidence_sha256: task.execution.provider_calls.chat.evidence_sha256 };
+    task.execution.provider_calls.chat = {
+      ...task.execution.provider_calls.chat, state: 'terminal', count: Math.max(1, task.execution.provider_calls.chat.count),
+      outcome: 'response_persisted', evidence_ref: task.execution.provider_calls.chat.evidence_ref,
+      evidence_sha256: task.execution.provider_calls.chat.evidence_sha256, terminal_at: new Date().toISOString(),
+    };
     task.error = null; task.review = { status: 'pending', pending_count: calibration.corrected_units.filter((unit) => unit.changed).length };
     return commitTerminalThenDerive(directory, task, snapshot, calibration, fault);
   } catch (error) {
     if (error instanceof SimulatedV5Crash) throw error;
     task = await readV5Task(directory);
     if (TERMINAL.has(task.status)) return task;
+    if (task.status === 'paused') return task;
     if (task.execution.cancel_requested_at && !Object.values(task.execution.provider_calls).some((entry) => entry.state === 'in_flight')) {
       return cancelV5AtBoundary(directory, task);
     }
@@ -1268,26 +1693,54 @@ export async function projectV5Task(directory: string, input?: TaskRecordV5): Pr
   ]);
   const visibleError = projectedTaskError(task.error);
   const delivery = await (await import('../delivery.js')).projectDeliveryReadOnly(task);
+  const taskControl = hasTaskControl(task);
+  const retryPlan = taskControl && ['failed', 'interrupted'].includes(task.status)
+    ? await planV5Retry(directory, task)
+    : null;
+  const pauseAllowed = taskControl && ['queued', 'running'].includes(task.status);
+  const resumeAllowed = taskControl
+    && ['paused', 'interrupted'].includes(task.status)
+    && task.execution.safe_checkpoint !== null
+    && !Object.values(task.execution.provider_calls).some((entry) => entry.state === 'in_flight'
+      || entry.outcome === 'outcome_unknown'
+      || (entry.state === 'terminal' && entry.outcome === 'known_terminal'));
+  const cancelAllowed = ['queued', 'running', 'pausing', 'paused'].includes(task.status);
+  const retryReason = retryPlan?.allowed ? null
+    : task.status === 'queued' ? '任务仍在当前 attempt 的队列中；当前不能创建 retry attempt。'
+      : task.status === 'running' ? '任务正在当前 attempt 中处理；当前不能创建 retry attempt。'
+        : task.status === 'pausing' ? '任务正在等待安全暂停；当前不能创建 retry attempt。'
+          : task.status === 'paused' ? '任务已暂停；请使用 task resume 继续同一 attempt，当前不能 retry。'
+            : task.status === 'completed' ? '任务已经完成，不需要 retry。'
+              : task.status === 'cancelled' ? '任务已经取消；如需重新处理，请创建新的逻辑 request。'
+                : task.status === 'needs_input' ? '任务正在等待用户处理输入问题；请先按主错误修复，当前不能 retry。'
+                  : retryPlan?.reason ?? '安全重试不可用。';
   const nextAction = task.status === 'queued' ? '任务已入队；查询不会启动 Worker。若 Worker 未运行，请显式执行 worker start。'
     : task.status === 'running' ? '任务正在后台处理，请稍后查询。'
+      : task.status === 'pausing' ? '暂停请求已记录；Provider 调用若正在进行会先等待结果固定，再在安全检查点暂停。'
+        : task.status === 'paused' ? `任务已在安全检查点 ${task.execution.safe_checkpoint} 暂停；可显式执行 task resume 继续同一 attempt。`
       : task.status === 'completed' && ['finalized', 'not_required'].includes(review.status) && ['ready', 'failed', 'delivered'].includes(delivery.status) ? delivery.next_action
         : task.status === 'completed' && ['finalized', 'not_required'].includes(review.status) ? '人工批准稿已生成，可以直接打开批准后字幕。'
           : task.status === 'completed' ? `校验后字幕已生成，还有 ${review.pending_count ?? 0} 项修改待人工审阅。`
-            : task.status === 'interrupted' ? 'Provider 结果不确定；不要自动重试。'
+            : task.status === 'interrupted' && retryPlan?.provider_outcome === 'outcome_unknown' ? 'Provider 结果不确定；不要自动重试，也不要重放当前 attempt。'
+              : task.status === 'interrupted' && retryPlan?.provider_outcome === 'response_persisted' ? 'Provider 响应已固定；可执行 task resume 仅继续本地工作。'
               : task.status === 'cancelled' ? (artifacts.find((entry) => entry.identity === 'transcribed_srt')?.exists ? '任务已取消；纯转写字幕仍可使用。' : '任务已取消；尚未产生字幕文件。')
                 : visibleError?.code === 'REFERENCE_AUDIO_MISMATCH' ? REFERENCE_AUDIO_MISMATCH_ACTION
                   : visibleError && TEXT_ONLY_HARD_LIMIT_CODES.has(visibleError.code) ? TEXT_ONLY_HARD_LIMIT_ACTION
+                    : retryPlan?.allowed ? '先执行只读 task retry-plan，确认预计新增调用后，再显式执行 task retry。'
                     : '按错误提示检查输入或模型配置。';
   return assertExchangeContract('task', {
     contract: 'mercury.task/v1', task_id: task.identity.task_id, request_id: task.identity.request_id, revision: task.identity.revision, created_at: task.created_at, updated_at: task.updated_at,
     status: task.status, stage: task.stage, progress: null,
-    worker: { status: task.status === 'running' ? 'active' : 'inactive', heartbeat_at: task.execution.heartbeat_at },
-    pause: { allowed: false, reason: '0.3.0-alpha.1 尚未提供暂停。' }, cancel: { allowed: ['queued', 'running'].includes(task.status), reason: ['queued', 'running'].includes(task.status) ? null : '当前状态不能取消。' }, retry: { allowed: false, reason: '0.3.0-alpha.1 尚未提供安全重试。' },
+    worker: { status: ['running', 'pausing'].includes(task.status) ? 'active' : 'inactive', heartbeat_at: task.execution.heartbeat_at },
+    pause: { allowed: pauseAllowed, reason: pauseAllowed ? null : task.status === 'pausing' ? '暂停请求已经记录。' : task.status === 'paused' ? '任务已经暂停；如需继续请查看 resume 动作。' : `任务状态 ${task.status} 不能暂停。` },
+    resume: { allowed: resumeAllowed, reason: resumeAllowed ? null : !taskControl ? '此历史任务没有 Alpha.2 安全检查点。' : task.status === 'pausing' ? '暂停尚未到达安全检查点；请继续查询当前任务。' : task.status === 'paused' || task.status === 'interrupted' ? '当前检查点或 Provider 结果不能证明安全恢复。' : `任务状态 ${task.status} 不能恢复。` },
+    cancel: { allowed: cancelAllowed, reason: cancelAllowed ? null : `任务状态 ${task.status} 不能取消。` },
+    retry: { allowed: retryPlan?.allowed ?? false, reason: retryReason },
     attempt: { attempt_id: task.execution.attempt_id, count: task.execution.attempt_count },
     artifacts,
     review, delivery, error: visibleError,
     next_action: nextAction,
-    source_schema_version: '5.0.0', capabilities: { pause: { supported: false, reason: 'Alpha.2 capability' }, resume: { supported: false, reason: 'Alpha.2 capability' }, retry: { supported: false, reason: 'Alpha.2 capability' }, review: { supported: true, reason: null }, dictionary_snapshot: { supported: true, reason: null }, provided_transcript: { supported: true, reason: null } }, extensions: {},
+    source_schema_version: '5.0.0', capabilities: { pause: { supported: taskControl, reason: taskControl ? null : 'Alpha.1 task has no safe checkpoint record' }, resume: { supported: taskControl, reason: taskControl ? null : 'Alpha.1 task has no safe checkpoint record' }, retry: { supported: taskControl, reason: taskControl ? null : 'Alpha.1 task has no retry ledger' }, review: { supported: true, reason: null }, dictionary_snapshot: { supported: true, reason: null }, provided_transcript: { supported: true, reason: null } }, extensions: {},
   });
 }
 
@@ -1305,7 +1758,13 @@ export async function projectV5Result(directory: string, taskInput?: TaskRecordV
       return { snapshots: task.dictionary_snapshot.resolved, conflict_count: snapshot.conflicts.length, match_count: snapshot.matched_entry_ids.length };
     })(), artifacts: view.artifacts,
     review: { status: view.review.status, pending_count: view.review.pending_count, approved: ['finalized', 'not_required'].includes(view.review.status) }, delivery: view.delivery,
-    calls: [{ provider: modelSnapshot.models.asr?.plugin_id ?? 'asr', capability: 'transcription', count: task.execution.provider_calls.asr.count, outcome: task.execution.provider_calls.asr.outcome }, { provider: modelSnapshot.models.chat.plugin_id, capability: 'calibration', count: task.execution.provider_calls.chat.count, outcome: task.execution.provider_calls.chat.outcome }],
+    calls: [{
+      provider: modelSnapshot.models.asr?.plugin_id ?? 'asr', capability: 'transcription', count: task.execution.provider_calls.asr.count,
+      outcome: task.execution.provider_calls.asr.count > 1 ? 'mixed' : task.execution.provider_calls.asr.outcome,
+    }, {
+      provider: modelSnapshot.models.chat.plugin_id, capability: 'calibration', count: task.execution.provider_calls.chat.count,
+      outcome: task.execution.provider_calls.chat.count > 1 ? 'mixed' : task.execution.provider_calls.chat.outcome,
+    }],
     warnings: task.warnings, error: view.error, next_action: view.next_action, extensions: {},
   });
 }
@@ -1336,11 +1795,14 @@ async function reconcileMisclassifiedChatOutcomeUnknown(
     repaired.stage = null;
     repaired.execution.safe_checkpoint = null;
     repaired.execution.provider_calls.chat = {
+      ...call,
       state: 'in_flight',
       count: call.count,
       outcome: 'outcome_unknown',
       evidence_ref: call.evidence_ref,
       evidence_sha256: call.evidence_sha256,
+      response_persisted_at: null,
+      terminal_at: null,
     };
     const issue = calibration.errors[0] as { message?: unknown } | undefined;
     repaired.error = exchangeError(
@@ -1410,10 +1872,71 @@ export async function claimV5Job(workspace: string, job: BackgroundJobV1, worker
   return withTaskTransitionLock(directory, async () => {
     const currentJob = await readJob(workspace, job.task_id); const task = await readV5Task(directory);
     if (task.status !== 'queued' || currentJob.state !== 'queued' || task.execution.cancel_requested_at) return null;
-    const at = new Date().toISOString(); task.status = 'running'; task.stage = 'preparing'; task.execution.started_at = at; task.execution.worker_id = workerId; task.execution.heartbeat_at = at; task.execution.attempt_id = `att-${randomBytes(8).toString('hex')}`; task.execution.attempt_count += 1; task.execution.safe_checkpoint = 'claimed';
+    const at = new Date().toISOString();
+    const preboundAttempt = task.execution.attempt_id !== null;
+    const retrying = preboundAttempt && task.execution.attempt_id!.startsWith('att-retry-');
+    task.status = 'running'; task.stage = 'preparing'; task.execution.started_at = at; task.execution.worker_id = workerId; task.execution.heartbeat_at = at;
+    if (!preboundAttempt) {
+      task.execution.attempt_id = `att-${randomBytes(8).toString('hex')}`;
+      task.execution.attempt_count += 1;
+      task.execution.safe_checkpoint = 'claimed';
+    }
     await persistV5Task(directory, task); currentJob.state = 'claimed'; currentJob.worker_id = workerId; currentJob.claim_token = randomBytes(16).toString('hex'); currentJob.updated_at = at; await writeJob(workspace, currentJob);
-    await appendStableJsonLine(path.join(directory, 'attempts.jsonl'), { contract: 'mercury.attempt/v1', task_id: task.identity.task_id, attempt_id: task.execution.attempt_id, number: task.execution.attempt_count, started_at: at, transcription_mode: task.input_config.transcription_mode, asr_call_count: task.execution.provider_calls.asr.count });
-    await appendV5Event(directory, task, 'worker_claimed', `后台 Worker 已开始处理${task.input_config.transcription_mode === 'provided' ? '外部转录' : 'Provider 转写'}任务。`, { attempt: task.execution.attempt_count, transcription_mode: task.input_config.transcription_mode }); return task;
+    if (!preboundAttempt) await appendStableJsonLine(path.join(directory, 'attempts.jsonl'), {
+      contract: 'mercury.attempt/v1', task_id: task.identity.task_id, attempt_id: task.execution.attempt_id,
+      number: task.execution.attempt_count, source: 'initial', actor: 'system', based_on_revision: task.identity.revision,
+      started_at: at, checkpoint: 'claimed', transcription_mode: task.input_config.transcription_mode,
+      starting_asr_call_count: task.execution.provider_calls.asr.count,
+      starting_chat_call_count: task.execution.provider_calls.chat.count,
+      asr_call_count: task.execution.provider_calls.asr.count,
+      chat_call_count: task.execution.provider_calls.chat.count,
+    });
+    await appendV5Event(directory, task, preboundAttempt ? (retrying ? 'worker_retry_started' : 'worker_resumed') : 'worker_claimed', preboundAttempt ? (retrying ? `后台 Worker 已开始 append-only retry attempt ${task.execution.attempt_id}。` : `后台 Worker 正从检查点 ${task.execution.safe_checkpoint} 继续同一 attempt。`) : `后台 Worker 已开始处理${task.input_config.transcription_mode === 'provided' ? '外部转录' : 'Provider 转写'}任务。`, { attempt: task.execution.attempt_count, attempt_id: task.execution.attempt_id, checkpoint: task.execution.safe_checkpoint, transcription_mode: task.input_config.transcription_mode }); return task;
+  });
+}
+
+async function ensureAttemptResultFact(directory: string, task: TaskRecordV5): Promise<void> {
+  const attemptId = task.execution.attempt_id;
+  if (!attemptId) return;
+  const target = path.join(directory, 'attempts.jsonl');
+  await repairTrailingJsonlFragment(target);
+  const records = await readFile(target, 'utf8').then((source) => source.split('\n').filter(Boolean).map((line) => {
+    try {
+      return JSON.parse(line) as {
+        contract?: string; attempt_id?: string; starting_asr_call_count?: number; starting_chat_call_count?: number;
+        asr_call_count?: number; chat_call_count?: number;
+      };
+    } catch { throw new MercuryError('ATTEMPT_LEDGER_INVALID', 'attempt 账本损坏；不会继续或重放 Provider。'); }
+  })).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  });
+  if (records.some((entry) => entry.contract === 'mercury.attempt-result/v1' && entry.attempt_id === attemptId)) return;
+  const start = records.find((entry) => entry.contract === 'mercury.attempt/v1' && entry.attempt_id === attemptId);
+  if (!start) throw new MercuryError('ATTEMPT_LEDGER_INVALID', '当前 attempt 缺少 append-only 起始记录。');
+  const startingAsr = start.starting_asr_call_count ?? start.asr_call_count ?? 0;
+  const startingChat = start.starting_chat_call_count ?? start.chat_call_count ?? 0;
+  await appendStableJsonLine(target, {
+    contract: 'mercury.attempt-result/v1', task_id: task.identity.task_id, attempt_id: attemptId,
+    number: task.execution.attempt_count, ended_at: task.execution.ended_at, status: task.status,
+    safe_checkpoint: task.execution.safe_checkpoint,
+    asr_call_count: task.execution.provider_calls.asr.count,
+    chat_call_count: task.execution.provider_calls.chat.count,
+    error_code: task.error?.code ?? null,
+    provider_outcomes: {
+      asr: task.execution.provider_calls.asr.outcome,
+      chat: task.execution.provider_calls.chat.outcome,
+    },
+    starting_call_counts: { asr: startingAsr, chat: startingChat },
+    ending_call_counts: { asr: task.execution.provider_calls.asr.count, chat: task.execution.provider_calls.chat.count },
+    new_call_counts: {
+      asr: task.execution.provider_calls.asr.count - startingAsr,
+      chat: task.execution.provider_calls.chat.count - startingChat,
+    },
+    response_evidence: {
+      asr: task.execution.provider_calls.asr.evidence_sha256,
+      chat: task.execution.provider_calls.chat.evidence_sha256,
+    },
   });
 }
 
@@ -1423,19 +1946,7 @@ export async function finishV5Job(workspace: string, task: TaskRecordV5): Promis
     const current = await readV5Task(directory);
     if (!TERMINAL.has(current.status)) throw new MercuryError('JOB_TASK_STATE_CONFLICT', 'v5 任务尚未终结。');
     const job = await readJob(workspace, current.identity.task_id);
-    const attemptsPath = path.join(directory, 'attempts.jsonl');
-    const attemptRecords = await readFile(attemptsPath, 'utf8').then((source) => source.split('\n').filter(Boolean).map((line) => JSON.parse(line) as { contract?: string; attempt_id?: string })).catch((error) => {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
-      throw error;
-    });
-    if (!attemptRecords.some((entry) => entry.contract === 'mercury.attempt-result/v1' && entry.attempt_id === current.execution.attempt_id)) {
-      await appendStableJsonLine(path.join(directory, 'attempts.jsonl'), {
-        contract: 'mercury.attempt-result/v1', task_id: current.identity.task_id, attempt_id: current.execution.attempt_id,
-        number: current.execution.attempt_count, ended_at: current.execution.ended_at, status: current.status,
-        asr_call_count: current.execution.provider_calls.asr.count, chat_call_count: current.execution.provider_calls.chat.count,
-        safe_checkpoint: current.execution.safe_checkpoint,
-      });
-    }
+    await ensureAttemptResultFact(directory, current);
     if (job.state !== 'terminal') {
       job.state = 'terminal'; job.updated_at = new Date().toISOString(); await writeJob(workspace, job);
     }
@@ -1447,7 +1958,7 @@ export async function cancelV5Task(workspace: string, task: TaskRecordV5): Promi
   return withTaskTransitionLock(directory, async () => {
     const current = await readV5Task(directory); if (TERMINAL.has(current.status)) return { task: current, pending: false };
     current.execution.cancel_requested_at ??= new Date().toISOString();
-    if (current.status === 'queued') {
+    if (current.status === 'queued' || current.status === 'paused') {
       let cancelled = await cancelV5AtBoundary(directory, current);
       const event = await v5CancellationEventFacts(directory, cancelled);
       await appendV5Event(directory, cancelled, 'task_cancelled', event.message, event.data);
@@ -1460,14 +1971,660 @@ export async function cancelV5Task(workspace: string, task: TaskRecordV5): Promi
   });
 }
 
+export async function pauseV5Task(workspace: string, task: TaskRecordV5, fault?: (point: V5FaultPoint, task: TaskRecordV5) => Promise<void> | void): Promise<{ task: TaskRecordV5; pending: boolean }> {
+  const directory = taskRoot(workspace, task.identity.task_directory);
+  return withTaskTransitionLock(directory, async () => {
+    let current = await readV5Task(directory);
+    if (!hasTaskControl(current)) throw new MercuryError('CONTRACT_UNSUPPORTED', '此 Alpha.1 历史任务没有安全暂停检查点；查询未做任何写入。', { exitCode: 5 });
+    if (TERMINAL.has(current.status)) throw new MercuryError('TASK_PAUSE_UNAVAILABLE', `任务已是 ${current.status}，不能暂停。`, { exitCode: 3 });
+    if (current.execution.cancel_requested_at) throw new MercuryError('TASK_CANCEL_WINS', '任务已请求取消；取消优先，不能再请求暂停。', { exitCode: 3 });
+    if (current.status === 'paused') {
+      const job = await readJob(workspace, current.identity.task_id);
+      if (job.state !== 'paused') {
+        job.state = 'paused'; job.worker_id = null; job.claim_token = null; job.updated_at = new Date().toISOString();
+        await writeJob(workspace, job);
+      }
+      current = await ensurePausedEvent(directory, current);
+      return { task: current, pending: false };
+    }
+    if (current.status === 'pausing') return { task: current, pending: true };
+    const at = new Date().toISOString();
+    current.execution.control!.pause_requested_at = at;
+    current.updated_at = at;
+    if (current.status === 'queued') {
+      current = await pauseV5AtBoundary(directory, current, fault);
+      return { task: current, pending: false };
+    }
+    current.status = 'pausing';
+    await persistV5Task(directory, current);
+    await appendV5Event(directory, current, 'pause_requested', '暂停请求已记录；Mercury 将在下一个可证明安全的检查点暂停。', {
+      checkpoint: current.execution.safe_checkpoint,
+      provider_in_flight: Object.values(current.execution.provider_calls).some((entry) => entry.state === 'in_flight'),
+    });
+    return { task: await readV5Task(directory), pending: true };
+  });
+}
+
+async function validateV5ResumeCheckpoint(directory: string, task: TaskRecordV5): Promise<void> {
+  if (!hasTaskControl(task) || !['paused', 'interrupted'].includes(task.status) || task.execution.safe_checkpoint === null) {
+    throw new MercuryError('TASK_RESUME_UNSAFE', '任务没有可恢复的 Alpha.2 安全检查点。', { exitCode: 3 });
+  }
+  if (Object.values(task.execution.provider_calls).some((entry) => entry.state === 'in_flight' || entry.outcome === 'outcome_unknown')) {
+    throw new MercuryError('TASK_RESUME_UNSAFE', 'Provider 结果不确定，不能安全恢复或自动重放。', { exitCode: 3 });
+  }
+  if (Object.values(task.execution.provider_calls).some((entry) => entry.state === 'terminal' && entry.outcome === 'known_terminal')) {
+    throw new MercuryError('TASK_RESUME_UNSAFE', '已知 Provider 终态失败必须先生成 retry plan，不能用 resume 掩盖新调用。', { exitCode: 3 });
+  }
+  const allowed = new Set(['queued', 'claimed', 'asr_not_started', 'asr_response_persisted', 'chat_not_started', 'chat_response_persisted']);
+  if (!allowed.has(task.execution.safe_checkpoint)) throw new MercuryError('TASK_RESUME_UNSAFE', `不支持从检查点 ${task.execution.safe_checkpoint} 恢复。`, { exitCode: 3 });
+  const snapshot = await readVerifiedV5ModelSnapshot(directory, task);
+  if (await sha256File(managed(directory, task.dictionary_snapshot.path)).catch(() => null) !== task.dictionary_snapshot.sha256) {
+    throw new MercuryError('TASK_RESUME_UNSAFE', '词典快照缺失或损坏，不能安全恢复。', { exitCode: 3 });
+  }
+  await verifyV5ImmutableInputs(directory, task);
+  if (task.execution.provider_calls.asr.evidence_ref) {
+    if (!task.inputs.media || !snapshot.models.asr) throw new MercuryError('TASK_RESUME_UNSAFE', 'ASR 响应证据缺少固定媒体或模型 identity。', { exitCode: 3 });
+    const bytes = await readVerifiedMediaBytes(directory, task.inputs.media);
+    assertAsrEvidenceIdentity(
+      await readPinnedEvidence(directory, task.execution.provider_calls.asr, 'TASK_RESUME_UNSAFE'),
+      task,
+      snapshot,
+      task.inputs.media,
+      readMp3DurationMsFromBytes(bytes),
+    );
+  }
+  if (task.execution.provider_calls.chat.evidence_ref) {
+    assertChatEvidenceIdentity(await readPinnedEvidence(directory, task.execution.provider_calls.chat, 'TASK_RESUME_UNSAFE'), task, snapshot);
+    await verifyV5CalibrationSources(directory, task);
+  }
+  if (task.artifacts.transcript && task.calibration_sources.transcript) {
+    await verifyV5CalibrationSources(directory, task).catch((error) => {
+      throw new MercuryError('TASK_RESUME_UNSAFE', `校准来源证据无法安全恢复：${error instanceof MercuryError ? error.code : 'INVALID'}`, { exitCode: 3 });
+    });
+  }
+  if (task.artifacts.transcribed) await verifyInternalArtifact(directory, task.artifacts.transcribed, 'TASK_RESUME_UNSAFE');
+  if (task.execution.attempt_id !== null) {
+    try { await readVerifiedRetryLedger(directory, task); }
+    catch (error) {
+      if (error instanceof MercuryError) throw new MercuryError('TASK_RESUME_UNSAFE', `attempt/Provider 账本未通过完整历史校验：${error.code}。`, { exitCode: 3 });
+      throw error;
+    }
+  }
+}
+
+export async function resumeV5Task(workspace: string, task: TaskRecordV5, fault?: (point: V5FaultPoint, task: TaskRecordV5) => Promise<void> | void): Promise<TaskRecordV5> {
+  const directory = taskRoot(workspace, task.identity.task_directory);
+  return withTaskTransitionLock(directory, async () => {
+    let current = await readV5Task(directory);
+    const replayable = ['queued', 'running', 'pausing'].includes(current.status)
+      && (current.execution.control?.resume_count ?? 0) > 0;
+    if (replayable) {
+      const events = await stableEvents(directory);
+      const controlEvents = events.filter((event) => event.attempt_id === current.execution.attempt_id
+        && ['task_paused', 'task_resumed', 'retry_scheduled'].includes(event.type));
+      const latest = controlEvents.at(-1)?.type;
+      if (latest === 'task_paused' || latest === 'task_resumed') {
+        const job = await readJob(workspace, current.identity.task_id);
+        if (current.status === 'queued' && job.state !== 'queued') {
+          job.state = 'queued'; job.worker_id = null; job.claim_token = null; job.updated_at = new Date().toISOString();
+          await writeJob(workspace, job);
+        }
+        current = await ensureResumedEvent(directory, current);
+        return current;
+      }
+    }
+    await validateV5ResumeCheckpoint(directory, current);
+    const job = await readJob(workspace, current.identity.task_id);
+    if (!((current.status === 'paused' && job.state === 'paused') || (current.status === 'interrupted' && job.state === 'terminal'))) throw new MercuryError('TASK_RESUME_UNSAFE', '任务与后台 job 的可恢复状态不一致。', { exitCode: 3 });
+    const at = new Date().toISOString();
+    current.status = 'queued';
+    current.stage = null;
+    current.execution.ended_at = null;
+    current.execution.started_at = null;
+    current.execution.worker_id = null;
+    current.execution.heartbeat_at = null;
+    current.execution.control!.pause_requested_at = null;
+    current.execution.control!.paused_at = null;
+    current.execution.control!.resume_count += 1;
+    current.error = null;
+    current.updated_at = at;
+    await persistV5Task(directory, current);
+    await crashFault(fault, 'after_resume_task_committed', current);
+    job.state = 'queued'; job.worker_id = null; job.claim_token = null; job.updated_at = at; await writeJob(workspace, job);
+    await crashFault(fault, 'after_resume_job_committed', current);
+    return ensureResumedEvent(directory, current);
+  });
+}
+
+function retryOutcome(task: TaskRecordV5): ProviderCall['outcome'] {
+  const calls = [task.execution.provider_calls.chat, task.execution.provider_calls.asr];
+  return calls.find((entry) => entry.outcome === 'outcome_unknown')?.outcome
+    ?? calls.find((entry) => entry.outcome === 'known_terminal')?.outcome
+    ?? calls.find((entry) => entry.outcome === 'response_persisted')?.outcome
+    ?? 'not_dispatched';
+}
+
+function retryPlanId(identity: unknown): string {
+  return `rpl-${digest(canonicalJson(identity)).slice(0, 24)}`;
+}
+
+export async function planV5Retry(directory: string, input?: TaskRecordV5, now = new Date()): Promise<ExchangeRetryPlanV1> {
+  const task = input ?? await readV5Task(directory);
+  if (!hasTaskControl(task)) throw new MercuryError('CONTRACT_UNSUPPORTED', '此 Alpha.1 历史任务没有安全重试账本；查询未做任何写入。', { exitCode: 5 });
+  await readVerifiedV5ModelSnapshot(directory, task);
+  if (await sha256File(managed(directory, task.dictionary_snapshot.path)).catch(() => null) !== task.dictionary_snapshot.sha256) {
+    throw new MercuryError('DICTIONARY_RECORD_INVALID', '词典快照缺失或损坏；retry-plan 未写入任何状态。');
+  }
+  const outcome = retryOutcome(task);
+  const chatKnownFailure = task.execution.provider_calls.chat.outcome === 'known_terminal';
+  const asrKnownFailure = task.execution.provider_calls.asr.outcome === 'known_terminal';
+  const retryChatOnly = chatKnownFailure || (task.input_config.transcription_mode === 'provided' && task.execution.provider_calls.chat.outcome === 'not_dispatched');
+  const responsePersisted = task.execution.provider_calls.chat.state === 'response_persisted'
+    || task.execution.provider_calls.asr.state === 'response_persisted';
+  const retryableStatus = ['failed', 'interrupted'].includes(task.status);
+  const userInputProblem = task.error ? ['input', 'config', 'security'].includes(task.error.category) : false;
+  let evidenceProblem: string | null = null;
+  try {
+    await readVerifiedRetryLedger(directory, task);
+    await verifyV5ImmutableInputs(directory, task);
+    if (retryChatOnly) {
+      await verifyInternalArtifact(directory, task.artifacts.transcript, 'RETRY_EVIDENCE_INVALID');
+      await verifyInternalArtifact(directory, task.artifacts.transcribed, 'RETRY_EVIDENCE_INVALID');
+      await verifyV5CalibrationSources(directory, task);
+    }
+  } catch (error) {
+    evidenceProblem = error instanceof MercuryError ? error.code : 'RETRY_EVIDENCE_INVALID';
+  }
+  const allowed = retryableStatus && outcome !== 'outcome_unknown' && !responsePersisted && !userInputProblem && evidenceProblem === null
+    && (outcome === 'known_terminal' || outcome === 'not_dispatched');
+  const checkpoint: ExchangeRetryPlanV1['checkpoint'] = retryChatOnly ? 'chat_not_started'
+    : asrKnownFailure ? 'asr_not_started'
+      : task.execution.safe_checkpoint === 'outputs_validated' ? null : task.execution.safe_checkpoint;
+  const estimate = allowed
+    ? retryChatOnly
+      ? { asr: 0, chat: 1 }
+      : task.input_config.transcription_mode === 'provided'
+        ? { asr: 0, chat: 1 }
+        : { asr: 1, chat: 1 }
+    : { asr: 0, chat: 0 };
+  const reason = allowed ? null
+    : outcome === 'outcome_unknown' ? 'Provider 结果不确定，安全 retry 被禁止；如需重新处理必须创建新的逻辑 request。'
+      : responsePersisted ? 'Provider 响应已经固定；请使用 task resume 继续本地工作，不要新增调用。'
+        : userInputProblem ? '输入、配置或安全问题必须先由用户修复，并使用新的 request ID。'
+          : evidenceProblem ? `本地复用证据未通过 ${evidenceProblem} 校验；不能安全创建新 attempt。`
+          : !retryableStatus ? `任务状态 ${task.status} 不允许 retry。`
+            : '当前失败没有可证明安全的重试起点。';
+  const reuse = ['request', 'model_snapshot', 'dictionary_snapshot', 'input_snapshots'];
+  if (retryChatOnly && task.artifacts.transcribed) reuse.push('transcript', 'transcribed_srt', ...(task.input_config.transcription_mode === 'provider' ? ['asr_response'] : []));
+  const discard = ['current_error', 'calibration_report'];
+  if (retryChatOnly) discard.push('chat_response', 'calibrated_srt', 'approved_srt');
+  else discard.push('asr_response', 'transcript', 'transcribed_srt', 'chat_response', 'calibrated_srt', 'approved_srt');
+  const validityMs = 24 * 60 * 60 * 1000;
+  const taskTime = new Date(task.updated_at).getTime();
+  const effectiveNow = Math.max(taskTime, now.getTime());
+  const validityWindow = Math.floor((effectiveNow - taskTime) / validityMs);
+  const createdAt = new Date(taskTime + validityWindow * validityMs).toISOString();
+  const expiresAt = new Date(taskTime + (validityWindow + 1) * validityMs).toISOString();
+  const normalized = {
+    task_id: task.identity.task_id, task_revision: task.identity.revision, attempt_id: task.execution.attempt_id,
+    checkpoint, provider_outcome: outcome, reuse, discard, estimated_calls: estimate,
+    models: { asr: task.models.asr, chat: task.models.chat }, allowed, reason,
+    requires_user_action: userInputProblem || outcome === 'outcome_unknown' || evidenceProblem !== null,
+    risk: outcome === 'outcome_unknown' ? 'unsafe_provider_outcome' : allowed ? 'new_provider_calls' : 'none',
+  };
+  const planBody = { ...normalized, created_at: createdAt, expires_at: expiresAt };
+  return assertExchangeContract('retryPlan', {
+    contract: 'mercury.retry-plan/v1', plan_id: retryPlanId(planBody), ...planBody, extensions: {},
+  });
+}
+
+async function archiveRetryArtifacts(directory: string, task: TaskRecordV5): Promise<Record<string, unknown>> {
+  const archived: Record<string, unknown> = {};
+  const attemptKey = digest(task.execution.attempt_id ?? `attempt-${task.execution.attempt_count}`).slice(0, 20);
+  const workRoot = managed(directory, 'work');
+  const workEntry = await lstat(workRoot);
+  if (!workEntry.isDirectory() || workEntry.isSymbolicLink()) throw new MercuryError('RETRY_ARCHIVE_INVALID', '任务 work 目录不安全；未创建新 attempt。');
+  const historyRoot = managed(directory, 'work/attempt-history');
+  const historyEntry = await lstat(historyRoot).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  });
+  if (historyEntry && (!historyEntry.isDirectory() || historyEntry.isSymbolicLink())) throw new MercuryError('RETRY_ARCHIVE_INVALID', 'attempt-history 路径不安全；未创建新 attempt。');
+  if (!historyEntry) await mkdir(historyRoot, { mode: 0o700 });
+  const archiveRoot = managed(directory, `work/attempt-history/${attemptKey}`);
+  const archiveEntry = await lstat(archiveRoot).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  });
+  if (archiveEntry && (!archiveEntry.isDirectory() || archiveEntry.isSymbolicLink())) throw new MercuryError('RETRY_ARCHIVE_INVALID', '旧 attempt 归档目录不安全。');
+  if (!archiveEntry) await mkdir(archiveRoot, { mode: 0o700 });
+  await chmod(archiveRoot, 0o700);
+  for (const [identity, value] of Object.entries(task.artifacts)) {
+    if (!value) { archived[identity] = null; continue; }
+    const source = managed(directory, value.path);
+    const sourceEntry = await lstat(source).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    });
+    if (!sourceEntry?.isFile() || sourceEntry.isSymbolicLink()) {
+      archived[identity] = { original_path: value.path, sha256: value.sha256, validation: 'unavailable', archive_path: null };
+      continue;
+    }
+    const sourceHandle = await open(source, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)).catch(() => null);
+    let bytes: Buffer | null = null;
+    if (sourceHandle) {
+      try {
+        const opened = await sourceHandle.stat();
+        if (opened.isFile() && opened.dev === sourceEntry.dev && opened.ino === sourceEntry.ino && opened.size === sourceEntry.size) bytes = await sourceHandle.readFile();
+      } finally {
+        await sourceHandle.close();
+      }
+    }
+    if (!bytes || digest(bytes) !== value.sha256) {
+      archived[identity] = { original_path: value.path, sha256: value.sha256, validation: 'unavailable', archive_path: null };
+      continue;
+    }
+    const extension = path.extname(value.path).slice(0, 12);
+    const relative = `work/attempt-history/${attemptKey}/${identity}-${value.sha256.slice(0, 16)}${extension}`;
+    const target = managed(directory, relative);
+    const handle = await open(target, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'EEXIST') return null;
+      throw error;
+    });
+    if (handle) {
+      try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
+      await chmod(target, 0o600);
+    }
+    const targetEntry = await lstat(target);
+    if (!targetEntry.isFile() || targetEntry.isSymbolicLink() || targetEntry.nlink !== 1) throw new MercuryError('RETRY_ARCHIVE_INVALID', '旧 attempt 产物归档目标不是安全独占普通文件；未创建新 attempt。');
+    if ((targetEntry.mode & 0o777) !== 0o600) await chmod(target, 0o600);
+    if (await sha256File(target) !== value.sha256) throw new MercuryError('RETRY_ARCHIVE_INVALID', '旧 attempt 产物归档 hash 不一致；未创建新 attempt。');
+    archived[identity] = { original_path: value.path, archive_path: relative, sha256: value.sha256, validation: value.validation };
+  }
+  return archived;
+}
+
+async function appendRetryAttemptFacts(directory: string, task: TaskRecordV5, plan: ExchangeRetryPlanV1, nextAttemptId: string, at: string): Promise<void> {
+  const target = path.join(directory, 'attempts.jsonl');
+  await repairTrailingJsonlFragment(target).catch((error) => {
+    if (error instanceof MercuryError) throw new MercuryError('RETRY_LEDGER_INVALID', error.message);
+    throw error;
+  });
+  const records = await readVerifiedRetryLedger(directory, task);
+  if (!records.some((entry) => entry.contract === 'mercury.retry/v1' && entry.plan_id === plan.plan_id)) {
+    const previousArtifacts = await archiveRetryArtifacts(directory, task);
+    await appendStableJsonLine(target, {
+      contract: 'mercury.retry/v1', plan_id: plan.plan_id, task_id: task.identity.task_id, based_on_revision: plan.task_revision,
+      previous_attempt_id: task.execution.attempt_id, previous_status: task.status, previous_error: task.error,
+      previous_artifacts: previousArtifacts,
+      reuse: plan.reuse, discard: plan.discard, estimated_calls: plan.estimated_calls, created_at: at,
+      actor: 'user', plan,
+    });
+  }
+  if (!records.some((entry) => entry.contract === 'mercury.attempt/v1' && entry.attempt_id === nextAttemptId)) {
+    await appendStableJsonLine(target, {
+      contract: 'mercury.attempt/v1', task_id: task.identity.task_id, attempt_id: nextAttemptId, number: task.execution.attempt_count + 1,
+      source: 'retry', actor: 'user', retry_plan_id: plan.plan_id, based_on_revision: plan.task_revision, started_at: at,
+      checkpoint: plan.checkpoint, transcription_mode: task.input_config.transcription_mode,
+      starting_asr_call_count: task.execution.provider_calls.asr.count,
+      starting_chat_call_count: task.execution.provider_calls.chat.count,
+      reuse: plan.reuse, discard: plan.discard,
+    });
+  }
+}
+
+interface RetryLedgerRecord {
+  [key: string]: unknown;
+  contract?: string;
+  task_id?: string;
+  number?: number;
+  plan_id?: string;
+  attempt_id?: string;
+  retry_plan_id?: string;
+  based_on_revision?: number;
+  started_at?: string;
+  plan?: unknown;
+}
+
+async function readRetryLedgerReadOnly(directory: string): Promise<RetryLedgerRecord[]> {
+  const target = path.join(directory, 'attempts.jsonl');
+  let handle;
+  try {
+    const entry = await lstat(target);
+    if (!entry.isFile() || entry.isSymbolicLink() || entry.size > 8 * 1024 * 1024) throw new MercuryError('RETRY_LEDGER_INVALID', 'attempt 账本不是安全的 Mercury 普通文件。');
+    handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.dev !== entry.dev || opened.ino !== entry.ino) throw new MercuryError('RETRY_LEDGER_INVALID', 'attempt 账本在只读核验期间被替换。');
+    const source = await handle.readFile('utf8');
+    const complete = source.endsWith('\n') ? source : source.slice(0, source.lastIndexOf('\n') + 1);
+    return complete.split('\n').filter(Boolean).map((line) => {
+      try { return JSON.parse(line) as RetryLedgerRecord; }
+      catch { throw new MercuryError('RETRY_LEDGER_INVALID', 'attempt 账本包含损坏的完整记录；未执行 retry 或 Provider 调用。'); }
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    if (error instanceof MercuryError) throw error;
+    throw new MercuryError('RETRY_LEDGER_INVALID', 'attempt 账本无法安全读取；未执行 retry 或 Provider 调用。');
+  } finally { await handle?.close().catch(() => undefined); }
+}
+
+function assertRetryLedgerIdentity(records: RetryLedgerRecord[], task: TaskRecordV5, snapshot: ModelSnapshotV3): void {
+  const invalid = (message: string): never => { throw new MercuryError('RETRY_LEDGER_INVALID', `${message}；未执行 retry 或 Provider 调用。`); };
+  const number = (value: unknown, label: string): number => {
+    if (!Number.isInteger(value) || Number(value) < 0) invalid(`${label} 不是非负整数`);
+    return Number(value);
+  };
+  const same = (left: unknown, right: unknown): boolean => canonicalJson(left) === canonicalJson(right);
+  if (!task.execution.attempt_id || task.execution.attempt_count < 1) invalid('当前任务缺少 attempt identity');
+  const activeCurrent = !TERMINAL.has(task.status);
+  const completedAttemptCount = task.execution.attempt_count - (activeCurrent ? 1 : 0);
+  if (records.length === 0) invalid('当前任务缺少 append-only attempt 账本');
+  const knownContracts = new Set([
+    'mercury.attempt/v1', 'mercury.attempt-result/v1', 'mercury.attempt-result-correction/v1',
+    'mercury.provider-call/v1', 'mercury.retry/v1',
+  ]);
+  if (records.some((record) => typeof record.contract !== 'string' || !knownContracts.has(record.contract))) invalid('attempt 账本包含未知合同');
+  if (records.some((record) => record.task_id !== task.identity.task_id)) invalid('attempt 账本 task identity 不一致');
+  const starts = records.filter((record) => record.contract === 'mercury.attempt/v1');
+  const retries = records.filter((record) => record.contract === 'mercury.retry/v1');
+  const results = records.filter((record) => record.contract === 'mercury.attempt-result/v1');
+  const corrections = records.filter((record) => record.contract === 'mercury.attempt-result-correction/v1');
+  const calls = records.filter((record) => record.contract === 'mercury.provider-call/v1');
+  const startIds = new Set<string>();
+  for (const [index, start] of starts.entries()) {
+    const attemptId = start.attempt_id;
+    if (typeof attemptId !== 'string' || startIds.has(attemptId) || start.number !== index + 1) invalid('attempt 起点缺失、重复或序号不连续');
+    startIds.add(attemptId as string);
+    if (typeof start.based_on_revision !== 'number' || start.based_on_revision < 1 || start.based_on_revision > task.identity.revision) invalid('attempt 起点 revision 无效');
+    if (index === 0 && start.source !== 'initial') invalid('首个 attempt 不是 initial');
+    if (index > 0 && (start.source !== 'retry' || typeof start.retry_plan_id !== 'string')) invalid('后续 attempt 缺少 retry plan 引用');
+  }
+  const pendingStarts = starts.length - task.execution.attempt_count;
+  if (pendingStarts < 0 || pendingStarts > (activeCurrent ? 0 : 1)) invalid('attempt 数量与 task attempt_count 不一致');
+  const currentStart = starts[task.execution.attempt_count - 1];
+  if (!currentStart || currentStart.attempt_id !== task.execution.attempt_id) invalid('当前 task attempt 与 append-only 起点不一致');
+  if (retries.length !== Math.max(0, starts.length - 1)) invalid('retry 计划事实数量与 retry attempt 不一致');
+  const matchedRetryIds = new Set<string>();
+  for (let index = 1; index < starts.length; index += 1) {
+    const start = starts[index]!; const previous = starts[index - 1]!;
+    const matching = retries.filter((record) => record.plan_id === start.retry_plan_id);
+    if (matching.length !== 1) invalid('retry attempt 缺少唯一计划事实');
+    const retry = matching[0]!; const planId = String(start.retry_plan_id);
+    if (matchedRetryIds.has(planId)) invalid('retry plan 被多个 attempt 复用');
+    matchedRetryIds.add(planId);
+    if (retry.based_on_revision !== start.based_on_revision || retry.previous_attempt_id !== previous.attempt_id
+      || typeof retry.plan !== 'object' || retry.plan === null) invalid('retry 事实与 attempt/revision/前序 attempt 不一致');
+    let plan: ExchangeRetryPlanV1;
+    try { plan = assertExchangeContract('retryPlan', retry.plan); } catch { invalid('retry 账本内嵌计划不符合合同'); }
+    const { contract: _contract, plan_id: _planId, extensions: _extensions, ...planBody } = plan!;
+    if (plan!.plan_id !== planId || retry.plan_id !== planId || retryPlanId(planBody) !== planId
+      || plan!.task_id !== task.identity.task_id || plan!.task_revision !== start.based_on_revision
+      || plan!.attempt_id !== previous.attempt_id || !plan!.allowed || plan!.checkpoint !== start.checkpoint
+      || !same(retry.reuse, plan!.reuse) || !same(retry.discard, plan!.discard)
+      || !same(retry.estimated_calls, plan!.estimated_calls)) invalid('retry 计划 ID、revision、checkpoint 或执行内容不闭合');
+  }
+  if (retries.some((retry) => typeof retry.plan_id !== 'string' || !matchedRetryIds.has(retry.plan_id))) invalid('retry 账本包含重复或孤儿计划事实');
+  for (let number = 1; number <= completedAttemptCount; number += 1) {
+    const start = starts[number - 1]!;
+    const matching = results.filter((record) => record.attempt_id === start.attempt_id);
+    if (matching.length !== 1 || matching[0]!.number !== number) invalid('attempt 终态结果缺失、重复或序号不一致');
+  }
+  if (results.length !== completedAttemptCount || results.some((record) => !startIds.has(String(record.attempt_id)))) invalid('attempt result 包含重复或孤儿事实');
+  if (corrections.some((record) => !startIds.has(String(record.attempt_id)))) invalid('attempt correction 引用了未知 attempt');
+  const startCounts = (start: RetryLedgerRecord, index: number) => ({
+    asr: number(start.starting_asr_call_count ?? start.asr_call_count, `attempt ${index + 1} ASR 起始计数`),
+    chat: number(start.starting_chat_call_count ?? start.chat_call_count, `attempt ${index + 1} Chat 起始计数`),
+  });
+  const attemptFacts = starts.slice(0, completedAttemptCount).map((start, index) => {
+    const result = results.find((record) => record.attempt_id === start.attempt_id)!;
+    const attemptCorrections = corrections.filter((record) => record.attempt_id === start.attempt_id);
+    if (attemptCorrections.length > 1) invalid('attempt correction 重复');
+    const correction = attemptCorrections[0];
+    if (correction && correction.supersedes_status !== result.status) invalid('attempt correction 未指向原始终态');
+    const status = correction?.status ?? result.status;
+    const errorCode = correction?.reason_code ?? result.error_code ?? null;
+    const starting = startCounts(start, index);
+    const resultStarting = result.starting_call_counts as { asr?: unknown; chat?: unknown } | undefined;
+    const endingSource = result.ending_call_counts as { asr?: unknown; chat?: unknown } | undefined;
+    const deltas = result.new_call_counts as { asr?: unknown; chat?: unknown } | undefined;
+    if (!resultStarting || !endingSource || !deltas) invalid('attempt result 缺少调用计数闭包');
+    const ending = { asr: number(endingSource!.asr, 'ASR 终止计数'), chat: number(endingSource!.chat, 'Chat 终止计数') };
+    if (resultStarting!.asr !== starting.asr || resultStarting!.chat !== starting.chat
+      || result.asr_call_count !== ending.asr || result.chat_call_count !== ending.chat
+      || deltas!.asr !== ending.asr - starting.asr || deltas!.chat !== ending.chat - starting.chat
+      || ending.asr < starting.asr || ending.chat < starting.chat) invalid('attempt starting/ending/delta 调用计数不闭合');
+    if (index > 0) {
+      const prior = starts[index - 1]!; const priorResult = results.find((record) => record.attempt_id === prior.attempt_id)!;
+      const priorEnding = priorResult.ending_call_counts as { asr?: unknown; chat?: unknown };
+      if (starting.asr !== number(priorEnding.asr, '前一 attempt ASR 终止计数') || starting.chat !== number(priorEnding.chat, '前一 attempt Chat 终止计数')) invalid('相邻 attempt Provider 计数不连续');
+    }
+    const nextStart = starts[index + 1];
+    if (nextStart) {
+      const retry = retries.find((record) => record.plan_id === nextStart.retry_plan_id)!;
+      const previousError = retry.previous_error as { code?: unknown } | null | undefined;
+      if (retry.previous_status !== status || (previousError?.code ?? null) !== errorCode) invalid('retry 事实未固定前一 attempt 的有效终态/错误');
+    }
+    return { start, result, status, errorCode, starting, ending, active: false as const };
+  });
+  const activeFacts = activeCurrent ? (() => {
+    const start = starts[task.execution.attempt_count - 1]!; const starting = startCounts(start, task.execution.attempt_count - 1);
+    if (attemptFacts.length > 0) {
+      const prior = attemptFacts.at(-1)!;
+      if (starting.asr !== prior.ending.asr || starting.chat !== prior.ending.chat) invalid('active attempt 与历史 Provider 计数不连续');
+    }
+    const ending = { asr: task.execution.provider_calls.asr.count, chat: task.execution.provider_calls.chat.count };
+    if (ending.asr < starting.asr || ending.chat < starting.chat) invalid('active attempt Provider 计数回退');
+    return { start, result: null, status: null, errorCode: null, starting, ending, active: true as const };
+  })() : null;
+  const allAttemptFacts = activeFacts ? [...attemptFacts, activeFacts] : attemptFacts;
+  if (!activeCurrent) {
+    const currentFacts = attemptFacts.at(-1)!;
+    if (currentFacts.status !== task.status || currentFacts.errorCode !== (task.error?.code ?? null)) invalid('当前 attempt 有效终态/错误与 task 不一致');
+    if (currentFacts.ending.asr !== task.execution.provider_calls.asr.count || currentFacts.ending.chat !== task.execution.provider_calls.chat.count) invalid('当前 attempt Provider 计数与 task 不一致');
+    const currentOutcomes = currentFacts.result.provider_outcomes as { asr?: unknown; chat?: unknown } | undefined;
+    if (!currentOutcomes || currentOutcomes.asr !== task.execution.provider_calls.asr.outcome || currentOutcomes.chat !== task.execution.provider_calls.chat.outcome) invalid('当前 attempt Provider outcome 与 task 不一致');
+  }
+  if (calls.some((record) => !startIds.has(String(record.attempt_id)))) invalid('Provider call 引用了未知 attempt');
+  for (const role of ['asr', 'chat'] as const) {
+    const roleCalls = calls.filter((record) => record.role === role);
+    const groupedByNumber = new Map<number, RetryLedgerRecord[]>();
+    for (const record of roleCalls) {
+      const callId = record.call_id; const callNumber = record.call_number;
+      if (typeof callId !== 'string' || typeof callNumber !== 'number' || callNumber < 1) invalid('Provider call identity 无效');
+      groupedByNumber.set(callNumber as number, [...(groupedByNumber.get(callNumber as number) ?? []), record]);
+    }
+    const total = task.execution.provider_calls[role].count;
+    if (groupedByNumber.size !== total || Array.from({ length: total }, (_, index) => index + 1).some((callNumber) => !groupedByNumber.has(callNumber))) invalid(`${role} Provider call_number 不连续`);
+    for (const [callNumber, phases] of groupedByNumber) {
+      const callIds = new Set(phases.map((record) => record.call_id));
+      if (callIds.size !== 1) invalid('同一 Provider call_number 对应多个 call ID');
+      if (phases.filter((record) => record.phase === 'dispatched').length !== 1 || phases.filter((record) => record.phase === 'terminal').length > 1) invalid('Provider call phase 不完整或重复');
+      if (phases.filter((record) => record.phase === 'response_persisted').length > 1) invalid('Provider response phase 重复');
+      const order = phases.map((record) => ({ dispatched: 1, response_persisted: 2, terminal: 3 })[String(record.phase)] ?? 0);
+      if (order.includes(0) || order.some((value, index) => index > 0 && value <= order[index - 1]!)) invalid('Provider call phase 顺序无效');
+      const attempt = allAttemptFacts.find((facts) => callNumber > facts.starting[role] && callNumber <= facts.ending[role]);
+      if (!attempt || phases.some((record) => record.attempt_id !== attempt!.start.attempt_id)) invalid('Provider call 未落在唯一历史 attempt 计数区间');
+      const expectedCapability = role === 'asr' ? 'transcription' : 'calibration';
+      const expectedModelRef = role === 'asr' ? snapshot.models.asr?.snapshot_entry_id ?? null : snapshot.models.chat.snapshot_entry_id;
+      if (!expectedModelRef || phases.some((record) => record.capability !== expectedCapability || record.model_snapshot_entry_ref !== expectedModelRef)) invalid('历史 Provider call 能力或模型 identity 不一致');
+      const terminal = phases.find((record) => record.phase === 'terminal');
+      if (!attempt!.active) {
+        if (!terminal) invalid('历史 Provider call 缺少 terminal phase');
+        const outcomes = attempt!.result!.provider_outcomes as { asr?: unknown; chat?: unknown };
+        const evidence = attempt!.result!.response_evidence as { asr?: unknown; chat?: unknown };
+        if (terminal!.outcome !== outcomes[role] || terminal!.evidence_sha256 !== evidence[role]) invalid('历史 Provider terminal outcome/evidence 与 attempt result 不一致');
+      } else {
+        const currentCall = task.execution.provider_calls[role];
+        const responseCount = phases.filter((record) => record.phase === 'response_persisted').length;
+        const terminalCount = terminal ? 1 : 0;
+        if (callNumber !== total || phases.some((record) => record.call_id !== currentCall.call_id)
+          || (currentCall.state === 'in_flight' && (responseCount !== 0 || terminalCount !== 0))
+          || (currentCall.state === 'response_persisted' && (responseCount !== 1 || terminalCount !== 0))
+          || (currentCall.state === 'terminal' && terminalCount !== 1)) invalid('active attempt Provider phase 与 task checkpoint 不一致');
+        const latest = phases.at(-1)!;
+        if (currentCall.state !== 'in_flight' && (latest.evidence_ref !== currentCall.evidence_ref || latest.evidence_sha256 !== currentCall.evidence_sha256)) invalid('active attempt Provider evidence 与 task 不一致');
+      }
+      if (!activeCurrent && callNumber === total && !attempt!.active) {
+        const currentCall = task.execution.provider_calls[role];
+        if (terminal!.call_id !== currentCall.call_id || terminal!.outcome !== currentCall.outcome
+          || terminal!.evidence_ref !== currentCall.evidence_ref || terminal!.evidence_sha256 !== currentCall.evidence_sha256) invalid(`当前 ${role} Provider call 与 task 不一致`);
+      }
+    }
+  }
+}
+
+async function readVerifiedRetryLedger(directory: string, task: TaskRecordV5): Promise<RetryLedgerRecord[]> {
+  const [records, snapshot] = await Promise.all([
+    readRetryLedgerReadOnly(directory),
+    readVerifiedV5ModelSnapshot(directory, task),
+  ]);
+  assertRetryLedgerIdentity(records, task, snapshot);
+  return records;
+}
+
+async function readRetryLedger(directory: string, task?: TaskRecordV5): Promise<RetryLedgerRecord[]> {
+  const target = path.join(directory, 'attempts.jsonl');
+  await repairTrailingJsonlFragment(target).catch((error) => {
+    if (error instanceof MercuryError) throw new MercuryError('RETRY_LEDGER_INVALID', error.message);
+    throw error;
+  });
+  const records = await readRetryLedgerReadOnly(directory);
+  if (task) assertRetryLedgerIdentity(records, task, await readVerifiedV5ModelSnapshot(directory, task));
+  return records;
+}
+
+async function ensureRetryScheduledEvent(directory: string, taskInput: TaskRecordV5, plan: ExchangeRetryPlanV1, attemptId: string): Promise<TaskRecordV5> {
+  let task = taskInput;
+  const exists = (await stableEvents(directory)).some((event) => event.type === 'retry_scheduled'
+    && event.attempt_id === attemptId
+    && (event.data as Record<string, unknown>).plan_id === plan.plan_id);
+  if (!exists) {
+    await appendV5Event(directory, task, 'retry_scheduled', `已按只读计划 ${plan.plan_id} 创建 append-only attempt；预计新增 ASR ${plan.estimated_calls.asr} 次、Chat ${plan.estimated_calls.chat} 次。`, {
+      plan_id: plan.plan_id, attempt_id: attemptId, based_on_revision: plan.task_revision,
+      estimated_asr_calls: plan.estimated_calls.asr, estimated_chat_calls: plan.estimated_calls.chat,
+    });
+    task = await readV5Task(directory);
+  }
+  return task;
+}
+
+async function commitRetryTransition(
+  workspace: string,
+  directory: string,
+  taskInput: TaskRecordV5,
+  plan: ExchangeRetryPlanV1,
+  nextAttemptId: string,
+  at: string,
+  fault?: (point: V5FaultPoint, task: TaskRecordV5) => Promise<void> | void,
+): Promise<TaskRecordV5> {
+  let current = taskInput;
+  if (!(current.status === 'queued' && current.execution.attempt_id === nextAttemptId)) {
+    const retryAsr = plan.estimated_calls.asr > 0;
+    current.status = 'queued'; current.stage = null; current.error = null;
+    current.execution.started_at = null; current.execution.ended_at = null; current.execution.worker_id = null; current.execution.heartbeat_at = null;
+    current.execution.attempt_id = nextAttemptId; current.execution.attempt_count += 1;
+    current.execution.safe_checkpoint = retryAsr ? 'asr_not_started' : 'chat_not_started';
+    current.execution.cancel_requested_at = null;
+    current.execution.control!.pause_requested_at = null; current.execution.control!.paused_at = null;
+    current.execution.control!.retry_count = (current.execution.control!.retry_count ?? 0) + 1;
+    if (retryAsr) {
+      current.execution.provider_calls.asr = { ...current.execution.provider_calls.asr, state: 'not_started', count: current.execution.provider_calls.asr.count, outcome: 'not_dispatched', evidence_ref: null, evidence_sha256: null, call_id: null, capability: null, model_snapshot_entry_ref: null, dispatched_at: null, response_persisted_at: null, terminal_at: null };
+      current.execution.provider_calls.chat = { ...current.execution.provider_calls.chat, state: 'not_started', count: current.execution.provider_calls.chat.count, outcome: 'not_dispatched', evidence_ref: null, evidence_sha256: null, call_id: null, capability: null, model_snapshot_entry_ref: null, dispatched_at: null, response_persisted_at: null, terminal_at: null };
+      current.calibration_sources.transcript = null;
+      current.artifacts.transcript = null; current.artifacts.transcribed = null;
+    } else {
+      current.execution.provider_calls.chat = { ...current.execution.provider_calls.chat, state: 'not_started', count: current.execution.provider_calls.chat.count, outcome: 'not_dispatched', evidence_ref: null, evidence_sha256: null, call_id: null, capability: null, model_snapshot_entry_ref: null, dispatched_at: null, response_persisted_at: null, terminal_at: null };
+    }
+    current.artifacts.calibrated = null; current.artifacts.approved = null; current.artifacts.report = null;
+    current.review = { status: 'not_ready', pending_count: null };
+    if (current.delivery?.requested_directory) current.delivery = { ...current.delivery, status: 'pending_review', final_path: null, sha256: null, validation: 'unavailable', delivered_at: null, review_revision: null, error: null };
+    current.updated_at = at;
+    await persistV5Task(directory, current);
+    await crashFault(fault, 'after_retry_task_committed', current);
+  }
+  const job = await readJob(workspace, current.identity.task_id);
+  if (job.state !== 'queued') {
+    job.state = 'queued'; job.worker_id = null; job.claim_token = null; job.updated_at = at;
+    await writeJob(workspace, job);
+    await crashFault(fault, 'after_retry_job_committed', current);
+  }
+  current = await ensureRetryScheduledEvent(directory, await readV5Task(directory), plan, nextAttemptId);
+  return current;
+}
+
+async function pendingRetryTransition(directory: string, task: TaskRecordV5): Promise<{ plan: ExchangeRetryPlanV1; attemptId: string; at: string } | null> {
+  if (!['failed', 'interrupted'].includes(task.status)) return null;
+  const records = await readRetryLedger(directory);
+  for (const retry of [...records].reverse()) {
+    if (retry.contract !== 'mercury.retry/v1' || retry.based_on_revision !== task.identity.revision || !retry.plan_id || !retry.plan) continue;
+    const attempt = records.find((entry) => entry.contract === 'mercury.attempt/v1' && entry.retry_plan_id === retry.plan_id);
+    if (!attempt?.attempt_id || !attempt.started_at) continue;
+    const plan = assertExchangeContract('retryPlan', retry.plan);
+    if (plan.plan_id !== retry.plan_id || plan.task_id !== task.identity.task_id || plan.task_revision !== task.identity.revision || !plan.allowed) {
+      throw new MercuryError('RETRY_LEDGER_INVALID', 'retry 账本与当前 task identity/revision 不一致；未调用 Provider。');
+    }
+    return { plan, attemptId: attempt.attempt_id, at: attempt.started_at };
+  }
+  return null;
+}
+
+async function currentRetryTransition(directory: string, task: TaskRecordV5): Promise<{ plan: ExchangeRetryPlanV1; attemptId: string } | null> {
+  if (!task.execution.attempt_id?.startsWith('att-retry-')) return null;
+  const records = await readRetryLedger(directory);
+  const attempt = records.find((entry) => entry.contract === 'mercury.attempt/v1' && entry.attempt_id === task.execution.attempt_id);
+  if (!attempt?.retry_plan_id) throw new MercuryError('RETRY_LEDGER_INVALID', '当前 retry attempt 缺少固定计划引用。');
+  const retry = records.find((entry) => entry.contract === 'mercury.retry/v1' && entry.plan_id === attempt.retry_plan_id);
+  if (!retry?.plan) throw new MercuryError('RETRY_LEDGER_INVALID', '当前 retry attempt 缺少只读计划证据。');
+  const plan = assertExchangeContract('retryPlan', retry.plan);
+  if (plan.plan_id !== attempt.retry_plan_id || plan.task_id !== task.identity.task_id) throw new MercuryError('RETRY_LEDGER_INVALID', '当前 retry attempt 的计划 identity 不一致。');
+  return { plan, attemptId: task.execution.attempt_id };
+}
+
+export async function executeV5Retry(workspace: string, task: TaskRecordV5, planId: string, now = new Date(), fault?: (point: V5FaultPoint, task: TaskRecordV5) => Promise<void> | void): Promise<TaskRecordV5> {
+  const directory = taskRoot(workspace, task.identity.task_directory);
+  return withTaskTransitionLock(directory, async () => {
+    const current = await readV5Task(directory);
+    if (retryOutcome(current) === 'outcome_unknown') throw new MercuryError('RETRY_UNSAFE_PROVIDER_OUTCOME', 'Provider 结果不确定，安全 retry 被禁止；不得自动重放。', { exitCode: 3 });
+    if (current.execution.provider_calls.chat.state === 'response_persisted' || current.execution.provider_calls.asr.state === 'response_persisted') {
+      throw new MercuryError('RETRY_USE_RESUME', 'Provider 响应已经固定；请使用 task resume 继续本地工作，不要新增调用。', { exitCode: 3 });
+    }
+    await readVerifiedRetryLedger(directory, current);
+    const plan = await planV5Retry(directory, current, now);
+    if (plan.plan_id !== planId || plan.task_revision !== current.identity.revision) {
+      const previous = await planV5Retry(directory, current, new Date(new Date(plan.created_at).getTime() - 1));
+      if (previous.plan_id === planId && now.getTime() >= new Date(previous.expires_at).getTime()) {
+        throw new MercuryError('RETRY_PLAN_EXPIRED', 'retry plan 已过期；请重新运行 retry-plan 获取新的只读计划。', { exitCode: 3 });
+      }
+      throw new MercuryError('RETRY_PLAN_STALE', 'retry plan 与当前 task revision 或有效时间窗口不一致；请重新运行 retry-plan。', { exitCode: 3 });
+    }
+    if (now.getTime() >= new Date(plan.expires_at).getTime()) throw new MercuryError('RETRY_PLAN_EXPIRED', 'retry plan 已过期；请重新运行 retry-plan 获取新的只读计划。', { exitCode: 3 });
+    if (!plan.allowed) {
+      const code = plan.provider_outcome === 'outcome_unknown' ? 'RETRY_UNSAFE_PROVIDER_OUTCOME' : plan.provider_outcome === 'response_persisted' ? 'RETRY_USE_RESUME' : 'RETRY_NOT_ALLOWED';
+      throw new MercuryError(code, plan.reason ?? '当前任务不能安全 retry。', { exitCode: 3 });
+    }
+    const job = await readJob(workspace, current.identity.task_id);
+    if (job.state !== 'terminal') throw new MercuryError('TASK_STATE_CONFLICT', 'retry 需要 task 与 job 同时处于稳定失败终态。', { exitCode: 3 });
+    const at = now.toISOString();
+    const nextAttemptId = `att-retry-${digest(plan.plan_id).slice(0, 16)}`;
+    await appendRetryAttemptFacts(directory, current, plan, nextAttemptId, at);
+    await crashFault(fault, 'after_retry_ledger_appended', current);
+    return commitRetryTransition(workspace, directory, current, plan, nextAttemptId, at, fault);
+  });
+}
+
 export async function readV5Events(directory: string, after = 0): Promise<ExchangeEventV1[]> { const task = await readV5Task(directory); return (await stableEvents(directory)).filter((event) => event.task_id === task.identity.task_id && event.sequence > after); }
 
 export async function auditV5Job(workspace: string, listed: BackgroundJobV1): Promise<void> {
   const directory = taskRoot(workspace, listed.task_directory);
   await withTaskTransitionLock(directory, async () => {
-    let task = await readV5Task(directory); const job = await readJob(workspace, listed.task_id);
+    let task = await readV5Task(directory); let job = await readJob(workspace, listed.task_id);
     const eventRevision = (await stableEvents(directory)).at(-1)?.task_revision ?? 0;
     if (eventRevision > task.identity.revision) { task.identity.revision = eventRevision; task.updated_at = new Date().toISOString(); await persistV5Task(directory, task); }
+    const pendingRetry = await pendingRetryTransition(directory, task);
+    if (pendingRetry) {
+      task = await commitRetryTransition(workspace, directory, task, pendingRetry.plan, pendingRetry.attemptId, pendingRetry.at);
+      job = await readJob(workspace, listed.task_id);
+    }
     if (TERMINAL.has(task.status)) {
       task = await reconcileMisclassifiedChatOutcomeUnknown(directory, task);
       await ensureOutcomeUnknownAttemptCorrection(directory, task);
@@ -1485,32 +2642,40 @@ export async function auditV5Job(workspace: string, listed: BackgroundJobV1): Pr
         await appendV5Event(directory, current, terminalType, cancellation?.message ?? '后台任务已在安全审计中确认终态。', cancellation?.data ?? {});
         current = await readV5Task(directory);
       }
+      await ensureAttemptResultFact(directory, current);
       await writeV5Result(directory, current);
-      const attemptsPath = path.join(directory, 'attempts.jsonl');
-      const attemptRecords = await readFile(attemptsPath, 'utf8').then((source) => source.split('\n').filter(Boolean).map((line) => JSON.parse(line) as { contract?: string; attempt_id?: string })).catch((error) => {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
-        throw error;
-      });
-      if (!attemptRecords.some((entry) => entry.contract === 'mercury.attempt-result/v1' && entry.attempt_id === current.execution.attempt_id)) {
-        await appendStableJsonLine(attemptsPath, {
-          contract: 'mercury.attempt-result/v1', task_id: current.identity.task_id, attempt_id: current.execution.attempt_id,
-          number: current.execution.attempt_count, ended_at: current.execution.ended_at, status: current.status,
-          asr_call_count: current.execution.provider_calls.asr.count, chat_call_count: current.execution.provider_calls.chat.count,
-          safe_checkpoint: current.execution.safe_checkpoint,
-        });
-      }
       if (job.state !== 'terminal') { job.state = 'terminal'; job.updated_at = new Date().toISOString(); await writeJob(workspace, job); }
       return;
     }
-    if (task.status === 'queued' && job.state === 'queued') return;
+    if (task.status === 'queued') {
+      if (job.state !== 'queued') {
+        job.state = 'queued'; job.worker_id = null; job.claim_token = null; job.updated_at = new Date().toISOString();
+        await writeJob(workspace, job);
+      }
+      const retry = await currentRetryTransition(directory, task);
+      if (retry) await ensureRetryScheduledEvent(directory, task, retry.plan, retry.attemptId);
+      else if ((task.execution.control?.resume_count ?? 0) > 0) await ensureResumedEvent(directory, task);
+      return;
+    }
+    if (task.status === 'paused') {
+      if (job.state !== 'paused') { job.state = 'paused'; job.worker_id = null; job.claim_token = null; job.updated_at = new Date().toISOString(); await writeJob(workspace, job); }
+      await ensurePausedEvent(directory, task);
+      return;
+    }
     const calls = Object.values(task.execution.provider_calls);
     const call = task.execution.provider_calls.chat;
     if (calls.some((entry) => entry.state === 'in_flight')) {
       task.status = 'interrupted'; task.stage = null; task.execution.ended_at = new Date().toISOString(); task.error = exchangeError('TASK_INTERRUPTED_PROVIDER_UNKNOWN', 'Worker 中断时 Provider 结果无法确认。', 'outcome_unknown'); job.state = 'terminal';
+    } else if (hasTaskControl(task) && (task.status === 'pausing' || task.execution.control!.pause_requested_at !== null)) {
+      const at = new Date().toISOString();
+      task.status = 'paused'; task.stage = null; task.execution.started_at = null; task.execution.worker_id = null; task.execution.heartbeat_at = null;
+      task.execution.control!.pause_requested_at ??= at; task.execution.control!.paused_at = at;
+      job.state = 'paused'; job.worker_id = null; job.claim_token = null;
     } else {
       task.status = 'queued'; task.stage = null; task.execution.started_at = null; task.execution.worker_id = null; task.execution.heartbeat_at = null; task.execution.attempt_id = null;
       task.execution.safe_checkpoint = call.state === 'response_persisted' ? 'chat_response_persisted'
         : task.execution.provider_calls.asr.state === 'response_persisted' ? 'asr_response_persisted' : 'queued';
+      if (hasTaskControl(task) && task.execution.safe_checkpoint !== 'queued') task.execution.attempt_id = (await readV5Task(directory)).execution.attempt_id;
       job.state = 'queued'; job.worker_id = null; job.claim_token = null;
     }
     task.updated_at = new Date().toISOString(); job.updated_at = task.updated_at; await persistV5Task(directory, task); await writeJob(workspace, job);
@@ -1519,7 +2684,7 @@ export async function auditV5Job(workspace: string, listed: BackgroundJobV1): Pr
 
 export async function heartbeatV5Task(workspace: string, taskId: string, workerId: string, at: string): Promise<void> {
   const job = await readJob(workspace, taskId); const directory = taskRoot(workspace, job.task_directory);
-  await withTaskTransitionLock(directory, async () => { const task = await readV5Task(directory); if (task.status === 'running' && task.execution.worker_id === workerId) { task.execution.heartbeat_at = at; task.updated_at = at; await persistV5Task(directory, task); } });
+  await withTaskTransitionLock(directory, async () => { const task = await readV5Task(directory); if (['running', 'pausing'].includes(task.status) && task.execution.worker_id === workerId) { task.execution.heartbeat_at = at; task.updated_at = at; await persistV5Task(directory, task); } });
 }
 
 export async function containV5Failure(workspace: string, listed: BackgroundJobV1, error: unknown): Promise<'terminal' | 'requeued'> {
@@ -1532,7 +2697,19 @@ export async function containV5Failure(workspace: string, listed: BackgroundJobV
     else if (error instanceof MercuryError && ['ASR_ARTIFACT_INVALID', 'CALIBRATION_RESULT_INVALID', 'REFERENCE_INPUT_INVALID', 'DICTIONARY_RECORD_INVALID', 'MODEL_SNAPSHOT_INVALID'].includes(error.code)) {
       task.status = 'failed'; task.error = exchangeError(error.code, '已持久化的本地证据缺失、损坏或 identity 不一致；任务已安全停止，未重放 Provider。', 'response_persisted', error.message, 'security'); job.state = 'terminal';
     }
-    else if (call.state === 'response_persisted' || task.execution.provider_calls.asr.state === 'response_persisted') { task.status = 'queued'; task.stage = null; task.execution.started_at = null; task.execution.worker_id = null; task.execution.heartbeat_at = null; task.execution.attempt_id = null; task.execution.safe_checkpoint = call.state === 'response_persisted' ? 'chat_response_persisted' : 'asr_response_persisted'; job.state = 'queued'; job.worker_id = null; job.claim_token = null; }
+    else if (hasTaskControl(task) && (task.status === 'pausing' || task.execution.control!.pause_requested_at !== null)) {
+      const at = new Date().toISOString();
+      task.status = 'paused'; task.stage = null; task.execution.started_at = null; task.execution.worker_id = null; task.execution.heartbeat_at = null;
+      task.execution.safe_checkpoint = call.state === 'response_persisted' ? 'chat_response_persisted' : task.execution.provider_calls.asr.state === 'response_persisted' ? 'asr_response_persisted' : task.execution.safe_checkpoint;
+      task.execution.control!.pause_requested_at ??= at; task.execution.control!.paused_at = at;
+      job.state = 'paused'; job.worker_id = null; job.claim_token = null;
+    }
+    else if (call.state === 'response_persisted' || task.execution.provider_calls.asr.state === 'response_persisted') {
+      task.status = 'queued'; task.stage = null; task.execution.started_at = null; task.execution.worker_id = null; task.execution.heartbeat_at = null;
+      if (!hasTaskControl(task)) task.execution.attempt_id = null;
+      task.execution.safe_checkpoint = call.state === 'response_persisted' ? 'chat_response_persisted' : 'asr_response_persisted';
+      job.state = 'queued'; job.worker_id = null; job.claim_token = null;
+    }
     else { task.status = 'failed'; task.error = exchangeError(error instanceof MercuryError ? error.code : 'WORKER_JOB_FAILED_BEFORE_PROVIDER', '后台任务在 Provider 调用前遇到内部错误；未自动重试。', 'not_dispatched'); job.state = 'terminal'; }
     task.stage = null; if (task.status !== 'queued') task.execution.ended_at = new Date().toISOString(); task.updated_at = new Date().toISOString(); job.updated_at = task.updated_at; await persistV5Task(directory, task); await writeJob(workspace, job); await writeV5Result(directory, task); return task.status === 'queued' ? 'requeued' : 'terminal';
   });

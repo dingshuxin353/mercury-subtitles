@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercury.local/schemas/exchange/v1/retry-plan.schema.json",
+  "title": "ExchangeRetryPlanV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "plan_id", "task_id", "task_revision", "attempt_id", "created_at", "expires_at", "checkpoint", "provider_outcome", "reuse", "discard", "estimated_calls", "models", "allowed", "reason", "requires_user_action", "risk", "extensions"],
+  "properties": {
+    "contract": { "const": "mercury.retry-plan/v1" },
+    "plan_id": { "type": "string", "pattern": "^rpl-[a-f0-9]{24}$" },
+    "task_id": { "$ref": "common.schema.json#/$defs/taskId" },
+    "task_revision": { "type": "integer", "minimum": 0 },
+    "attempt_id": { "type": ["string", "null"], "maxLength": 100 },
+    "created_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "expires_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "checkpoint": { "enum": ["queued", "claimed", "asr_not_started", "asr_response_persisted", "chat_not_started", "chat_response_persisted", null] },
+    "provider_outcome": { "enum": ["not_dispatched", "known_terminal", "response_persisted", "outcome_unknown", "not_applicable"] },
+    "reuse": { "type": "array", "uniqueItems": true, "maxItems": 20, "items": { "type": "string", "minLength": 1, "maxLength": 100 } },
+    "discard": { "type": "array", "uniqueItems": true, "maxItems": 20, "items": { "type": "string", "minLength": 1, "maxLength": 100 } },
+    "estimated_calls": {
+      "type": "object", "additionalProperties": false, "required": ["asr", "chat"],
+      "properties": { "asr": { "type": "integer", "minimum": 0, "maximum": 10 }, "chat": { "type": "integer", "minimum": 0, "maximum": 10 } }
+    },
+    "models": {
+      "type": "object", "additionalProperties": false, "required": ["asr", "chat"],
+      "properties": { "asr": { "type": ["string", "null"], "maxLength": 100 }, "chat": { "type": "string", "minLength": 1, "maxLength": 100 } }
+    },
+    "allowed": { "type": "boolean" },
+    "reason": { "type": ["string", "null"], "maxLength": 500 },
+    "requires_user_action": { "type": "boolean" },
+    "risk": { "enum": ["none", "new_provider_calls", "unsafe_provider_outcome"] },
+    "extensions": { "$ref": "common.schema.json#/$defs/extensions" }
+  }
+}

@@ -265,6 +265,20 @@ describe('SRT serialization and disk validation', () => {
     ]));
   });
 
+  it('rejects user-visible sentence punctuation while accepting protected lexical punctuation', () => {
+    const expected = [{
+      subtitle_segment_id: 'subtitle-0001', index: 0, start_ms: 0, end_ms: 1_000,
+      text: '版本 3.0使用 B-roll', confidence: 'high' as const, asr_segment_refs: ['seg-1'], reference_segment_refs: []
+    }];
+    const context = { audioDurationMs: 1_000, expectedSegments: expected, mode: null, referenceSegments: null };
+    const invalid = validateSrtText('1\n00:00:00,000 --> 00:00:01,000\n版本 3.0，使用 B-roll。\n', context);
+    expect(invalid.valid).toBe(false);
+    expect(invalid.checks).toContainEqual(expect.objectContaining({ check_id: 'SRT_VISIBLE_SUBTITLE_STYLE', status: 'failed' }));
+    const valid = validateSrtText('1\n00:00:00,000 --> 00:00:01,000\n版本 3.0使用 B-roll\n', context);
+    expect(valid.valid).toBe(true);
+    expect(valid.checks).toContainEqual(expect.objectContaining({ check_id: 'SRT_VISIBLE_SUBTITLE_STYLE', status: 'passed' }));
+  });
+
   it('enforces the 24-character hard limit even when two output lines are possible', () => {
     const text = '一二三四五六七八九十一二三四五六七八九十一二三四五';
     const expected = [{

@@ -1,6 +1,15 @@
 # Mercury Changelog
 
-## 0.3.0-alpha.1 — Unreleased
+## 0.3.0-alpha.2 — Unreleased
+
+- Added safe queued/running pause checkpoints and same-attempt resume without replaying persisted Provider responses.
+- Added deterministic read-only retry plans and append-only retry attempts with explicit Provider call estimates and unknown-outcome refusal.
+- Migrated the packaged Mercury Skill to stable `mercury.cli/v1` / Exchange v1 for external inputs, dictionaries, task control, review and approved-SRT delivery.
+- Added read-only stable media inspection and non-sensitive model default/readiness discovery for Agent request construction.
+- Removed sentence punctuation from every new user-visible transcribed, calibrated, approved and delivered SRT while preserving lexical punctuation in versions, technical names, URLs and abbreviations.
+- Replaced soft character-count reflow with source-boundary-first segmentation; only source timing, internal sentence punctuation, punctuation-plus-pause evidence or the 24-character hard limit may create a boundary. Silence alone never creates a split.
+
+## 0.3.0-alpha.1 — 2026-08-17
 
 - Added Exchange Protocol v1 schemas, generated types and stable machine CLI foundations.
 - Added external SRT, VTT and transcript JSON imports with explicit roles, normalized provenance and auditable zero-ASR provided mode.

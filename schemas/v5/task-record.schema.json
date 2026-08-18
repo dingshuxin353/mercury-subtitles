@@ -86,7 +86,18 @@
           "required": ["asr", "chat"],
           "properties": { "asr": { "$ref": "#/$defs/providerCall" }, "chat": { "$ref": "#/$defs/providerCall" } }
         },
-        "cancel_requested_at": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/timestamp" }] }
+        "cancel_requested_at": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/timestamp" }] },
+        "control": {
+          "type": "object", "additionalProperties": false,
+          "required": ["checkpoint_version", "pause_requested_at", "paused_at", "resume_count", "retry_count"],
+          "properties": {
+            "checkpoint_version": { "const": "mercury.safe-checkpoint/v1" },
+            "pause_requested_at": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/timestamp" }] },
+            "paused_at": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/timestamp" }] },
+            "resume_count": { "type": "integer", "minimum": 0, "maximum": 1000 },
+            "retry_count": { "type": "integer", "minimum": 0, "maximum": 1000 }
+          }
+        }
       }
     },
     "artifacts": {
@@ -145,7 +156,13 @@
         "count": { "type": "integer", "minimum": 0, "maximum": 1000 },
         "outcome": { "enum": ["not_dispatched", "known_terminal", "response_persisted", "outcome_unknown", "not_applicable"] },
         "evidence_ref": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/taskRelativePath" }] },
-        "evidence_sha256": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/sha256" }] }
+        "evidence_sha256": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/sha256" }] },
+        "call_id": { "type": ["string", "null"], "pattern": "^pcl-[a-f0-9]{24}$" },
+        "capability": { "enum": ["transcription", "calibration", null] },
+        "model_snapshot_entry_ref": { "type": ["string", "null"], "minLength": 1, "maxLength": 200 },
+        "dispatched_at": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/timestamp" }] },
+        "response_persisted_at": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/timestamp" }] },
+        "terminal_at": { "anyOf": [{ "type": "null" }, { "$ref": "../exchange/v1/common.schema.json#/$defs/timestamp" }] }
       }
     },
     "internalArtifact": {

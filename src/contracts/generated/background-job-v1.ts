@@ -6,7 +6,7 @@ export interface BackgroundJobV1 {
   contract_version: 'mercury-job-experimental-v1';
   task_id: string;
   task_directory: string;
-  state: 'queued' | 'claimed' | 'terminal';
+  state: 'queued' | 'claimed' | 'paused' | 'terminal';
   created_at: string;
   updated_at: string;
   claim_token: string | null;

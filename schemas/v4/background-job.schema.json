@@ -9,7 +9,7 @@
     "contract_version": { "const": "mercury-job-experimental-v1" },
     "task_id": { "type": "string", "pattern": "^tsk-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}$" },
     "task_directory": { "type": "string", "minLength": 1 },
-    "state": { "enum": ["queued", "claimed", "terminal"] },
+    "state": { "enum": ["queued", "claimed", "paused", "terminal"] },
     "created_at": { "type": "string", "format": "date-time" },
     "updated_at": { "type": "string", "format": "date-time" },
     "claim_token": { "type": ["string", "null"], "pattern": "^[a-f0-9]{32}$" },

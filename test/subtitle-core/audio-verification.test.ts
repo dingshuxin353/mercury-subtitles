@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { AudioVerification } from '../../src/contracts/index.js';
 import { serializeCalibratedSrt, validateSrtText } from '../../src/output-report/index.js';
-import { applyAudioVerificationFindings, type CalibratedTranscript } from '../../src/subtitle-core/index.js';
+import { applyAudioVerificationFindings, normalizeVisibleSubtitleText, type CalibratedTranscript } from '../../src/subtitle-core/index.js';
 
 function transcript(): CalibratedTranscript {
   return {
@@ -133,7 +133,7 @@ describe('D009 audio-verification application boundary', () => {
       check_id: 'SRT_CALIBRATED_MAPPING', status: 'passed'
     }));
     expect(validated.segments.map((segment) => segment.text.replace('\n', ''))).toEqual(
-      result.calibrated.segments.map((segment) => segment.text)
+      result.calibrated.segments.map((segment) => normalizeVisibleSubtitleText(segment.text).text)
     );
     expect(srt).not.toMatch(/3\.\n0/u);
   });

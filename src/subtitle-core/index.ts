@@ -10,9 +10,12 @@ export { runSubtitleCore } from './pipeline.js';
 export { applyAudioVerificationFindings } from './audio-verification.js';
 export { normalizeCalibrationUnitText, normalizeReferenceSrtForCalibration, parseReferenceSrt, textOnlyTimelineIssue } from './srt.js';
 export { countSubtitleCharacters, lineCount } from './text.js';
+export { normalizeVisibleSubtitleText, VISIBLE_SUBTITLE_STYLE_VERSION } from './visible-text.js';
+export type { VisibleSubtitleTextResult } from './visible-text.js';
 export {
   HARD_MAX_CHARACTERS,
   MATCH_COVERAGE_THRESHOLD,
+  SEGMENTATION_POLICY_VERSION,
   SOFT_MAX_DURATION_MS,
   SOFT_MAX_READING_SPEED,
   SOFT_MIN_DURATION_MS,

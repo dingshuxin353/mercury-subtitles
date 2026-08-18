@@ -6,7 +6,7 @@ import { MercuryError } from './errors.js';
 import { readProductVersion } from './version.js';
 
 export const MERCURY_SKILL_NAME = 'mercury-subtitles';
-export const MERCURY_SKILL_CONTRACT = 'mercury-cli-experimental-v1';
+export const MERCURY_SKILL_CONTRACT = 'mercury.cli/v1';
 export const MERCURY_SKILL_SOURCE = 'dingshuxin353/mercury-subtitles';
 export const MERCURY_SKILL_INSTALL_COMMAND =
   `npx skills add ${MERCURY_SKILL_SOURCE}`;

@@ -14,10 +14,12 @@ import {
 } from '../src/contracts/index.js';
 import {
   appendStableJsonLine,
+  DEFAULT_STABLE_JSON_MAX_NODES,
   projectMachineTaskToExchangeResult,
   projectMachineTaskToExchangeTask,
   readStableJson,
   repairTrailingJsonlFragment,
+  TRANSCRIPT_STABLE_JSON_MAX_NODES,
   writeStableJsonAtomic,
 } from '../src/exchange/index.js';
 import type { MachineTaskView } from '../src/background/types.js';
@@ -80,12 +82,12 @@ function dictionary(): ExchangeDictionaryV1 {
 }
 
 describe('Exchange Protocol v1 contracts', () => {
-  it('ships all seven stable contract identities and schemas', () => {
+  it('ships all eight stable contract identities and schemas', () => {
     expect(EXCHANGE_CONTRACTS).toEqual({
       request: 'mercury.exchange.request/v1', task: 'mercury.task/v1', event: 'mercury.event/v1',
-      result: 'mercury.result/v1', error: 'mercury.error/v1', transcript: 'mercury.transcript/v1', dictionary: 'mercury.dictionary/v1',
+      result: 'mercury.result/v1', error: 'mercury.error/v1', transcript: 'mercury.transcript/v1', dictionary: 'mercury.dictionary/v1', retryPlan: 'mercury.retry-plan/v1',
     });
-    expect(Object.keys(exchangeSchemaDocuments()).sort()).toEqual(['common', 'dictionary', 'error', 'event', 'request', 'result', 'task', 'transcript']);
+    expect(Object.keys(exchangeSchemaDocuments()).sort()).toEqual(['common', 'dictionary', 'error', 'event', 'request', 'result', 'retryPlan', 'task', 'transcript']);
   });
 
   it('enforces explicit provider/provided transcription roles', () => {
@@ -97,6 +99,19 @@ describe('Exchange Protocol v1 contracts', () => {
     expect(validateExchangeContract('request', provided).valid).toBe(true);
     expect(validateExchangeContract('request', { ...provided, models: { asr: 'asr-default', chat: 'chat-default' } }).valid).toBe(false);
     expect(validateExchangeContract('request', { ...provided, inputs: { ...provided.inputs, transcript: { ...provided.inputs.transcript!, role: 'reference' } } }).valid).toBe(false);
+  });
+
+  it('validates retry-plan safety semantics in the stable contract', () => {
+    const allowed = {
+      contract: 'mercury.retry-plan/v1', plan_id: `rpl-${'a'.repeat(24)}`, task_id: 'tsk-20260816-120000-deadbeef', task_revision: 4,
+      attempt_id: 'att-fixture', created_at: now, expires_at: '2026-08-17T12:00:00.000Z', checkpoint: 'chat_not_started',
+      provider_outcome: 'known_terminal', reuse: ['transcript'], discard: ['chat_response'], estimated_calls: { asr: 0, chat: 1 },
+      models: { asr: null, chat: 'chat-default' }, allowed: true, reason: null, requires_user_action: false, risk: 'new_provider_calls', extensions: {},
+    };
+    expect(validateExchangeContract('retryPlan', allowed).valid).toBe(true);
+    const unknown = { ...allowed, allowed: false, reason: 'Provider 结果不确定。', provider_outcome: 'outcome_unknown', estimated_calls: { asr: 0, chat: 0 }, requires_user_action: true, risk: 'unsafe_provider_outcome' };
+    expect(validateExchangeContract('retryPlan', unknown).valid).toBe(true);
+    expect(validateExchangeContract('retryPlan', { ...unknown, allowed: true, reason: null, estimated_calls: { asr: 0, chat: 1 } }).valid).toBe(false);
   });
 
   it('accepts an optional absolute approved SRT directory without breaking old requests and rejects unsafe directory shapes', () => {
@@ -118,6 +133,41 @@ describe('Exchange Protocol v1 contracts', () => {
     const result = validateExchangeContract('transcript', bad);
     expect(result.valid).toBe(false);
     if (!result.valid) expect(result.issues.map((entry) => entry.path)).toEqual(expect.arrayContaining(['/text', '/segments/1/index', '/segments/1/start_ms', '/segments/0/words/0']));
+  });
+
+  it('accepts a bounded long transcript above the generic 20,000-node budget while generic extensions remain capped', async () => {
+    const long = transcript();
+    long.duration_ms = 9_000;
+    long.segments = Array.from({ length: 441 }, (_, index) => {
+      const start = index * 20;
+      const wordCount = index < 34 ? 10 : 9;
+      return {
+        segment_id: `seg-${index.toString(16).padStart(8, '0')}`,
+        index,
+        start_ms: start,
+        end_ms: start + 19,
+        text: `第${index + 1}段`,
+        words: Array.from({ length: wordCount }, (_entry, wordIndex) => ({
+          text: '字', start_ms: start + wordIndex, end_ms: start + wordIndex + 1, confidence: null,
+        })),
+      };
+    }) as ExchangeTranscriptV1['segments'];
+    long.text = long.segments.map((segment) => segment.text).join('\n');
+    expect(long.segments.reduce((total, segment) => total + segment.words.length, 0)).toBe(4_003);
+    expect(validateExchangeContract('transcript', long).valid).toBe(true);
+
+    const root = await mkdtemp(path.join(os.tmpdir(), 'mercury-exchange-long-transcript-'));
+    roots.push(root);
+    const target = path.join(root, 'transcript.json');
+    await writeStableJsonAtomic(target, long);
+    await expect(readStableJson(target)).rejects.toMatchObject({ code: 'CONTRACT_INVALID' });
+    expect(DEFAULT_STABLE_JSON_MAX_NODES).toBe(20_000);
+    expect(await readStableJson(target, 'CONTRACT_INVALID', { maxNodes: TRANSCRIPT_STABLE_JSON_MAX_NODES })).toEqual(long);
+
+    const generic = request({ extensions: { 'com.example': { values: Array.from({ length: 21_000 }, () => 0) } } });
+    const genericResult = validateExchangeContract('request', generic);
+    expect(genericResult.valid).toBe(false);
+    if (!genericResult.valid) expect(genericResult.issues.some((entry) => entry.message.includes('20,000'))).toBe(true);
   });
 
   it('rejects dictionary identity conflicts and project scope mismatch', () => {
@@ -229,6 +279,20 @@ describe('Exchange Protocol v1 contracts', () => {
     expect(validateV5TaskRecord(delivery).valid).toBe(true);
     delivery.delivery.status = 'delivered';
     expect(validateV5TaskRecord(delivery).valid).toBe(false);
+    const controlled = structuredClone(record);
+    controlled.execution.control = { checkpoint_version: 'mercury.safe-checkpoint/v1', pause_requested_at: null, paused_at: null, resume_count: 0, retry_count: 0 };
+    expect(validateV5TaskRecord(controlled).valid).toBe(true);
+    const missingRetryCount = structuredClone(controlled);
+    delete missingRetryCount.execution.control.retry_count;
+    expect(validateV5TaskRecord(missingRetryCount).valid).toBe(false);
+    const falsePaused = structuredClone(controlled);
+    falsePaused.status = 'paused'; falsePaused.execution.safe_checkpoint = 'chat_response_persisted'; falsePaused.execution.attempt_id = 'att-fixture';
+    falsePaused.execution.control.pause_requested_at = now; falsePaused.execution.control.paused_at = now;
+    falsePaused.execution.provider_calls.chat = { state: 'in_flight', count: 1, outcome: 'outcome_unknown', evidence_ref: null, evidence_sha256: null };
+    expect(validateV5TaskRecord(falsePaused).valid).toBe(false);
+    const impossibleCheckpoint = structuredClone(controlled);
+    impossibleCheckpoint.execution.safe_checkpoint = 'chat_response_persisted';
+    expect(validateV5TaskRecord(impossibleCheckpoint).valid).toBe(false);
   });
 });
 
@@ -278,10 +342,14 @@ describe('stable storage and history projection', () => {
     expect(validateExchangeContract('task', task).valid).toBe(true);
     expect(validateExchangeContract('result', result).valid).toBe(true);
     expect(task.request_id).toBeNull();
+    expect(task.resume).toEqual({ allowed: false, reason: '此历史任务没有 Alpha.2 安全检查点，不能恢复。' });
     expect(task.capabilities.dictionary_snapshot.supported).toBe(false);
     expect(result.transcription.asr_call_count).toBeNull();
     expect(result.dictionaries.snapshots).toEqual([]);
     expect(task.delivery).toMatchObject({ status: 'unsupported', requested_directory: null, history: [] });
     expect(result.delivery).toEqual(task.delivery);
+    const oldTaskWithoutCurrentResume = structuredClone(task) as typeof task & { resume?: unknown };
+    delete oldTaskWithoutCurrentResume.resume;
+    expect(validateExchangeContract('task', oldTaskWithoutCurrentResume).valid).toBe(true);
   });
 });

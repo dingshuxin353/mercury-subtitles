@@ -647,6 +647,13 @@ export async function runWorker(
           await v5CrashFault(options.v5Fault, 'after_execute', finalTask);
           await heartbeatChain;
           if (heartbeatError) throw heartbeatError;
+          if (finalTask.status === 'paused') {
+            await writeV5Result(directory, finalTask);
+            worker.state = 'idle';
+            worker.task_id = null;
+            await queueWorkerWrite();
+            continue;
+          }
           if (finalTask.status === 'completed') {
             const review = await initializeV5Review(directory);
             if (review.status === 'not_required') await finalizeV5Review(directory);

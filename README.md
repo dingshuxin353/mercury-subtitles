@@ -26,7 +26,7 @@
 | 产物 | 适合什么时候用 |
 | --- | --- |
 | `*.transcribed.srt` | 云端语音转文字的原始结果；方便比较 ASR 到底听出了什么。 |
-| `*.calibrated.srt` | AI 结合完整正文和可用音频校验后的版本；只要时间轴安全，就忠实保留模型结果。 |
+| `*.calibrated.srt` | AI 结合完整正文和可用音频校对错字后的版本；cue 数量、顺序和毫秒时间轴与纯转写完全相同。 |
 | `*.approved.srt` | 你逐项接受、驳回或编辑后生成的批准稿；这是最适合交付的版本。 |
 | `calibration-report.md` | 本次模型、校验模式、修改摘要、警告和文件位置。 |
 
@@ -94,6 +94,12 @@ mercury task submit --request "/绝对路径/request.json" --json
 mercury task status <task-id> --json
 mercury task result <task-id> --json
 
+# 在安全检查点暂停/恢复；失败重试必须先查看只读计划
+mercury task pause <task-id> --json
+mercury task resume <task-id> --json
+mercury task retry-plan <task-id> --json
+mercury task retry <task-id> --plan <plan-id> --json
+
 # 业务目录暂时不可用时，只重试本地批准稿交付（不会调用 Provider）
 mercury task deliver <task-id> --json
 
@@ -108,7 +114,9 @@ mercury worker start --json
 
 查询状态不会偷偷启动 Worker，也不会重复提交任务。Provider 结果不确定时，Mercury 会停下来阻止自动重放，避免重复调用或计费。
 
-`0.3.0-alpha.1` 候选还提供 Exchange Protocol v1：脚本可显式导入 SRT、VTT 或 transcript JSON 作为转写事实源（ASR 0 调用），也可用 `reference` 继续走 ASR；两种模式共用稳定任务、事件、结果、词典快照和审阅合同。全局/项目词典通过 `mercury dictionary ... --json` 管理，任务创建后固定 revision/hash。
+`0.3.0-alpha.2` 候选继续使用 Exchange Protocol v1：脚本可显式导入 SRT、VTT 或 transcript JSON 作为转写事实源（ASR 0 调用），也可用 `reference` 继续走 ASR；两种模式共用稳定任务、事件、结果、词典快照和审阅合同。新增安全暂停/同 attempt 恢复，以及只读 retry plan + append-only retry；Provider 结果不确定时仍禁止自动重放。全局/项目词典通过 `mercury dictionary ... --json` 管理，任务创建后固定 revision/hash。
+
+新任务的纯转写、AI 校验、人工批准与业务目录交付 SRT 统一采用无句读风格：句读位置替换为一个空格，连续空白会折叠。版本号、`B-roll`、URL、邮箱和技术缩写中的词法符号会保留，包裹 URL 的括号、方括号和引号不会被误当成 URL 本体。AI 校验只修正每个纯转写 cue 内的文字，不拆分、合并、移动或调整时间；即使请求使用历史 `text-and-segmentation` 模式，当前版本也会冻结原 cue。如果修正文字在固定 cue 内超过 24 字或两行，任务会明确停止而不偷偷改断句。Provider/raw 证据仍保持原样，历史任务不会被改写。
 
 [CLI 完整说明 →](https://github.com/dingshuxin353/mercury-subtitles/blob/main/docs/cli.md)
 
@@ -140,7 +148,7 @@ mercury skill status --json
 
 > 用 Mercury 查看任务 `<task-id>` 的状态；如果完成了，带我审阅修改并生成批准稿。
 
-Skill 只使用 Mercury 的机器命令。它不会向你索要 Key，不会自行上传音频，不会绕过 Mercury 直接调用 ASR 或 Chat 服务，也不会凭空拼出结果路径。
+Skill 只使用 Mercury 的机器命令，当前完整迁移到稳定 `mercury.cli/v1` / Exchange v1。它不会向你索要 Key，不会自行上传音频，不会绕过 Mercury 直接调用 ASR 或 Chat 服务，也不会凭空拼出结果路径；暂停、恢复、重试计划、外部转录、词典、审阅和批准稿业务目录交付都复用同一稳定合同。
 
 [Skill 完整说明 →](https://github.com/dingshuxin353/mercury-subtitles/blob/main/docs/agent-skill.md)
 
@@ -261,7 +269,7 @@ npm run verify
 
 ## 版本与反馈
 
-- 当前开发候选：`0.3.0-alpha.1`；尚未发布，已发布 Public Alpha 仍可通过 npm dist-tag `next` 安装。
+- 当前开发候选：`0.3.0-alpha.2`；尚未发布，已发布 Public Alpha 仍可通过 npm dist-tag `next` 安装。
 - 版本变化：[CHANGELOG.md](./CHANGELOG.md)
 - 下载与校验：[GitHub Releases](https://github.com/dingshuxin353/mercury-subtitles/releases)
 - 安装或配置求助：[创建安装帮助](https://github.com/dingshuxin353/mercury-subtitles/issues/new?template=installation-help.yml)

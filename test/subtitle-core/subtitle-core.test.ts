@@ -26,10 +26,11 @@ async function referenceInput(): Promise<{
   transcript: TranscriptRaw;
   calibrationResult: CalibrationResult;
 }> {
-  return {
-    transcript: await fixture<TranscriptRaw>('transcript.raw.json'),
-    calibrationResult: await fixture<CalibrationResult>('calibration-result.json')
-  };
+  const transcript = await fixture<TranscriptRaw>('transcript.raw.json');
+  transcript.segments[0]!.text = '欢迎使用水兴';
+  transcript.segments[0]!.words[2]!.text = '水兴';
+  transcript.full_text = '欢迎使用水兴\n字幕工具';
+  return { transcript, calibrationResult: await fixture<CalibrationResult>('calibration-result.json') };
 }
 
 function referenceSrt(firstText = '欢迎使用水兴'): string {
@@ -202,7 +203,7 @@ describe('text-only fidelity', () => {
     expect(result.artifact.modifications).toEqual([
       expect.objectContaining({
         type: 'text_correction',
-        original_segment_refs: ['reference-0001'],
+        original_segment_refs: ['seg-0001'],
         replacement_text: '欢迎使用水星',
         applied: true
       })
@@ -234,7 +235,8 @@ describe('text-only fidelity', () => {
 
     expect(result.status).toBe('completed');
     if (result.status !== 'completed') return;
-    expect(result.artifact.segments[0]!.text).toBe('欢迎使用水星，这是一个更好用的字幕工具');
+    expect(result.artifact.segments).toHaveLength(2);
+    expect(result.artifact.segments[0]).toMatchObject({ start_ms: 0, end_ms: 2500, text: '欢迎使用水星 这是一个更好用的字幕工具' });
     expect(result.artifact.modifications[0]).toMatchObject({ applied: true });
   });
 
@@ -251,7 +253,7 @@ describe('text-only fidelity', () => {
     expect(result.artifact.modifications[0]).toMatchObject({ applied: true });
   });
 
-  it('uses suggestion time evidence to disambiguate repeated reference text', async () => {
+  it('rejects a sub-cue correction even when reference contains matching subranges', async () => {
     const input = await referenceInput();
     const text = '一二三四甲乙一二三四甲乙';
     input.transcript.audio.duration_ms = 2400;
@@ -291,16 +293,11 @@ describe('text-only fidelity', () => {
 
     const result = runSubtitleCore({ ...input, referenceSrtText: srt });
 
-    expect(result.status).toBe('completed');
-    if (result.status !== 'completed') return;
-    expect(result.artifact.segments.map((segment) => segment.text)).toEqual([
-      '一二三四甲丙',
-      '一二三四甲乙'
-    ]);
-    expect(result.artifact.modifications[0]?.original_segment_refs).toEqual(['reference-0002']);
+    expect(result.status).toBe('failed');
+    expect(result.issues[0]).toMatchObject({ code: 'UPSTREAM_SUGGESTION_CUE_MAPPING_INVALID' });
   });
 
-  it('applies one high-confidence correction across reference blocks and writes each character back to its original block', async () => {
+  it('rejects one correction spanning multiple transcribed cues', async () => {
     const input = await referenceInput();
     input.transcript.audio.duration_ms = 1000;
     input.transcript.full_text = '甲乙丙您\n好';
@@ -358,18 +355,8 @@ describe('text-only fidelity', () => {
 
     const result = runSubtitleCore({ ...input, referenceSrtText: srt });
 
-    expect(result.status).toBe('completed');
-    if (result.status !== 'completed') return;
-    expect(result.alignment).toMatchObject({ asr_coverage: 0.8, reference_coverage: 0.8 });
-    expect(result.artifact.segments.map(({ start_ms, end_ms, text }) => ({ start_ms, end_ms, text }))).toEqual([
-      { start_ms: 0, end_ms: 800, text: '甲乙丙您' },
-      { start_ms: 800, end_ms: 1000, text: '好' }
-    ]);
-    expect(result.artifact.modifications[0]).toMatchObject({
-      original_segment_refs: ['reference-0001', 'reference-0002'],
-      replacement_text: '甲乙丙您好',
-      applied: true
-    });
+    expect(result.status).toBe('failed');
+    expect(result.issues[0]).toMatchObject({ code: 'UPSTREAM_SUGGESTION_CUE_MAPPING_INVALID' });
   });
 
   it.each([
@@ -382,17 +369,14 @@ describe('text-only fidelity', () => {
     const result = runSubtitleCore({ ...input, referenceSrtText: srt });
 
     expect(result.status).toBe('needs_input');
-    expect(result.issues[0]).toMatchObject({ code: 'REFERENCE_TIMELINE_INVALID_FOR_TEXT_ONLY' });
-    expect(result.issues[0]!.remediation).toContain('text-and-segmentation');
+    expect(result.issues[0]).toMatchObject({ code: 'REFERENCE_TIMELINE_INVALID_FOR_CALIBRATION_EVIDENCE' });
+    expect(result.issues[0]!.remediation).toContain('transcribed cue timeline will remain unchanged');
   });
 
-  it.each([
-    ['25 counted characters', `${'一'.repeat(25)}`],
-    ['three lines', '一二三\n四五六\n七八九']
-  ])('returns needs_input when text-only reference text exceeds the %s hard limit', async (_case, text) => {
+  it('does not let a 25-character transcribed cue borrow reference timing to split itself', async () => {
     const input = await referenceInput();
-    const normalizedText = text.replaceAll('\n', '');
-    setTimedText(input.transcript, normalizedText);
+    const text = '一'.repeat(25);
+    setTimedText(input.transcript, text);
     input.calibrationResult.suggestions = [];
     const endMs = input.transcript.audio.duration_ms;
     const seconds = String(Math.floor(endMs / 1000)).padStart(2, '0');
@@ -402,8 +386,24 @@ describe('text-only fidelity', () => {
     const result = runSubtitleCore({ ...input, referenceSrtText: srt });
 
     expect(result.status).toBe('needs_input');
-    expect(result.issues[0]).toMatchObject({ code: 'REFERENCE_HARD_LIMIT_INVALID_FOR_TEXT_ONLY' });
-    expect(result.issues[0]!.remediation).toContain('text-and-segmentation');
+    expect(result.issues[0]).toMatchObject({ code: 'CALIBRATED_HARD_LIMIT_INVALID_FOR_FIXED_TIMELINE' });
+  });
+
+  it('uses a three-line reference only as text evidence and preserves the transcribed cue', async () => {
+    const input = await referenceInput();
+    setTimedText(input.transcript, '一二三四五六七八九');
+    input.calibrationResult.suggestions = [];
+    const srt = '1\n00:00:00,000 --> 00:00:01,800\n一二三\n四五六\n七八九';
+
+    const result = runSubtitleCore({ ...input, referenceSrtText: srt });
+
+    expect(result.status).toBe('completed');
+    expect(result.artifact?.segments).toHaveLength(1);
+    expect(result.artifact?.segments[0]).toMatchObject({
+      start_ms: input.transcript.segments[0]?.start_ms,
+      end_ms: input.transcript.segments[0]?.end_ms,
+      text: '一二三四五六七八九'
+    });
   });
 
   it('does not let an applied text-only correction create a 25-character output block', async () => {
@@ -423,13 +423,36 @@ describe('text-only fidelity', () => {
     const result = runSubtitleCore({ ...input, referenceSrtText: srt });
 
     expect(result.status).toBe('needs_input');
-    expect(result.issues[0]).toMatchObject({ code: 'CALIBRATED_HARD_LIMIT_INVALID_FOR_TEXT_ONLY' });
+    expect(result.issues[0]).toMatchObject({ code: 'CALIBRATED_HARD_LIMIT_INVALID_FOR_FIXED_TIMELINE' });
     expect(result.artifact).toBeNull();
   });
 });
 
-describe('segmentation and ASR-backed timeline generation', () => {
-  it('keeps sub-range timing distinct when one ASR segment aligns to multiple reference blocks', async () => {
+describe('fixed transcribed cue timeline', () => {
+  it('rejects a structural suggestion even when it names one exact transcribed cue', async () => {
+    const input = await referenceInput();
+    input.calibrationResult.request.mode = 'text-and-segmentation';
+    input.calibrationResult.suggestions = [{
+      ...input.calibrationResult.suggestions[0]!,
+      kind: 'segmentation',
+      source_segment_refs: ['seg-0001'],
+      start_ms: input.transcript.segments[0]!.start_ms,
+      end_ms: input.transcript.segments[0]!.end_ms,
+      disposition: 'not_applied',
+      disposition_reason: 'insufficient_evidence'
+    }];
+
+    const result = runSubtitleCore({
+      ...input,
+      referenceSrtText: referenceSrt(),
+      requestedMode: 'text-and-segmentation'
+    });
+
+    expect(result.status).toBe('failed');
+    expect(result.issues[0]).toMatchObject({ code: 'UPSTREAM_SUGGESTION_CUE_MAPPING_INVALID' });
+  });
+
+  it('rejects a sub-range correction when one transcribed cue aligns to multiple reference blocks', async () => {
     const input = await referenceInput();
     const transcript = await timedTranscript(40);
     const characters = [...transcript.full_text];
@@ -460,13 +483,8 @@ describe('segmentation and ASR-backed timeline generation', () => {
       requestedMode: 'text-and-segmentation'
     });
 
-    expect(result.status).toBe('completed');
-    if (result.status !== 'completed') return;
-    expect(result.artifact.segments.map((segment) => segment.text).join('')).toBe(`${expanded}${second}`);
-    expect(result.artifact.segments.every((segment, index, values) =>
-      countSubtitleCharacters(segment.text) <= 24 &&
-      (index === 0 || segment.start_ms >= values[index - 1]!.end_ms)
-    )).toBe(true);
+    expect(result.status).toBe('failed');
+    expect(result.issues[0]).toMatchObject({ code: 'UPSTREAM_SUGGESTION_CUE_MAPPING_INVALID' });
   });
 
   it('records an ASR-backed reference correction in text-and-segmentation mode without rewriting ASR evidence', async () => {
@@ -493,7 +511,7 @@ describe('segmentation and ASR-backed timeline generation', () => {
     expect(result.artifact.modifications.some((modification) => modification.type === 'omission_recovery')).toBe(false);
   });
 
-  it('segments no-reference text by word timing, preserves all content, and records the split', async () => {
+  it('does not split an overlong no-reference cue and reports a fixed-timeline conflict', async () => {
     const input = await referenceInput();
     const transcript = await timedTranscript(30);
     const calibrationResult = withoutReference(input.calibrationResult);
@@ -501,23 +519,28 @@ describe('segmentation and ASR-backed timeline generation', () => {
 
     const result = runSubtitleCore({ transcript, calibrationResult, referenceSrtText: null });
 
-    expect(result.status).toBe('completed');
-    if (result.status !== 'completed') return;
-    expect(result.artifact.mode).toBeNull();
-    expect(result.artifact.segments.length).toBeGreaterThan(1);
-    expect(result.artifact.segments.map((segment) => segment.text).join('')).toBe(transcript.full_text);
-    expect(result.artifact.segments.every((segment) => countSubtitleCharacters(segment.text) <= 24)).toBe(true);
-    expect(result.artifact.segments.every((segment, index, all) =>
-      segment.start_ms >= 0 && segment.start_ms < segment.end_ms &&
-      segment.end_ms <= transcript.audio.duration_ms &&
-      (index === 0 || segment.start_ms >= all[index - 1]!.end_ms)
-    )).toBe(true);
-    expect(result.artifact.modifications).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: 'split', original_segment_refs: ['seg-0001'], applied: true })
-    ]));
+    expect(result.status).toBe('needs_input');
+    expect(result.issues[0]).toMatchObject({ code: 'CALIBRATED_HARD_LIMIT_INVALID_FOR_FIXED_TIMELINE' });
   });
 
-  it('assigns punctuation omitted from word timing to adjacent evidence without blocking legal splits', async () => {
+  it('rejects a punctuation-only cue after visible cleanup instead of removing or merging it', async () => {
+    const input = await referenceInput();
+    setTimedText(input.transcript, '，。！？');
+    const calibrationResult = withoutReference(input.calibrationResult);
+    calibrationResult.suggestions = [];
+
+    const result = runSubtitleCore({
+      transcript: input.transcript,
+      calibrationResult,
+      referenceSrtText: null
+    });
+
+    expect(result.status).toBe('failed');
+    expect(result.issues[0]).toMatchObject({ code: 'VISIBLE_SUBTITLE_TEXT_EMPTY' });
+    expect(result.artifact).toBeNull();
+  });
+
+  it('does not use punctuation or word timing to split an overlong cue', async () => {
     const input = await referenceInput();
     const transcript = await timedTranscript(30);
     const text = '一二三，四五六，七八九，十一二，十三四，十五六，十七八，十九二十';
@@ -541,14 +564,11 @@ describe('segmentation and ASR-backed timeline generation', () => {
 
     const result = runSubtitleCore({ transcript, calibrationResult, referenceSrtText: null });
 
-    expect(result.status).toBe('completed');
-    if (result.status !== 'completed') return;
-    expect(result.artifact.segments.length).toBeGreaterThan(1);
-    expect(result.artifact.segments.map((segment) => segment.text).join('')).toBe(text);
-    expect(result.artifact.segments.every((segment) => countSubtitleCharacters(segment.text) <= 24)).toBe(true);
+    expect(result.status).toBe('needs_input');
+    expect(result.issues[0]).toMatchObject({ code: 'CALIBRATED_HARD_LIMIT_INVALID_FOR_FIXED_TIMELINE' });
   });
 
-  it('accepts an invalid reference timeline in segmentation mode and rebuilds it from ASR word timing', async () => {
+  it('does not rebuild an invalid reference timeline in segmentation mode', async () => {
     const input = await referenceInput();
     const transcript = await timedTranscript(30);
     const calibrationResult = structuredClone(input.calibrationResult);
@@ -563,16 +583,11 @@ describe('segmentation and ASR-backed timeline generation', () => {
       requestedMode: 'text-and-segmentation'
     });
 
-    expect(result.status).toBe('completed');
-    if (result.status !== 'completed') return;
-    expect(result.artifact.segments.map((segment) => segment.text).join('')).toBe(transcript.full_text);
-    expect(result.artifact.segments[0]).toMatchObject({ start_ms: 0 });
-    expect(result.artifact.modifications.map((modification) => modification.type)).toEqual(
-      expect.arrayContaining(['split', 'timing_adjustment'])
-    );
+    expect(result.status).not.toBe('completed');
+    expect(result.artifact).toBeNull();
   });
 
-  it('keeps a fully returned reference unit authoritative at exactly 80% alignment', async () => {
+  it('keeps transcribed text authoritative when reference alignment is exactly 80%', async () => {
     const input = await referenceInput();
     setTimedText(input.transcript, '一二三四五六七八甲乙');
     input.calibrationResult.request.mode = 'text-and-segmentation';
@@ -592,12 +607,12 @@ describe('segmentation and ASR-backed timeline generation', () => {
       reference_coverage: 0.8,
       conclusion: 'matched'
     });
-    expect(result.artifact.segments.map((segment) => segment.text).join('')).toBe('一二三四五六七八丙丁');
+    expect(result.artifact.segments.map((segment) => segment.text).join('')).toBe('一二三四五六七八甲乙');
     expect(result.artifact.warnings.filter((warning) => warning.code === 'LOCAL_ALIGNMENT_GAP')).toHaveLength(2);
     expect(result.artifact.modifications.some((modification) => modification.type === 'omission_recovery')).toBe(false);
   });
 
-  it('does not synthesize omitted text when the complete model response preserves the reference', async () => {
+  it('does not omit transcribed text merely because reference is shorter', async () => {
     const input = await referenceInput();
     setTimedText(input.transcript, '一二三四五六七八甲乙');
     input.calibrationResult.request.mode = 'text-and-segmentation';
@@ -613,10 +628,10 @@ describe('segmentation and ASR-backed timeline generation', () => {
     expect(result.status).toBe('completed');
     if (result.status !== 'completed') return;
     expect(result.alignment).toMatchObject({ asr_coverage: 0.8, reference_coverage: 1 });
-    expect(result.artifact.segments.map((segment) => segment.text).join('')).toBe('一二三四五六七八');
+    expect(result.artifact.segments.map((segment) => segment.text).join('')).toBe('一二三四五六七八甲乙');
   });
 
-  it('fails instead of inventing character-average timing when a timed ASR unit exceeds the hard limit', async () => {
+  it('returns a fixed-timeline input conflict when one ASR cue exceeds the hard limit', async () => {
     const input = await referenceInput();
     const transcript = await timedTranscript(25, false);
     const calibrationResult = withoutReference(input.calibrationResult);
@@ -624,8 +639,8 @@ describe('segmentation and ASR-backed timeline generation', () => {
 
     const result = runSubtitleCore({ transcript, calibrationResult, referenceSrtText: null });
 
-    expect(result.status).toBe('failed');
-    expect(result.issues[0]?.code).toBe('TIMELINE_HARD_LIMIT_UNRESOLVABLE');
+    expect(result.status).toBe('needs_input');
+    expect(result.issues[0]?.code).toBe('CALIBRATED_HARD_LIMIT_INVALID_FOR_FIXED_TIMELINE');
   });
 
   it.each([4, 20])('keeps a faithful legal %i-character ASR unit and reports the soft character target', async (characterCount) => {
@@ -652,8 +667,8 @@ describe('segmentation and ASR-backed timeline generation', () => {
     const calibrationResult = withoutReference(input.calibrationResult);
     calibrationResult.suggestions[0] = {
       ...calibrationResult.suggestions[0]!,
-      original_text: '欢迎使用水星',
-      suggested_text: '欢迎使用水兴',
+      original_text: '欢迎使用水兴',
+      suggested_text: '欢迎使用水星',
       confidence: 'low'
     };
 
@@ -665,7 +680,7 @@ describe('segmentation and ASR-backed timeline generation', () => {
 
     expect(result.status).toBe('completed');
     if (result.status !== 'completed') return;
-    expect(result.artifact.segments.map((segment) => segment.text).join('')).toContain('欢迎使用水兴');
+    expect(result.artifact.segments.map((segment) => segment.text).join('')).toContain('欢迎使用水星');
     expect(result.artifact.warnings).toEqual(expect.arrayContaining([
       expect.objectContaining({ code: 'LOW_CONFIDENCE_TEXT_APPLIED' })
     ]));
@@ -676,7 +691,7 @@ describe('segmentation and ASR-backed timeline generation', () => {
     const calibrationResult = withoutReference(input.calibrationResult);
     calibrationResult.suggestions[0] = {
       ...calibrationResult.suggestions[0]!,
-      original_text: '欢迎使用水星',
+      original_text: '欢迎使用水兴',
       suggested_text: 'Welcome to Mercury',
       confidence: 'high'
     };
@@ -698,7 +713,7 @@ describe('segmentation and ASR-backed timeline generation', () => {
     const calibrationResult = withoutReference(input.calibrationResult);
     calibrationResult.suggestions[0] = {
       ...calibrationResult.suggestions[0]!,
-      original_text: '欢迎使用水星',
+      original_text: '欢迎使用水兴',
       suggested_text: '完全不同',
       confidence: 'high'
     };
@@ -750,7 +765,7 @@ describe('segmentation and ASR-backed timeline generation', () => {
     const calibrationResult = withoutReference(input.calibrationResult);
     calibrationResult.suggestions[0] = {
       ...calibrationResult.suggestions[0]!,
-      original_text: '欢迎使用水星',
+      original_text: '欢迎使用水兴',
       suggested_text: placeholder,
       confidence: 'high'
     };
@@ -763,13 +778,13 @@ describe('segmentation and ASR-backed timeline generation', () => {
 
     expect(result.status).toBe('completed');
     if (result.status !== 'completed') return;
-    expect(result.artifact.segments.map((segment) => segment.text).join('')).toContain('欢迎使用水星');
+    expect(result.artifact.segments.map((segment) => segment.text).join('')).toContain('欢迎使用水兴');
     expect(result.artifact.warnings).toEqual(expect.arrayContaining([
       expect.objectContaining({ code: 'AUDIO_EVIDENCE_GAP' })
     ]));
   });
 
-  it('uses word timing to update only the requested repeated occurrence', async () => {
+  it('rejects a correction aimed at only a sub-range of one cue', async () => {
     const input = await referenceInput();
     setTimedText(input.transcript, '甲乙甲乙');
     const calibrationResult = withoutReference(input.calibrationResult);
@@ -789,10 +804,8 @@ describe('segmentation and ASR-backed timeline generation', () => {
       referenceSrtText: null
     });
 
-    expect(result.status).toBe('completed');
-    if (result.status !== 'completed') return;
-    expect(result.artifact.segments.map((segment) => segment.text).join('')).toBe('甲乙甲丙');
-    expect(result.artifact.modifications[0]).toMatchObject({ start_ms: 400, end_ms: 800, applied: true });
+    expect(result.status).toBe('failed');
+    expect(result.issues[0]).toMatchObject({ code: 'UPSTREAM_SUGGESTION_CUE_MAPPING_INVALID' });
   });
 });
 

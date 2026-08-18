@@ -32,7 +32,7 @@ describe('Public Alpha release surface', () => {
 
     expect(packageJson).toMatchObject({
       name: 'mercury-subtitles',
-      version: '0.3.0-alpha.1',
+      version: '0.3.0-alpha.2',
       license: 'Apache-2.0',
       engines: { node: '>=24.0.0 <25.0.0' },
       bin: { mercury: './dist/src/bin.js' },

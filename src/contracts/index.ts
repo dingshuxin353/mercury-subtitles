@@ -97,6 +97,7 @@ export type { ExchangeResultV1 } from './generated/exchange-result-v1.js';
 export type { ExchangeErrorV1 } from './generated/exchange-error-v1.js';
 export type { ExchangeTranscriptV1, Segment as ExchangeTranscriptSegmentV1, Word as ExchangeTranscriptWordV1 } from './generated/exchange-transcript-v1.js';
 export type { ExchangeDictionaryV1, Entry as ExchangeDictionaryEntryV1 } from './generated/exchange-dictionary-v1.js';
+export type { ExchangeRetryPlanV1 } from './generated/exchange-retry-plan-v1.js';
 export type { TaskRecordV5, Delivery as TaskDeliveryV5 } from './generated/task-record-v5.js';
 export { assertExchangeContract, exchangeSchemaDocuments, EXCHANGE_CONTRACTS, validateExchangeContract } from './exchange-v1.js';
 export type { ExchangeContractName, ExchangeContractTypeMap, ExchangeValidationIssue, ExchangeValidationResult } from './exchange-v1.js';

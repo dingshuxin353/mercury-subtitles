@@ -78,7 +78,7 @@ export interface CliIo {
 
 const HELP = `mercury（推荐：打开交互式 App）
 
-Mercury 0.3 Alpha.1
+Mercury 0.3 Alpha.2
 
 普通用户场景：
   1. 第一次使用：运行 mercury，按向导添加语音转文字和内容校准服务
@@ -95,12 +95,15 @@ Mercury 0.3 Alpha.1
   mercury config status --json
   mercury config migrate --check --json
   mercury config migrate --plan <plan-id> --json
-  mercury input inspect --file <absolute-path> --format auto|srt|vtt|transcript-json --role transcript-source|reference --json
+  mercury input inspect --file <absolute-path> --format auto|mp3|srt|vtt|transcript-json --role media|transcript-source|reference --json
   mercury task submit --request <absolute-request.json> --json
   mercury task status|result <task-id> --json
   mercury task list --limit <n> --json
   mercury task watch <task-id> --after <sequence> --jsonl
   mercury task deliver <task-id> --json
+  mercury task pause|resume <task-id> --json
+  mercury task retry-plan <task-id> --json
+  mercury task retry <task-id> --plan <plan-id> --json
   mercury dictionary create|list|show ... --json
   mercury dictionary entry add|edit|remove <dictionary-id> ... --json
   mercury dictionary validate|import|export ... --json
@@ -1219,7 +1222,11 @@ export async function runCli(
   const requestedMachineCommand = machineCommand(args);
   try {
     if (!experimentalMachine) {
-      const stable = await tryRunStableCli(args, { workspaceRoot, io });
+      const stable = await tryRunStableCli(args, {
+        workspaceRoot,
+        io,
+        ...(backgroundDependencies.startDetachedWorker ? { startDetachedWorker: backgroundDependencies.startDetachedWorker } : {}),
+      });
       if (stable !== null) return stable;
     }
     if (args[0] === '__worker') {

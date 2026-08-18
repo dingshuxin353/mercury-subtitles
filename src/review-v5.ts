@@ -13,6 +13,7 @@ import {
   readReview,
   reviewCounts,
   reviewStatusFor,
+  visibleReviewText,
   writeReviewRecord,
   type ReviewActor,
   type ReviewDecision,
@@ -47,7 +48,9 @@ function calibrated(value: unknown, taskId: string): CalibratedTranscript {
 function checkedText(value: string): string {
   const text = value.trim();
   if (!text || /[\p{Cc}\p{Cf}]/u.test(text) || /<\/?[A-Za-z][^>]*>|\{\\[^}]+\}|```/u.test(text)) throw new MercuryError('REVIEW_TEXT_INVALID', '编辑文字不能为空，也不能包含控制字符、样式标签或模型残片。', { exitCode: 2 });
-  return text;
+  const visible = visibleReviewText(text);
+  if (!visible) throw new MercuryError('REVIEW_TEXT_INVALID', '编辑文字清理句读标点后不能为空。', { exitCode: 2 });
+  return visible;
 }
 
 async function writeText(target: string, value: string): Promise<void> {
@@ -81,8 +84,12 @@ export async function initializeV5Review(taskDirectory: string, now = () => new 
     try { return await readReview(root); } catch (error) { if (!(error instanceof MercuryError) || error.code !== 'REVIEW_NOT_READY') throw error; }
     const transcribedPath = managed(root, task.artifacts.transcribed.path);
     const calibratedPath = managed(root, task.artifacts.calibrated.path);
+    const parsedTranscribed = parseReferenceSrt(await readFile(transcribedPath, 'utf8'));
     const parsedSrt = parseReferenceSrt(await readFile(calibratedPath, 'utf8'));
-    if (!parseReferenceSrt(await readFile(transcribedPath, 'utf8')).ok || !parsedSrt.ok) throw new MercuryError('REVIEW_SOURCE_INVALID', '审阅来源字幕无法安全解析。');
+    if (!parsedTranscribed.ok || !parsedSrt.ok) throw new MercuryError('REVIEW_SOURCE_INVALID', '审阅来源字幕无法安全解析。');
+    if (parsedTranscribed.segments.length !== parsedSrt.segments.length || parsedTranscribed.segments.some((segment, index) => segment.start_ms !== parsedSrt.segments[index]!.start_ms || segment.end_ms !== parsedSrt.segments[index]!.end_ms)) {
+      throw new MercuryError('REVIEW_TIMELINE_CHANGED', 'AI 校验稿必须与纯转写保持完全相同的片段数、顺序和时间戳。');
+    }
     const calibrationPath = managed(root, 'work/calibration-result.json');
     const checked = validateV3CalibrationResult(JSON.parse(await readFile(calibrationPath, 'utf8')) as unknown);
     if (!checked.valid || checked.value.status !== 'completed') throw new MercuryError('REVIEW_SOURCE_INVALID', '校准结果缺少完整、已验证的 corrected_units。');
@@ -92,6 +99,12 @@ export async function initializeV5Review(taskDirectory: string, now = () => new 
       throw new MercuryError('REVIEW_SOURCE_INVALID', '校验后 transcript 与 calibrated.srt 不一致。');
     }
     const changes = authoritativeReviewChanges(task.identity.task_id, checked.value, transcript);
+    if (changes.some((change) => change.target_segment_indexes.length !== 1
+      || change.segment_index !== change.target_segment_indexes[0]
+      || change.start_ms !== transcript.segments[change.segment_index]?.start_ms
+      || change.end_ms !== transcript.segments[change.segment_index]?.end_ms)) {
+      throw new MercuryError('REVIEW_MAPPING_INVALID', '每项审阅修改必须且只能定位一个权威纯转写 cue。');
+    }
     const at = now().toISOString();
     const review: ReviewRecordV1 = {
       contract_version: 'mercury-review-experimental-v1', task_id: task.identity.task_id, created_at: at, updated_at: at,
@@ -180,10 +193,17 @@ export async function finalizeV5Review(rootInput: string, now = () => new Date()
     }
     if (review.counts.pending > 0) throw new MercuryError('REVIEW_PENDING_CHANGES', `还有 ${review.counts.pending} 项修改未决定，不能生成批准稿。`);
     const parsed = parseReferenceSrt(await readFile(managed(root, review.sources.calibrated_srt.path), 'utf8'));
-    if (!parsed.ok) throw new MercuryError('REVIEW_SOURCE_INVALID', 'AI 校验字幕无法解析。');
+    const transcribed = parseReferenceSrt(await readFile(managed(root, review.sources.transcribed_srt.path), 'utf8'));
+    if (!parsed.ok || !transcribed.ok) throw new MercuryError('REVIEW_SOURCE_INVALID', '纯转写或 AI 校验字幕无法解析。');
+    if (transcribed.segments.length !== parsed.segments.length || transcribed.segments.some((segment, index) => segment.start_ms !== parsed.segments[index]!.start_ms || segment.end_ms !== parsed.segments[index]!.end_ms)) {
+      throw new MercuryError('REVIEW_TIMELINE_CHANGED', 'AI 校验稿必须与纯转写保持完全相同的片段数、顺序和时间戳。');
+    }
+    if (review.changes.some((change) => change.target_segment_indexes.length !== 1)) {
+      throw new MercuryError('REVIEW_MAPPING_INVALID', '批准稿不能应用跨 cue 的审阅修改。');
+    }
     const decided = applyReviewDecisions(parsed.segments.map((segment, index) => ({ subtitle_segment_id: `approved-source-${index + 1}`, index, start_ms: segment.start_ms, end_ms: segment.end_ms, text: flatReviewText(segment.text), confidence: 'high' as const, asr_segment_refs: [], reference_segment_refs: [] })), review.changes);
     const expected: CalibratedSubtitleSegment[] = decided.map((segment, index) => ({ ...segment, subtitle_segment_id: `approved-${index + 1}`, index }));
-    if (expected.length !== parsed.segments.length || expected.some((segment, index) => segment.start_ms !== parsed.segments[index]!.start_ms || segment.end_ms !== parsed.segments[index]!.end_ms)) throw new MercuryError('REVIEW_TIMELINE_CHANGED', '批准稿必须与 AI 校验稿保持完全相同的片段数、顺序和时间戳。');
+    if (expected.length !== parsed.segments.length || expected.length !== transcribed.segments.length || expected.some((segment, index) => segment.start_ms !== parsed.segments[index]!.start_ms || segment.end_ms !== parsed.segments[index]!.end_ms || segment.start_ms !== transcribed.segments[index]!.start_ms || segment.end_ms !== transcribed.segments[index]!.end_ms)) throw new MercuryError('REVIEW_TIMELINE_CHANGED', '批准稿必须与纯转写和 AI 校验稿保持完全相同的片段数、顺序和时间戳。');
     const source = `${expected.map((segment, index) => [String(index + 1), `${formatSrtTimestamp(segment.start_ms)} --> ${formatSrtTimestamp(segment.end_ms)}`, ...wrapSubtitleText(segment.text, task.input_config.calibration_mode)].join('\n')).join('\n\n')}\n`;
     const relative = approvedRelative(task); const target = managed(root, relative); await writeText(target, source);
     const transcript = JSON.parse(await readFile(managed(root, task.artifacts.transcript!.path), 'utf8')) as { duration_ms?: number; segments: Array<{ end_ms: number }> };

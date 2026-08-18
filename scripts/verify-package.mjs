@@ -381,6 +381,34 @@ try {
     path.join(standardSkillParent, 'mercury-subtitles'),
     { recursive: true, errorOnExist: true, force: false },
   );
+  const packagedCommands = await readFile(
+    path.join(installedPackage, 'skills', 'mercury-subtitles', 'references', 'commands.md'),
+    'utf8',
+  );
+  const packagedTroubleshooting = await readFile(
+    path.join(installedPackage, 'skills', 'mercury-subtitles', 'references', 'troubleshooting.md'),
+    'utf8',
+  );
+  if (
+    !packagedCommands.includes('config status.data.models[].model_id') ||
+    !packagedCommands.includes('Never use `provider`, `name`, or `category` as a model ID') ||
+    !packagedCommands.includes('derive a new stable request ID') ||
+    !packagedCommands.includes('`resume.allowed`') ||
+    !packagedCommands.includes('`dictionaries.selected` is an array of `dictionary_id` strings') ||
+    !packagedCommands.includes('"selected": ["dict-project-terms"]') ||
+    !packagedCommands.includes('do not put revision objects into `selected[]`') ||
+    !packagedCommands.includes('mercury dictionary create --name "项目术语" --scope project --project "demo-project" --json') ||
+    !packagedCommands.includes('mercury dictionary create --name "通用术语" --scope global --json') ||
+    !packagedCommands.includes('mercury dictionary entry add <dictionary-id> --revision <current-revision> --entry-id entry-product-name') ||
+    !packagedCommands.includes('mercury dictionary entry edit <dictionary-id> --revision <latest-revision> --entry-id entry-product-name') ||
+    !packagedCommands.includes('mercury dictionary entry remove <dictionary-id> --revision <latest-revision> --entry-id entry-product-name --json') ||
+    !packagedCommands.includes('Every entry ID must match `entry-[a-z0-9][a-z0-9-]{2,63}`') ||
+    !packagedCommands.includes('Every successful mutation returns `data.dictionary.revision`') ||
+    !packagedCommands.includes('`term|person|brand|product|acronym|other`') ||
+    !packagedTroubleshooting.includes('If `approved_srt.exists` is false, do not call `task deliver`')
+  ) {
+    throw new Error('Installed package Skill is missing the rc4 model/action/delivery/dictionary safety guidance');
+  }
   const { stdout: skillInstallOutput } = await runCli(['skill', 'install', '--json']);
   const skillInstall = JSON.parse(skillInstallOutput);
   if (

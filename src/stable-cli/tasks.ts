@@ -9,7 +9,8 @@ import { cancelBackgroundTask, taskMachineView } from '../background/runtime.js'
 import { readTaskEvents } from '../background/storage.js';
 import { projectMachineTaskToExchangeResult, projectMachineTaskToExchangeTask } from '../exchange/projection.js';
 import type { TaskRecordV5 } from '../contracts/generated/task-record-v5.js';
-import { cancelV5Task, projectV5Result, projectV5Task, readV5Events, readV5Task } from '../exchange/runtime.js';
+import { cancelV5Task, executeV5Retry, pauseV5Task, planV5Retry, projectV5Result, projectV5Task, readV5Events, readV5Task, resumeV5Task } from '../exchange/runtime.js';
+import type { ExchangeRetryPlanV1 } from '../contracts/index.js';
 import { readStableJson } from '../exchange/storage.js';
 import { deliverCurrentV5Review } from '../review-v5.js';
 
@@ -102,11 +103,62 @@ export async function stableCancelTask(workspaceRoot: string, record: Compatible
   return { pending: cancelled.pending, task: await stableTaskView(workspaceRoot, cancelled.task) };
 }
 
+export async function stablePauseTask(workspaceRoot: string, record: CompatibleTask): Promise<{ pending: boolean; task: ExchangeTaskV1 }> {
+  if (!('identity' in record)) throw new MercuryError('CONTRACT_UNSUPPORTED', '此历史任务不支持安全暂停；查询未做任何写入。', { exitCode: 5 });
+  const paused = await pauseV5Task(workspaceRoot, record);
+  return { pending: paused.pending, task: await stableTaskView(workspaceRoot, paused.task) };
+}
+
+export async function stableResumeTask(workspaceRoot: string, record: CompatibleTask): Promise<{ task: ExchangeTaskV1 }> {
+  if (!('identity' in record)) throw new MercuryError('CONTRACT_UNSUPPORTED', '此历史任务不支持安全恢复；查询未做任何写入。', { exitCode: 5 });
+  const resumed = await resumeV5Task(workspaceRoot, record);
+  return { task: await stableTaskView(workspaceRoot, resumed) };
+}
+
+export async function stableRetryPlan(workspaceRoot: string, record: CompatibleTask): Promise<ExchangeRetryPlanV1> {
+  if (!('identity' in record)) throw new MercuryError('CONTRACT_UNSUPPORTED', '此历史任务不支持安全 retry plan；查询未做任何写入。', { exitCode: 5 });
+  return planV5Retry(path.join(workspaceRoot, 'tasks', record.identity.task_directory), record);
+}
+
+export async function stableRetryTask(workspaceRoot: string, record: CompatibleTask, planId: string): Promise<{ task: ExchangeTaskV1 }> {
+  if (!('identity' in record)) throw new MercuryError('CONTRACT_UNSUPPORTED', '此历史任务不支持安全 retry；查询未做任何写入。', { exitCode: 5 });
+  const retried = await executeV5Retry(workspaceRoot, record, planId);
+  return { task: await stableTaskView(workspaceRoot, retried) };
+}
+
 export async function stableDeliverTask(workspaceRoot: string, record: CompatibleTask): Promise<{ task: ExchangeTaskV1; result: ExchangeResultV1 }> {
   if (!('identity' in record)) throw new MercuryError('CONTRACT_UNSUPPORTED', '此历史任务不支持业务目录交付；查询未做任何写入。', { exitCode: 5 });
+  if (record.status !== 'completed' || !record.artifacts.approved) {
+    throw new MercuryError('DELIVERY_NOT_READY', '当前任务没有可交付的最终批准字幕；业务目录不会产生新文件。', {
+      exitCode: 3,
+      remediation: '请按任务主错误处理，或在 completed 任务中先完成审阅并 finalize；不要执行 task deliver，也不要重放当前任务。',
+    });
+  }
   const directory = path.join(workspaceRoot, 'tasks', record.identity.task_directory);
   const delivered = await deliverCurrentV5Review(directory);
   return { task: await projectV5Task(directory, delivered), result: await projectV5Result(directory, delivered) };
+}
+
+export function assertStableReviewReady(record: TaskRecordV5): void {
+  if (record.status === 'completed' && record.artifacts.transcribed && record.artifacts.calibrated) return;
+  const taskId = record.identity.task_id;
+  const remediation = record.status === 'queued'
+    ? '任务仍在队列中。先查看 task status；若 Worker 已停止，显式执行 mercury worker start --json，然后等待任务形成 AI 校验稿。'
+    : record.status === 'running'
+      ? 'Worker 正在处理任务。请等待并只读查询 task status，直到任务形成 AI 校验稿。'
+      : record.status === 'pausing'
+        ? '暂停正在安全收敛。请等待 task status 进入 paused，再按其当前动作继续。'
+        : record.status === 'paused'
+          ? `先执行 mercury task resume ${taskId} --json 继续同一 attempt，再等待任务形成 AI 校验稿。`
+          : record.status === 'needs_input'
+            ? '任务正在等待输入。请先按 task status 的 error.remediation 和当前动作补齐输入。'
+            : record.status === 'completed'
+              ? '任务缺少可验证的审阅来源。请只读查看 task status 和 task result，并保留现有证据。'
+              : '此任务没有形成可审阅的 AI 校验稿。请按 task status 的 error.remediation 和当前动作处理。';
+  throw new MercuryError('REVIEW_NOT_READY', `任务当前为 ${record.status}，尚未形成可审阅的 AI 校验稿。`, {
+    exitCode: 3,
+    remediation,
+  });
 }
 
 export async function stableEventsAfter(workspaceRoot: string, record: CompatibleTask, after: number): Promise<ExchangeEventV1[]> {

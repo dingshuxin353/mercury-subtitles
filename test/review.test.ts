@@ -187,14 +187,15 @@ describe('V02-D003 review and approved subtitle', () => {
     const [first, second, third] = review.changes;
     review = await decideReviewChange(input.taskDirectory, { changeId: first!.change_id, decision: 'accepted', actor: 'user_via_skill', now: () => new Date('2026-08-16T05:01:00.000Z') });
     review = await decideReviewChange(input.taskDirectory, { changeId: second!.change_id, decision: 'rejected', actor: 'user_via_cli', now: () => new Date('2026-08-16T05:02:00.000Z') });
-    review = await decideReviewChange(input.taskDirectory, { changeId: third!.change_id, decision: 'edited', text: '丙自定义', actor: 'user_via_skill', now: () => new Date('2026-08-16T05:03:00.000Z') });
+    review = await decideReviewChange(input.taskDirectory, { changeId: third!.change_id, decision: 'edited', text: '丙，自定义！', actor: 'user_via_skill', now: () => new Date('2026-08-16T05:03:00.000Z') });
     expect(review.counts).toEqual({ total: 3, pending: 0, accepted: 1, rejected: 1, edited: 1 });
     await expect(finalizeReview(input.taskDirectory, () => new Date('2026-08-16T05:04:00.000Z'))).resolves.toMatchObject({ status: 'approved' });
     const final = await readReview(input.taskDirectory);
     const approved = await readFile(path.join(input.taskDirectory, final.approved_artifact!.path), 'utf8');
     expect(approved).toContain('甲一');
     expect(approved).toContain('\n乙\n');
-    expect(approved).toContain('丙自定义');
+    expect(approved).toContain('丙 自定义');
+    expect(approved).not.toMatch(/[，！]/u);
     expect(approved.match(/00:00:0\d,000 --> 00:00:0\d,000/gu)).toHaveLength(4);
     expect(await readFile(path.join(input.taskDirectory, 'output/source.transcribed.srt'), 'utf8')).toBe(input.transcribed);
     expect(await readFile(path.join(input.taskDirectory, 'output/source.calibrated.srt'), 'utf8')).toBe(input.calibrated);
@@ -309,20 +310,21 @@ describe('V02-D003 review and approved subtitle', () => {
 
   it('applies two disjoint corrections that share a cross-boundary target group without duplication', async () => {
     const input = await mappedPrepared({
-      transcribed: [{ start: 0, end: 1_000, text: 'Nue' }, { start: 1_000, end: 2_000, text: 'York?' }],
+      transcribed: [{ start: 0, end: 1_000, text: 'Nue' }, { start: 1_000, end: 2_000, text: 'Yrok?' }],
       calibrated: [{ start: 0, end: 1_000, text: 'New' }, { start: 1_000, end: 2_000, text: 'York!' }],
       units: [
         { id: 'unit-new', original: 'Nue', corrected: 'New', start: 0, end: 1_000, refs: ['seg-1'], targetRefs: ['mapped-subtitle-1', 'mapped-subtitle-2'] },
-        { id: 'unit-york', original: 'York?', corrected: 'York!', start: 1_000, end: 2_000, refs: ['seg-2'], targetRefs: ['mapped-subtitle-1', 'mapped-subtitle-2'] },
+        { id: 'unit-york', original: 'Yrok?', corrected: 'York!', start: 1_000, end: 2_000, refs: ['seg-2'], targetRefs: ['mapped-subtitle-1', 'mapped-subtitle-2'] },
       ],
     });
     let review = await initializeReview(input.taskDirectory);
-    expect(review.changes.map((change) => [change.target_text_start, change.target_text_end])).toEqual([[0, 3], [3, 8]]);
+    expect(review.changes.map((change) => [change.target_text_start, change.target_text_end])).toEqual([[0, 3], [3, 7]]);
     for (const change of review.changes) review = await decideReviewChange(input.taskDirectory, { changeId: change.change_id, decision: 'rejected', actor: 'user_via_cli' });
     const final = await finalizeReview(input.taskDirectory);
     const approved = await readFile(path.join(input.taskDirectory, final.approved_artifact!.path), 'utf8');
     expect(approved).toContain('Nue');
-    expect(approved).toContain('York?');
+    expect(approved).toContain('Yrok');
+    expect(approved).not.toMatch(/[?!]/u);
     expect((approved.match(/Nue/gu) ?? [])).toHaveLength(1);
   });
 
@@ -330,7 +332,7 @@ describe('V02-D003 review and approved subtitle', () => {
     const input = await mappedPrepared({
       transcribed: [
         { start: 0, end: 1_000, text: 'Nue' },
-        { start: 1_000, end: 2_000, text: 'York?' },
+        { start: 1_000, end: 2_000, text: 'Yrok?' },
         { start: 2_000, end: 3_000, text: 'Now' },
       ],
       calibrated: [
@@ -340,7 +342,7 @@ describe('V02-D003 review and approved subtitle', () => {
       ],
       units: [
         { id: 'unit-new', original: 'Nue', corrected: 'New', start: 0, end: 1_000, refs: ['seg-1'], targetRefs: ['mapped-subtitle-1', 'mapped-subtitle-2'] },
-        { id: 'unit-york', original: 'York?', corrected: 'York!', start: 1_000, end: 2_000, refs: ['seg-2'], targetRefs: ['mapped-subtitle-2', 'mapped-subtitle-3'] },
+        { id: 'unit-york', original: 'Yrok?', corrected: 'York!', start: 1_000, end: 2_000, refs: ['seg-2'], targetRefs: ['mapped-subtitle-2', 'mapped-subtitle-3'] },
       ],
     });
     let review = await initializeReview(input.taskDirectory);
@@ -358,7 +360,8 @@ describe('V02-D003 review and approved subtitle', () => {
     const final = await finalizeReview(input.taskDirectory);
     const approved = await readFile(path.join(input.taskDirectory, final.approved_artifact!.path), 'utf8');
     expect(approved).toContain('Nue');
-    expect(approved).toContain('York!');
+    expect(approved).toContain('York');
+    expect(approved).not.toMatch(/[?!]/u);
     expect((approved.match(/-->/gu) ?? [])).toHaveLength(3);
     const calibratedTimeline = parseReferenceSrt(input.calibrated);
     const approvedTimeline = parseReferenceSrt(approved);
@@ -408,6 +411,24 @@ describe('V02-D003 review and approved subtitle', () => {
     const after = await readReview(input.taskDirectory);
     expect(after.approved_artifact).toBeNull();
     expect(await readFile(path.join(input.taskDirectory, 'output/source.calibrated.srt'), 'utf8')).toBe(input.calibrated);
+  });
+
+  it('does not create a review item for a punctuation-only model change and finalizes visible text without punctuation', async () => {
+    const input = await mappedPrepared({
+      transcribed: [{ start: 0, end: 1_000, text: '你好' }],
+      calibrated: [{ start: 0, end: 1_000, text: '你好' }],
+      units: [{
+        id: 'unit-punctuation-only', original: '你好', corrected: '你好！', start: 0, end: 1_000,
+        refs: ['seg-1'], targetRefs: ['mapped-subtitle-1'],
+      }],
+    });
+    const review = await initializeReview(input.taskDirectory);
+    expect(review.counts).toEqual({ total: 0, pending: 0, accepted: 0, rejected: 0, edited: 0 });
+    expect(review.status).toBe('not_required');
+    const final = await finalizeReview(input.taskDirectory);
+    const approved = await readFile(path.join(input.taskDirectory, final.approved_artifact!.path), 'utf8');
+    expect(approved).toContain('你好');
+    expect(approved).not.toContain('！');
   });
 
   it('treats a segmentation-only change as not required and preserves English line output', async () => {

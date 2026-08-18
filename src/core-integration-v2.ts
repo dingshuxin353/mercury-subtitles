@@ -32,6 +32,7 @@ import {
 } from './models.js';
 import {
   normalizeReferenceSrtForCalibration,
+  normalizeVisibleSubtitleText,
   parseReferenceSrt,
   runSubtitleCore,
   type CalibratedTranscript,
@@ -423,7 +424,7 @@ function transcribedProjection(transcript: TranscriptRaw): CalibratedTranscript 
       index,
       start_ms: segment.start_ms,
       end_ms: segment.end_ms,
-      text: segment.text,
+      text: normalizeVisibleSubtitleText(segment.text).text,
       confidence: 'medium',
       asr_segment_refs: [segment.segment_id],
       reference_segment_refs: [],

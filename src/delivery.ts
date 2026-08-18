@@ -29,11 +29,17 @@ async function fireFault(fault: ((point: DeliveryFaultPoint) => Promise<void> | 
   try { await fault?.(point); } catch (error) { throw new SimulatedDeliveryCrash(point, error); }
 }
 
-function deliveryError(code: string, message: string, category: ExchangeErrorV1['category'], detail: string | null = null): ExchangeErrorV1 {
+function deliveryError(
+  code: string,
+  message: string,
+  category: ExchangeErrorV1['category'],
+  detail: string | null = null,
+  remediation = '工作区内的批准稿仍然安全；修复业务目录后执行 mercury task deliver <task-id> --json。本动作不会再次调用 Provider。',
+): ExchangeErrorV1 {
   return {
     contract: 'mercury.error/v1', code, category, message,
     retryability: 'after_user_action', provider_outcome: 'not_applicable',
-    remediation: ['工作区内的批准稿仍然安全；修复业务目录后执行 mercury task deliver <task-id> --json。本动作不会再次调用 Provider。'],
+    remediation: [remediation],
     technical: detail ? { provider_code: null, log_id: null, detail: detail.replace(/[\u0000-\u001f\u007f]/gu, ' ').slice(0, 1000) } : null,
     extensions: {},
   };
@@ -259,8 +265,19 @@ export async function projectDeliveryReadOnly(task: TaskRecordV5): Promise<NonNu
   const delivery = task.delivery;
   if (!delivery) return { requested_directory: null, status: 'not_requested', final_path: null, sha256: null, validation: 'unavailable', delivered_at: null, review_revision: null, history: [], error: null, next_action: '此任务未请求业务目录交付。' };
   if (delivery.requested_directory && ['failed', 'cancelled', 'interrupted', 'needs_input'].includes(task.status)) {
-    const error = deliveryError('DELIVERY_NOT_READY', '任务未成功完成并形成当前批准稿；Mercury 不会向业务目录发布 transcribed 或 calibrated 字幕。', 'conflict');
-    return { ...delivery, status: 'failed', final_path: null, sha256: null, validation: 'unavailable', delivered_at: null, review_revision: null, error, next_action: '当前任务不能发布最终字幕；业务目录没有新文件。请保留任务证据并按任务错误处理，不能用 task deliver 重放 Provider。' };
+    const error = deliveryError(
+      'DELIVERY_NOT_READY',
+      '任务未成功完成并形成当前批准稿；Mercury 不会向业务目录发布 transcribed 或 calibrated 字幕。',
+      'conflict',
+      null,
+      '当前任务没有可交付的最终批准字幕。请按任务主错误处理；不要执行 task deliver，也不要重放当前任务。',
+    );
+    const nextAction = task.status === 'needs_input'
+      ? '任务正在等待用户处理输入问题；请先按任务主错误完成修复。最终批准字幕尚未形成。'
+      : task.status === 'interrupted' && Object.values(task.execution.provider_calls).some((entry) => entry.state === 'response_persisted')
+        ? 'Provider 响应已固定；请先按任务当前 resume 动作继续本地处理。最终批准字幕尚未形成。'
+        : '当前任务不能发布最终字幕；业务目录没有新文件。请保留任务证据并按任务错误处理，不能用 task deliver 重放 Provider。';
+    return { ...delivery, status: 'failed', final_path: null, sha256: null, validation: 'unavailable', delivered_at: null, review_revision: null, error, next_action: nextAction };
   }
   let status: NonNullable<ExchangeTaskV1['delivery']>['status'] = delivery.status;
   let error = delivery.error;
@@ -268,10 +285,15 @@ export async function projectDeliveryReadOnly(task: TaskRecordV5): Promise<NonNu
   if (delivery.status === 'delivered' && (!delivery.final_path || !delivery.sha256 || !await verifiedFile(delivery.final_path, delivery.sha256))) {
     status = 'failed'; validation = 'unavailable'; error = deliveryError('DELIVERY_HISTORY_INVALID', '最新业务交付文件缺失、被替换、权限不安全或 hash 不一致。', 'security');
   }
-  const nextAction = status === 'pending_review' ? '请完成当前人工审阅并 finalize；历史业务文件仍保持不变。'
+  const activeTaskAction = task.status === 'queued' ? '任务已入队；请先启动或等待 Worker 完成处理。最终批准字幕尚未形成。'
+    : task.status === 'running' ? '任务正在后台处理；请等待当前阶段完成。最终批准字幕尚未形成。'
+      : task.status === 'pausing' ? '暂停请求正在等待安全检查点；请继续查询任务。最终批准字幕尚未形成。'
+        : task.status === 'paused' ? '任务已暂停；请先执行 task resume 继续同一 attempt。最终批准字幕尚未形成。'
+          : null;
+  const nextAction = activeTaskAction ?? (status === 'pending_review' ? '请完成当前人工审阅并 finalize；历史业务文件仍保持不变。'
     : status === 'ready' ? `批准稿已就绪；执行 mercury task deliver ${task.identity.task_id} --json 完成本地交付。`
       : status === 'delivered' ? `最新批准稿已交付：${delivery.final_path}`
         : status === 'failed' ? `工作区批准稿仍然安全；修复业务目录后执行 mercury task deliver ${task.identity.task_id} --json。本动作不会再次调用 Provider。`
-          : '此任务未请求业务目录交付。';
+          : '此任务未请求业务目录交付。');
   return { ...delivery, status, validation, error, next_action: nextAction };
 }
