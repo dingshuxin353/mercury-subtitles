@@ -98,7 +98,12 @@ jobs:
           '
 
       - run: npm ci
-      - run: npm run verify
+      - run: npm run verify:generated
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test -- --maxWorkers=1 --no-file-parallelism
+      - run: npm run verify:package
+      - run: npm run verify:sensitive
       - run: npm run verify:public-snapshot
 
       - name: Publish with npm Trusted Publishing
