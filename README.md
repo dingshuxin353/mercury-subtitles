@@ -53,11 +53,13 @@ node --version
 
 需要显示 `v24.x.x`。如果还是 Node 22，请先安装或切换到 [Node.js 24](https://nodejs.org/)，然后重新打开终端。
 
-### 2. 安装当前候选渠道
+### 2. 安装当前已发布版本
 
 ```bash
 npm install --global mercury-subtitles@next
 ```
+
+`@next` 当前仍指向已经发布的 `0.3.0-alpha.2`。本仓库的 `0.3.0-rc.1` 只是待验收候选，尚未获得 npm 发布授权；在真实发布完成前，上述命令不会安装 RC。
 
 ### 3. 打开 Mercury
 
@@ -242,7 +244,7 @@ npm install --global mercury-subtitles@next
 mercury update --check
 ```
 
-如果当前入口不是可验证、可写的 npm 全局安装，Mercury 会给出适合该来源的手动动作，而不是修改项目、本地 npm exec 缓存或源码。自动升级会先显示目标并要求确认；机器模式必须显式使用 `--yes`。也可以手动更新候选渠道：
+如果当前入口不是与同一个可信 npm global prefix 完整绑定、且该目录可写的全局安装，Mercury 会拒绝自动覆盖并给出适合该来源的手动动作，而不是修改项目、本地 npm exec 缓存或源码。自动升级会先显示目标并要求确认；机器模式必须显式使用 `--yes`。当前已发布预览版仍可手工安装：
 
 ```bash
 npm install --global mercury-subtitles@next
@@ -291,7 +293,7 @@ npm run verify
 
 ## 版本与反馈
 
-- 当前唯一开发候选：`0.3.0-rc.1`；尚未据此宣称 `0.3.0` 稳定版完成。公开候选渠道使用 npm dist-tag `next`。
+- 当前唯一开发候选：`0.3.0-rc.1`；尚未据此宣称 `0.3.0` 稳定版完成，也尚未发布到 npm。npm `next` 当前仍是已发布的 `0.3.0-alpha.2`，只有获得单独发布授权并完成真实发布后才会变化。
 - 版本变化：[CHANGELOG.md](./CHANGELOG.md)
 - 下载与校验：[GitHub Releases](https://github.com/dingshuxin353/mercury-subtitles/releases)
 - 安装或配置求助：[创建安装帮助](https://github.com/dingshuxin353/mercury-subtitles/issues/new?template=installation-help.yml)

@@ -106,6 +106,9 @@ export async function tryRunStableCli(args: string[], context: StableCliContext)
           nodeVersion,
           packageRoot,
           executablePath,
+          nodeExecutable: dependencies.nodeExecutable ?? process.execPath,
+          ...(dependencies.npmCliPath ? { npmCliPath: dependencies.npmCliPath } : {}),
+          ...(dependencies.spawnCommand ? { spawnCommand: dependencies.spawnCommand } : {}),
           ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
         });
       } else {

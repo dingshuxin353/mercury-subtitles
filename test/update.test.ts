@@ -7,6 +7,7 @@ import {
   applyUpdate,
   checkForUpdates,
   compareVersions,
+  defaultSpawnCommand,
   detectInstallationOrigin,
   fetchRegistryFacts,
   nodeSatisfiesEngine,
@@ -50,6 +51,15 @@ async function installation(kind: 'global' | 'local' | 'exec' | 'source') {
   return { root, packageRoot, executablePath };
 }
 
+async function globalInstallationAt(prefix: string) {
+  const packageRoot = path.join(prefix, 'lib/node_modules/mercury-subtitles');
+  const executablePath = path.join(packageRoot, 'dist/src/bin.js');
+  await mkdir(path.dirname(executablePath), { recursive: true });
+  await writeFile(executablePath, '#!/usr/bin/env node\n', { mode: 0o755 });
+  await writeFile(path.join(packageRoot, 'package.json'), JSON.stringify({ name: UPDATE_PACKAGE_NAME }));
+  return { root: prefix, packageRoot, executablePath };
+}
+
 async function fakeNode(root: string) {
   const nodeExecutable = path.join(root, 'node/bin/node');
   const npmCliPath = path.join(root, 'node/bin/npm');
@@ -60,6 +70,24 @@ async function fakeNode(root: string) {
   await writeFile(npmReal, '', { mode: 0o755 });
   await (await import('node:fs/promises')).symlink(npmReal, npmCliPath);
   return { nodeExecutable, npmCliPath };
+}
+
+function boundSpawn(
+  install: Awaited<ReturnType<typeof installation>>,
+  version = '0.3.0-rc.1',
+  options: { installCode?: number; verifyVersion?: string } = {},
+): { calls: Array<{ command: string; args: string[] }>; spawnCommand: SpawnCommand } {
+  const calls: Array<{ command: string; args: string[] }> = [];
+  return {
+    calls,
+    spawnCommand: async (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (args.join(' ') === 'prefix --global') return { code: 0, stdout: `${install.root}\n`, stderr: '' };
+      if (args.join(' ') === 'root --global') return { code: 0, stdout: `${path.join(install.root, 'lib/node_modules')}\n`, stderr: '' };
+      if (args[0] === 'install') return { code: options.installCode ?? 0, stdout: '', stderr: options.installCode ? 'private detail' : '' };
+      return { code: 0, stdout: `${options.verifyVersion ?? version}\n`, stderr: '' };
+    },
+  };
 }
 
 function capture(home: string) {
@@ -93,7 +121,7 @@ describe('safe CLI update contract', () => {
   it('classifies global, local, npm exec and source layouts from fixed package roots', async () => {
     for (const [fixture, expected] of [['global', 'npm_global'], ['local', 'npm_local'], ['exec', 'npm_exec'], ['source', 'source']] as const) {
       const found = await installation(fixture);
-      expect(await detectInstallationOrigin(found.packageRoot, found.executablePath)).toMatchObject({ kind: expected, auto_apply: fixture === 'global' });
+      expect(await detectInstallationOrigin(found.packageRoot, found.executablePath)).toMatchObject({ kind: expected, auto_apply: false, prefix_verified: false });
     }
   });
 
@@ -125,9 +153,11 @@ describe('safe CLI update contract', () => {
     await expect(readFile(path.join(home, 'mercury-workspace/config/model-config.json'))).rejects.toMatchObject({ code: 'ENOENT' });
 
     const global = await installation('global');
+    const node = await fakeNode(global.root);
+    const bound = boundSpawn(global);
     const cancelled = capture(home);
     expect(await runCli(['update'], { ...cancelled.io, prompt: async () => 'n' }, {}, {}, { update: {
-      currentVersion: '0.3.0-alpha.2', nodeVersion: '24.19.0', ...global, fetch: registry(),
+      currentVersion: '0.3.0-alpha.2', nodeVersion: '24.19.0', ...global, ...node, fetch: registry(), spawnCommand: bound.spawnCommand,
     } })).toBe(130);
     expect(cancelled.stderr.join('')).toBe('已取消，未执行安装。\n');
   });
@@ -151,25 +181,71 @@ describe('safe CLI update contract', () => {
   it('uses an argument array for one trusted global npm install and verifies the same entry', async () => {
     const global = await installation('global');
     const node = await fakeNode(global.root);
-    const calls: Array<{ command: string; args: string[] }> = [];
-    const spawnCommand: SpawnCommand = async (command, args) => {
-      calls.push({ command, args: [...args] });
-      return calls.length === 1
-        ? { code: 0, stdout: '', stderr: '' }
-        : { code: 0, stdout: '0.3.0-rc.1\n', stderr: '' };
-    };
+    const bound = boundSpawn(global);
     const result = await applyUpdate({
       currentVersion: '0.3.0-alpha.2', nodeVersion: '24.19.0', ...global, ...node,
-      yes: true, channel: 'next', fetch: registry(), spawnCommand,
+      yes: true, channel: 'next', fetch: registry(), spawnCommand: bound.spawnCommand,
     });
     expect(result).toMatchObject({ applied: true, verified_version: '0.3.0-rc.1', requested: { direction: 'upgrade' } });
-    expect(calls).toHaveLength(2);
-    expect(calls[0]).toEqual({
+    expect(bound.calls).toHaveLength(4);
+    expect(bound.calls[0]!.args).toEqual(['prefix', '--global']);
+    expect(bound.calls[1]!.args).toEqual(['root', '--global']);
+    expect(bound.calls[2]).toEqual({
       command: node.npmCliPath,
-      args: ['install', '--global', 'mercury-subtitles@0.3.0-rc.1', '--registry', 'https://registry.npmjs.org/', '--no-audit', '--no-fund', '--ignore-scripts'],
+      args: ['install', '--global', '--prefix', result.installation.npm_global_prefix!, 'mercury-subtitles@0.3.0-rc.1', '--registry', 'https://registry.npmjs.org/', '--no-audit', '--no-fund', '--ignore-scripts'],
     });
-    expect(calls[0]!.args.join(' ')).not.toMatch(/sudo|[;&|`$()]/u);
-    expect(calls[1]).toEqual({ command: node.nodeExecutable, args: [global.executablePath, '--version'] });
+    expect(bound.calls[2]!.args.join(' ')).not.toMatch(/sudo|[;&|`$()]/u);
+    expect(bound.calls[3]).toEqual({ command: node.nodeExecutable, args: [global.executablePath, '--version'] });
+    expect(result.installation).toMatchObject({ prefix_verified: true, auto_apply: true });
+  });
+
+  it('refuses a package in prefix A when the trusted npm is configured for prefix B', async () => {
+    const prefixA = await installation('global');
+    const prefixB = await installation('global');
+    const node = await fakeNode(prefixB.root);
+    const calls: Array<{ args: string[] }> = [];
+    const mismatchedSpawn: SpawnCommand = async (_command, args) => {
+      calls.push({ args: [...args] });
+      if (args[0] === 'prefix') return { code: 0, stdout: `${prefixB.root}\n`, stderr: '' };
+      if (args[0] === 'root') return { code: 0, stdout: `${path.join(prefixB.root, 'lib/node_modules')}\n`, stderr: '' };
+      throw new Error('install must not run');
+    };
+    const checked = await checkForUpdates({
+      currentVersion: '0.3.0-alpha.2', nodeVersion: '24.19.0', ...prefixA, ...node,
+      fetch: registry(), spawnCommand: mismatchedSpawn,
+    });
+    expect(checked).toMatchObject({
+      can_auto_apply: false,
+      installation: { kind: 'npm_global', auto_apply: false, prefix_verified: false, prefix_error: 'UPDATE_NPM_PREFIX_MISMATCH' },
+    });
+    calls.length = 0;
+    await expect(applyUpdate({
+      currentVersion: '0.3.0-alpha.2', nodeVersion: '24.19.0', ...prefixA, ...node,
+      yes: true, channel: 'next', fetch: registry(),
+      spawnCommand: mismatchedSpawn,
+    })).rejects.toMatchObject({ code: 'UPDATE_NPM_PREFIX_MISMATCH' });
+    expect(calls.map((call) => call.args[0])).toEqual(['prefix', 'root']);
+  });
+
+  it('uses npm prefix/root facts instead of guessing nvm, Homebrew, Volta or custom-prefix layouts', async () => {
+    const base = await mkdtemp(path.join(os.tmpdir(), 'mercury-update-manager-layouts-'));
+    for (const managerPath of [
+      '.nvm/versions/node/v24.19.0',
+      'homebrew/Cellar/node/24.19.0',
+      '.volta/tools/image/node/24.19.0',
+      'custom/npm-config-prefix',
+    ]) {
+      const prefix = path.join(base, managerPath, 'global-prefix');
+      const found = await globalInstallationAt(prefix);
+      const node = await fakeNode(path.join(base, managerPath, 'toolchain'));
+      const bound = boundSpawn(found);
+      const checked = await checkForUpdates({
+        currentVersion: '0.3.0-alpha.2', nodeVersion: '24.19.0', ...found, ...node,
+        fetch: registry(), spawnCommand: bound.spawnCommand,
+      });
+      expect(checked.installation).toMatchObject({ kind: 'npm_global', prefix_verified: true, auto_apply: true });
+      expect(bound.calls.map((call) => call.args)).toEqual([['prefix', '--global'], ['root', '--global']]);
+    }
   });
 
   it('refuses local, temporary and source installs without invoking npm', async () => {
@@ -198,23 +274,24 @@ describe('safe CLI update contract', () => {
       yes: true, channel: 'latest', fetch: registry(), spawnCommand: async () => ({ code: 0, stdout: '', stderr: '' }),
     })).rejects.toMatchObject({ code: 'UPDATE_CHANNEL_OLDER' });
     let calls = 0;
+    const mismatch = boundSpawn(global, '0.3.0-rc.1', { verifyVersion: '0.3.0-alpha.2' });
     await expect(applyUpdate({
       currentVersion: '0.3.0-alpha.2', nodeVersion: '24.19.0', ...global, ...node,
       yes: true, channel: 'next', fetch: registry(),
-      spawnCommand: async () => (++calls === 1 ? { code: 0, stdout: '', stderr: '' } : { code: 0, stdout: '0.3.0-alpha.2\n', stderr: '' }),
+      spawnCommand: async (command, args, options) => { calls += 1; return mismatch.spawnCommand(command, args, options); },
     })).rejects.toMatchObject({ code: 'UPDATE_VERIFY_FAILED' });
   });
 
   it('keeps npm failure explicit and does not attempt post-install verification', async () => {
     const global = await installation('global');
     const node = await fakeNode(global.root);
-    let calls = 0;
+    const failed = boundSpawn(global, '0.3.0-rc.1', { installCode: 73 });
     await expect(applyUpdate({
       currentVersion: '0.3.0-alpha.2', nodeVersion: '24.19.0', ...global, ...node,
       yes: true, channel: 'next', fetch: registry(),
-      spawnCommand: async () => { calls += 1; return { code: 73, stdout: '', stderr: 'permission denied' }; },
+      spawnCommand: failed.spawnCommand,
     })).rejects.toMatchObject({ code: 'UPDATE_INSTALL_FAILED', message: expect.not.stringContaining('permission denied') });
-    expect(calls).toBe(1);
+    expect(failed.calls.map((call) => call.args[0])).toEqual(['prefix', 'root', 'install']);
   });
 
   it('allows an explicit exact rollback without describing it as a recommended upgrade', async () => {
@@ -224,11 +301,11 @@ describe('safe CLI update contract', () => {
       latest: '0.3.0', next: '0.3.1-alpha.1',
       versions: { '0.3.0': '>=24 <25', '0.3.1-alpha.1': '>=24 <25', '0.2.0-alpha.2': '>=24 <25' },
     });
-    let calls = 0;
+    const bound = boundSpawn(global, '0.2.0-alpha.2');
     const result = await applyUpdate({
       currentVersion: '0.3.0', nodeVersion: '24.19.0', ...global, ...node,
       yes: true, version: '0.2.0-alpha.2', fetch: registry(exactMetadata),
-      spawnCommand: async () => (++calls === 1 ? { code: 0, stdout: '', stderr: '' } : { code: 0, stdout: '0.2.0-alpha.2\n', stderr: '' }),
+      spawnCommand: bound.spawnCommand,
     });
     expect(result.requested).toMatchObject({ version: '0.2.0-alpha.2', direction: 'downgrade', channel: null });
     expect(result.next_action).not.toContain('推荐升级');
@@ -270,6 +347,56 @@ describe('safe CLI update contract', () => {
       },
     });
     await expect(fetchRegistryFacts(async () => new Response(body))).rejects.toMatchObject({ code: 'UPDATE_REGISTRY_TOO_LARGE' });
+  });
+
+  it('maps headers-then-stall, partial-body reset and reader errors to stable transport errors', async () => {
+    vi.useFakeTimers();
+    try {
+      const stalled = fetchRegistryFacts(async () => new Response(new ReadableStream<Uint8Array>({ pull() {} })));
+      const timeout = expect(stalled).rejects.toMatchObject({ code: 'UPDATE_CHECK_TIMEOUT' });
+      await vi.advanceTimersByTimeAsync(5_001);
+      await timeout;
+    } finally {
+      vi.useRealTimers();
+    }
+    for (const partial of [false, true]) {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          if (partial) controller.enqueue(new TextEncoder().encode('{'));
+          controller.error(new Error('connection reset private detail'));
+        },
+      });
+      await expect(fetchRegistryFacts(async () => new Response(body))).rejects.toMatchObject({ code: 'UPDATE_REGISTRY_UNAVAILABLE' });
+    }
+  });
+
+  it('settles timeout and oversized-output processes even when SIGTERM is ignored', async () => {
+    const started = Date.now();
+    await expect(defaultSpawnCommand(process.execPath, ['-e', 'process.on("SIGTERM",()=>{});setInterval(()=>{},1000)'], { timeoutMs: 50 }))
+      .rejects.toMatchObject({ code: 'UPDATE_COMMAND_TIMEOUT' });
+    expect(Date.now() - started).toBeLessThan(1_000);
+    await expect(defaultSpawnCommand(process.execPath, ['-e', 'process.on("SIGTERM",()=>{});process.stdout.write("x".repeat(300000));setInterval(()=>{},1000)'], { timeoutMs: 5_000 }))
+      .rejects.toMatchObject({ code: 'UPDATE_COMMAND_OUTPUT_TOO_LARGE' });
+  });
+
+  it('never turns timed-out install or post-verify subprocesses into a late success', async () => {
+    const global = await installation('global');
+    const node = await fakeNode(global.root);
+    for (const phase of ['install', 'verify'] as const) {
+      const calls: string[] = [];
+      await expect(applyUpdate({
+        currentVersion: '0.3.0-alpha.2', nodeVersion: '24.19.0', ...global, ...node,
+        yes: true, channel: 'next', fetch: registry(),
+        spawnCommand: async (_command, args) => {
+          calls.push(args[0]!);
+          if (args[0] === 'prefix') return { code: 0, stdout: `${global.root}\n`, stderr: '' };
+          if (args[0] === 'root') return { code: 0, stdout: `${path.join(global.root, 'lib/node_modules')}\n`, stderr: '' };
+          if (phase === 'verify' && args[0] === 'install') return { code: 0, stdout: '', stderr: '' };
+          return defaultSpawnCommand(process.execPath, ['-e', 'process.on("SIGTERM",()=>{});setTimeout(()=>process.exit(0),500);setInterval(()=>{},1000)'], { timeoutMs: 50 });
+        },
+      })).rejects.toMatchObject({ code: 'UPDATE_COMMAND_TIMEOUT' });
+      expect(calls).toEqual(phase === 'install' ? ['prefix', 'root', 'install'] : ['prefix', 'root', 'install', global.executablePath]);
+    }
   });
 
   it('rejects malicious versions and engines before invoking npm', async () => {

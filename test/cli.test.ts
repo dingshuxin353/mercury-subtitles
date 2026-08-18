@@ -65,7 +65,7 @@ describe('Mercury v2 CLI', () => {
   it('guides a brand-new user without exposing credential references', async () => {
     const home = await mkdtemp(path.join(tmpdir(), 'mercury-v2-new-user-'));
     const output = capture(home);
-    const answers = ['1', 'fixture-subtitle-app', '1', 'fixture-chat-model', 'https://chat.example/v1', 'y', 'n', '0'];
+    const answers = ['1', '1', 'fixture-subtitle-app', '1', 'fixture-chat-model', 'https://chat.example/v1', 'y', 'n', '0'];
     const secrets = ['fixture-asr-secret', 'fixture-chat-secret'];
     const io = {
       ...output.io,
@@ -96,6 +96,7 @@ describe('Mercury v2 CLI', () => {
     const output = capture(home);
     const answers = [
       '1',
+      '1',
       'cancelled-subtitle-app',
       '1',
       'fixture-chat-model',
@@ -125,7 +126,7 @@ describe('Mercury v2 CLI', () => {
     const home = await mkdtemp(path.join(tmpdir(), 'mercury-v2-invalid-'));
     const output = capture(home);
     const answers = [
-      '2', '1', '1', 'fixture-chat-model', 'http://unsafe.example/v1', 'y',
+      '1', '2', '1', '1', 'fixture-chat-model', 'http://unsafe.example/v1', 'y',
     ];
     const secrets = ['invalid-asr-secret', 'invalid-chat-secret'];
     const io = {
@@ -567,10 +568,11 @@ describe('Mercury v2 CLI', () => {
     ).toBe(0);
     const output = capture(home);
     const answers = ['1', '/tmp/not-yet-read.mp3', '', '0', '0'];
+    const questions: string[] = [];
     expect(
       await runCli([], {
         ...output.io,
-        prompt: async () => answers.shift() ?? '0',
+        prompt: async (question) => { questions.push(question); return answers.shift() ?? '0'; },
       }),
     ).toBe(0);
     const visible = `${output.stdout.join('')}\n${output.stderr.join('')}`;
@@ -578,6 +580,9 @@ describe('Mercury v2 CLI', () => {
     expect(visible).toContain('1. 现在检查');
     expect(visible).toContain('2. 打开模型中心');
     expect(visible).toContain('已取消任务');
+    expect(visible).toContain('校准只修改文字');
+    expect(questions.join('\n')).not.toContain('校准范围');
+    expect(questions.join('\n')).not.toContain('文字和断句');
     expect(visible).not.toContain('MODEL_CHECK_NOT_PASSED');
     expect(
       await readdir(path.join(home, 'mercury-workspace/tasks')),

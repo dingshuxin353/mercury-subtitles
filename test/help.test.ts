@@ -136,12 +136,76 @@ describe('static human help router', () => {
     expect(child.stderr.join('')).toContain('mercury task status');
     expect(child.stderr.join('')).toContain('该建议未执行');
 
+    const positional = capture(home);
+    expect(await runCli(['task', 'stats', 'abc'], positional.io)).toBe(2);
+    expect(positional.stderr.join('')).toContain('mercury task status');
+
+    const nested = capture(home);
+    expect(await runCli(['dictionary', 'entri', 'ad', 'dict-demo', '--json'], nested.io)).toBe(2);
+    expect(JSON.parse(nested.stdout[0]!).error.remediation.join(' ')).toContain('mercury dictionary entry add');
+
+    const unreliable = capture(home);
+    expect(await runCli(['task', 'zzzz', 'abc'], unreliable.io)).toBe(2);
+    expect(unreliable.stderr.join('')).not.toContain('你是否想运行');
+
     const machine = capture(home);
     expect(await runCli(['task', 'stats', '--json'], machine.io)).toBe(2);
     const envelope = JSON.parse(machine.stdout[0]!);
     expect(envelope).toMatchObject({ contract: 'mercury.cli/v1', ok: false, error: { code: 'CLI_COMMAND_INVALID' } });
     expect(envelope.error.remediation.join(' ')).toContain('mercury task status');
     await expect(lstat(path.join(home, 'mercury-workspace'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('describes Provider, Worker, registry and install side effects without generic contradictions', async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), 'mercury-help-effects-'));
+    const model = capture(home);
+    expect(await runCli(['help', 'model', 'check'], model.io)).toBe(0);
+    expect(model.stdout.join('')).toContain('立即调用所选 Provider');
+    expect(model.stdout.join('')).toContain('写入检查结果');
+    expect(model.stdout.join('')).not.toContain('安装 CLI');
+
+    for (const args of [['help', 'worker', 'start'], ['help', 'task', 'submit']] as const) {
+      const output = capture(home);
+      expect(await runCli([...args], output.io)).toBe(0);
+      expect(output.stdout.join('')).toContain('可能启动 Worker');
+      expect(output.stdout.join('')).toContain('随后可能调用 Provider');
+      expect(output.stdout.join('')).not.toContain('不调用 Provider');
+    }
+    const check = capture(home);
+    expect(await runCli(['help', 'update', 'check'], check.io)).toBe(0);
+    expect(check.stdout.join('')).toContain('只读访问官方 npm registry');
+    expect(check.stdout.join('')).not.toContain('安装 CLI');
+    const apply = capture(home);
+    expect(await runCli(['help', 'update', 'apply'], apply.io)).toBe(0);
+    expect(apply.stdout.join('')).toContain('确认后由已验证 npm 安装 CLI');
+  });
+
+  it('offers setup, update, help and exit before creating a first workspace', async () => {
+    const metadata = {
+      name: 'mercury-subtitles',
+      'dist-tags': { latest: '0.3.0', next: '0.3.0-rc.1' },
+      versions: {
+        '0.3.0': { name: 'mercury-subtitles', version: '0.3.0', engines: { node: '>=24 <25' } },
+        '0.3.0-rc.1': { name: 'mercury-subtitles', version: '0.3.0-rc.1', engines: { node: '>=24 <25' } },
+      },
+    };
+    for (const [name, answers, expected] of [
+      ['exit', ['0'], '首次使用'],
+      ['help', ['3', '', '0'], '第一次使用'],
+      ['update', ['2', '0'], '官方 stable（latest）'],
+    ] as const) {
+      const home = await mkdtemp(path.join(os.tmpdir(), `mercury-first-${name}-`));
+      const output = capture(home);
+      const queue = [...answers];
+      expect(await runCli([], { ...output.io, prompt: async () => queue.shift() ?? '0' }, {}, {}, { update: {
+        currentVersion: '0.3.0-rc.1', nodeVersion: '24.19.0',
+        packageRoot: process.cwd(), executablePath: path.join(process.cwd(), 'src/bin.ts'),
+        fetch: async () => Response.json(metadata),
+      } })).toBe(0);
+      expect(output.stdout.join('')).toContain(expected);
+      expect(output.stdout.join('')).toContain('开始设置模型与服务');
+      await expect(lstat(path.join(home, 'mercury-workspace'))).rejects.toMatchObject({ code: 'ENOENT' });
+    }
   });
 
   it('keeps human errors friendly and points to the local command help', async () => {

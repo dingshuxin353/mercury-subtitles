@@ -2,6 +2,8 @@
 
 ## 0.3.0-rc.1 — Unreleased
 
+> This release candidate has not been published to npm. The public `next` tag still points to `0.3.0-alpha.2` until a separately authorized release completes.
+
 - Added a task-oriented one-screen help page, consistent group/command help, local typo suggestions, and human-readable recovery without exposing internal error codes.
 - Productized the interactive App home flow for subtitle tasks, recent results, model/service setup, dictionaries, update checks, and help without an accidental default task action.
 - Added bounded official-registry update checks, channel/exact-version decisions, verified install-source detection, Node engine preflight, and explicit-confirmation npm-global apply with post-install entry verification.

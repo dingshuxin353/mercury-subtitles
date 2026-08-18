@@ -1,6 +1,6 @@
 import { MercuryError } from './errors.js';
 
-type Effect = 'none' | 'local_read' | 'local_write' | 'network_read' | 'network_write' | 'provider';
+type Effect = 'none' | 'local_read' | 'local_write' | 'registry_read' | 'cli_install' | 'provider_now' | 'provider_background';
 
 export interface CommandFact {
   name: string;
@@ -23,15 +23,15 @@ export interface CommandGroup {
 const GROUPS: CommandGroup[] = [
   {
     name: 'task', title: '字幕任务', summary: '创建、查看、控制任务并找回结果。', commands: [
-      { name: 'submit', summary: '从稳定 request JSON 创建后台任务。', usage: 'mercury task submit --request <绝对路径> --json', example: 'mercury task submit --request "/tmp/request.json" --json', required: ['--request：mercury.exchange.request/v1 的绝对路径'], effects: ['local_write', 'provider'], next: '保存返回的 task ID；用 task status 查询，不要更换 request ID 重提。' },
+      { name: 'submit', summary: '从稳定 request JSON 创建后台任务。', usage: 'mercury task submit --request <绝对路径> --json', example: 'mercury task submit --request "/tmp/request.json" --json', required: ['--request：mercury.exchange.request/v1 的绝对路径'], effects: ['local_write', 'provider_background'], next: '保存返回的 task ID；用 task status 查询，不要更换 request ID 重提。' },
       { name: 'status', summary: '只读查看一个任务的当前状态与下一步。', usage: 'mercury task status <task-id> --json', example: 'mercury task status tsk-20260101-120000-abcd1234 --json', required: ['task-id'], effects: ['local_read'], next: '按 current_actions 与 next_action 决定暂停、恢复、审阅或打开结果。' },
       { name: 'list', summary: '只读列出本地任务。', usage: 'mercury task list [--limit <1-100>] [--cursor <游标>] --json', example: 'mercury task list --limit 10 --json', optional: ['--limit、--cursor'], effects: ['local_read'], next: '选择 task ID 后运行 task status 或 task result。' },
       { name: 'watch', summary: '从事件序号只读跟随任务，不触发 Worker。', usage: 'mercury task watch <task-id> [--after <序号>] --jsonl', example: 'mercury task watch tsk-20260101-120000-abcd1234 --after 0 --jsonl', required: ['task-id'], optional: ['--after'], effects: ['local_read'], next: '终态事件出现后用 task result 获取可信产物路径。' },
       { name: 'result', summary: '只读获取任务结果与产物。', usage: 'mercury task result <task-id> --json', example: 'mercury task result tsk-20260101-120000-abcd1234 --json', required: ['task-id'], effects: ['local_read'], next: '有待审阅修改时进入 review；已批准时直接打开 approved.srt。' },
       { name: 'pause', summary: '请求任务在可证明安全的检查点暂停。', usage: 'mercury task pause <task-id> --json', example: 'mercury task pause tsk-20260101-120000-abcd1234 --json', required: ['task-id'], effects: ['local_write'], next: '状态为 pausing 时继续只读查询；不要中止已发出的 Provider 请求。' },
-      { name: 'resume', summary: '从安全检查点恢复同一 attempt。', usage: 'mercury task resume <task-id> --json', example: 'mercury task resume tsk-20260101-120000-abcd1234 --json', required: ['task-id'], effects: ['local_write', 'provider'], next: '保存返回状态；response_persisted 恢复不会重复 Provider。' },
+      { name: 'resume', summary: '从安全检查点恢复同一 attempt。', usage: 'mercury task resume <task-id> --json', example: 'mercury task resume tsk-20260101-120000-abcd1234 --json', required: ['task-id'], effects: ['local_write', 'provider_background'], next: '保存返回状态；response_persisted 恢复不会重复 Provider。' },
       { name: 'retry-plan', summary: '严格只读生成安全重试计划。', usage: 'mercury task retry-plan <task-id> --json', example: 'mercury task retry-plan tsk-20260101-120000-abcd1234 --json', required: ['task-id'], effects: ['local_read'], next: '仅在 allowed=true 且用户接受预计调用时执行 retry。' },
-      { name: 'retry', summary: '按未过期计划显式创建新 attempt。', usage: 'mercury task retry <task-id> --plan <plan-id> --json', example: 'mercury task retry tsk-20260101-120000-abcd1234 --plan rpl-abc123 --json', required: ['task-id、--plan'], effects: ['local_write', 'provider'], next: '保存同一 task ID；不要重复执行相同计划。' },
+      { name: 'retry', summary: '按未过期计划显式创建新 attempt。', usage: 'mercury task retry <task-id> --plan <plan-id> --json', example: 'mercury task retry tsk-20260101-120000-abcd1234 --plan rpl-abc123 --json', required: ['task-id、--plan'], effects: ['local_write', 'provider_background'], next: '保存同一 task ID；不要重复执行相同计划。' },
       { name: 'deliver', summary: '本地重试交付当前 approved.srt。', usage: 'mercury task deliver <task-id> --json', example: 'mercury task deliver tsk-20260101-120000-abcd1234 --json', required: ['task-id'], effects: ['local_write'], next: '只在 approved 已存在且 delivery 建议恢复时执行；不会调用 Provider。' },
       { name: 'cancel', summary: '取消尚可安全停止的任务。', usage: 'mercury task cancel <task-id> --json', example: 'mercury task cancel tsk-20260101-120000-abcd1234 --json', required: ['task-id'], effects: ['local_write'], next: '若 Provider 已 in-flight，等待安全边界；不要重提相同任务。' },
     ],
@@ -41,7 +41,7 @@ const GROUPS: CommandGroup[] = [
       { name: 'list', summary: '查看已配置模型；普通用户推荐在 App 模型中心操作。', usage: 'mercury model list [--json]', example: 'mercury model list', effects: ['local_read'], next: '需要配置时运行 mercury，进入“模型与服务”。' },
       { name: 'add', summary: '在交互终端隐藏输入新增模型。', usage: 'mercury model add', example: 'mercury model add', effects: ['local_write'], next: '新增后执行 model check，再设为默认。' },
       { name: 'edit', summary: '交互编辑一个模型。', usage: 'mercury model edit --model <model-id>', example: 'mercury model edit --model chat-default', required: ['--model'], effects: ['local_write'], next: '编辑后重新检查模型。' },
-      { name: 'check', summary: '检查模型是否真正可用。', usage: 'mercury model check --model <model-id> [--audio <MP3>]', example: 'mercury model check --model chat-default', required: ['--model'], optional: ['ASR/强 Chat 使用 --audio'], effects: ['network_write', 'provider'], next: '通过后可设为默认并创建任务。' },
+      { name: 'check', summary: '检查模型是否真正可用。', usage: 'mercury model check --model <model-id> [--audio <MP3>]', example: 'mercury model check --model chat-default', required: ['--model'], optional: ['ASR/强 Chat 使用 --audio'], effects: ['local_write', 'provider_now'], next: '通过后可设为默认并创建任务。' },
       { name: 'enable', summary: '启用模型。', usage: 'mercury model enable --model <model-id>', example: 'mercury model enable --model chat-default', required: ['--model'], effects: ['local_write'], next: '检查模型并确认默认选择。' },
       { name: 'disable', summary: '停用非默认模型。', usage: 'mercury model disable --model <model-id>', example: 'mercury model disable --model chat-backup', required: ['--model'], effects: ['local_write'], next: '如需继续使用同类任务，确认仍有可用默认模型。' },
       { name: 'default', summary: '把模型设为所属用途的默认项。', usage: 'mercury model default --model <model-id>', example: 'mercury model default --model chat-default', required: ['--model'], effects: ['local_write'], next: '新任务将使用该默认模型。' },
@@ -64,7 +64,7 @@ const GROUPS: CommandGroup[] = [
   {
     name: 'worker', title: '后台 Worker', summary: '只读查看或显式启动本地单 Worker。', commands: [
       { name: 'status', summary: '只读查看 Worker，不会启动任务。', usage: 'mercury worker status --json', example: 'mercury worker status --json', effects: ['local_read'], next: '有安全 queued 任务且 Worker 停止时，显式运行 worker start。' },
-      { name: 'start', summary: '仅在存在安全 queued 任务时启动 Worker。', usage: 'mercury worker start --json', example: 'mercury worker start --json', effects: ['local_write'], next: '用 task status/watch 只读跟踪；不要重复提交任务。' },
+      { name: 'start', summary: '仅在存在安全 queued 任务时启动 Worker。', usage: 'mercury worker start --json', example: 'mercury worker start --json', effects: ['local_write', 'provider_background'], next: '用 task status/watch 只读跟踪；不要重复提交任务。' },
     ],
   },
   {
@@ -96,8 +96,8 @@ const GROUPS: CommandGroup[] = [
   },
   {
     name: 'update', title: '检查与更新 CLI', summary: '显式检查官方版本；只在可信 npm global 中确认后自动更新。', commands: [
-      { name: 'check', summary: '只读检查 latest/next、Node 与安装来源。', usage: 'mercury update check --json', example: 'mercury update check --json', effects: ['network_read'], next: '普通用户也可运行 mercury update --check；检查不会更新 Skill。' },
-      { name: 'apply', summary: '机器模式显式安装渠道或确切版本。', usage: 'mercury update apply (--channel latest|next|--version <exact>) --yes --json', example: 'mercury update apply --channel latest --yes --json', required: ['--channel 或 --version 二选一、--yes'], effects: ['network_write', 'local_write'], next: '重开终端运行 mercury --version；Skill 另用 npx skills update mercury-subtitles。' },
+      { name: 'check', summary: '只读检查 latest/next、Node 与安装来源。', usage: 'mercury update check --json', example: 'mercury update check --json', effects: ['registry_read', 'local_read'], next: '普通用户也可运行 mercury update --check；检查不会更新 Skill。' },
+      { name: 'apply', summary: '机器模式显式安装渠道或确切版本。', usage: 'mercury update apply (--channel latest|next|--version <exact>) --yes --json', example: 'mercury update apply --channel latest --yes --json', required: ['--channel 或 --version 二选一、--yes'], effects: ['registry_read', 'cli_install', 'local_write'], next: '重开终端运行 mercury --version；Skill 另用 npx skills update mercury-subtitles。' },
     ],
   },
   {
@@ -159,10 +159,17 @@ Agent / Skill
 
 function effectsText(effects: Effect[]): string {
   if (effects.length === 1 && effects[0] === 'none') return '不联网、不写入、不调用 Provider。';
-  const network = effects.includes('network_read') ? '只读联网' : effects.includes('network_write') ? '联网并安装' : '不联网';
-  const writes = effects.includes('local_write') ? '会写入明确的本地目标' : '不写入';
-  const provider = effects.includes('provider') ? '按任务状态可能调用 Provider' : '不调用 Provider';
-  return `${network}；${writes}；${provider}。`;
+  const details: string[] = [];
+  if (effects.includes('registry_read')) details.push('只读访问官方 npm registry');
+  if (effects.includes('cli_install')) details.push('确认后由已验证 npm 安装 CLI');
+  if (effects.includes('provider_now')) details.push('会立即调用所选 Provider 并写入检查结果');
+  if (effects.includes('provider_background')) details.push('会持久化任务/控制意图并可能启动 Worker，随后可能调用 Provider');
+  if (!effects.some((effect) => ['registry_read', 'cli_install', 'provider_now', 'provider_background'].includes(effect))) details.push('不联网');
+  if (!effects.some((effect) => ['provider_now', 'provider_background'].includes(effect))) details.push('不调用 Provider');
+  if (effects.includes('local_write') && !effects.includes('provider_now') && !effects.includes('provider_background'))
+    details.push('会写入命令明确的本地目标');
+  else if (!effects.includes('local_write')) details.push('不写入本地业务状态');
+  return `${details.join('；')}。`;
 }
 
 function commandHelp(group: CommandGroup, command: CommandFact): string {
@@ -232,7 +239,7 @@ export function renderHelp(args: string[], version: string): string | null {
   const command = [...group.commands].sort((left, right) => right.name.length - left.name.length)
     .find((candidate) => requested === candidate.name || requested.startsWith(`${candidate.name} `));
   if (command) return commandHelp(group, command);
-  const suggestion = suggest(requested, group.commands.map((candidate) => candidate.name));
+  const suggestion = suggestCommand(group, path.slice(1));
   throw new MercuryError('CLI_HELP_TOPIC_INVALID', `“${group.name} ${requested}”不是可用命令。`, {
     exitCode: 2,
     remediation: suggestion
@@ -266,11 +273,26 @@ function suggest(value: string, candidates: string[]): string | null {
   return best.distance <= threshold ? best.candidate : null;
 }
 
+function suggestCommand(group: CommandGroup, rawTokens: string[]): string | null {
+  const tokens = rawTokens.filter((token) => !token.startsWith('-'));
+  const commandTokens = group.commands.map((command) => ({ command, tokens: command.name.split(' ') }));
+  const firstCandidates = [...new Set(commandTokens.map((candidate) => candidate.tokens[0]!))];
+  const first = firstCandidates.includes(tokens[0] ?? '') ? tokens[0]! : suggest(tokens[0] ?? '', firstCandidates);
+  if (!first) return null;
+  const matching = commandTokens.filter((candidate) => candidate.tokens[0] === first);
+  const direct = matching.find((candidate) => candidate.tokens.length === 1);
+  const nested = matching.filter((candidate) => candidate.tokens.length > 1);
+  if (nested.length === 0) return direct?.command.name ?? null;
+  const secondCandidates = [...new Set(nested.map((candidate) => candidate.tokens[1]!))];
+  const second = secondCandidates.includes(tokens[1] ?? '') ? tokens[1]! : suggest(tokens[1] ?? '', secondCandidates);
+  if (second) return nested.find((candidate) => candidate.tokens[1] === second)?.command.name ?? null;
+  return direct?.command.name ?? null;
+}
+
 export function unknownCommandRemediation(args: string[]): string {
   const group = GROUPS.find((candidate) => candidate.name === args[0]);
   if (group && args[1]) {
-    const requested = args.slice(1).filter((item) => !item.startsWith('-')).join(' ');
-    const candidate = suggest(requested, group.commands.map((command) => command.name));
+    const candidate = suggestCommand(group, args.slice(1));
     return candidate
       ? `你是否想运行 mercury ${group.name} ${candidate}？该建议未执行。先运行 mercury help ${group.name} ${candidate} 查看用法。`
       : `运行 mercury help ${group.name} 查看该组命令；没有自动执行任何猜测。`;

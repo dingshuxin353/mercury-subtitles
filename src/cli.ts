@@ -106,6 +106,7 @@ const CALIBRATE_HELP = `用法：
     [--chat-model <model-id>]
 
 创建字幕校准任务。每个新任务只选择一个 ASR 与一个 Chat，并只执行一次 Chat 校准。
+当前校验始终冻结纯转写 cue，只修改各 cue 内文字；text-and-segmentation 仅保留历史协议兼容，不会改变断句或时间轴。
 加 --background 后任务会持久化入队并立即返回；独立 Worker 会继续处理。
 `;
 
@@ -709,7 +710,7 @@ async function statusText(
     `创建时间：${localTime(task.created_at)}`,
     `状态：${status}`,
     `当前阶段：${stage}`,
-    `输入：${task.input_config.has_reference_srt ? `MP3 + 参考 SRT（${task.input_config.mode === 'text-and-segmentation' ? '文字和断句' : '只改文字'}）` : '仅 MP3'}`,
+    `输入：${task.input_config.has_reference_srt ? `MP3 + 参考 SRT（${task.input_config.mode === 'text-and-segmentation' ? '历史兼容模式；当前仍只改文字、不改断句' : '只改文字、不改断句'}）` : '仅 MP3（只改文字、不改断句）'}`,
     `纯转写字幕（未经 Chat 校验）：${transcribedPath ?? '尚未生成'}`,
     `校验后字幕：${calibratedPath ?? '尚未生成'}`,
     `人工批准字幕：${approvedPath ?? (modern && task.execution.status === 'completed' ? '尚待审阅' : '尚未生成')}`,
@@ -1383,6 +1384,9 @@ export async function runCli(
         nodeVersion,
         packageRoot,
         executablePath,
+        nodeExecutable: dependencies.nodeExecutable ?? process.execPath,
+        ...(dependencies.npmCliPath ? { npmCliPath: dependencies.npmCliPath } : {}),
+        ...(dependencies.spawnCommand ? { spawnCommand: dependencies.spawnCommand } : {}),
         ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
       });
       io.stdout(updateCheckText(checked));
@@ -1422,7 +1426,6 @@ export async function runCli(
         io.stdout(mainHelp(await readProductVersion()));
         return 0;
       }
-      await ensureWorkspace(workspaceRoot);
       const terminal = io.prompt ? null : terminalPromptSession();
       const ask = io.prompt ?? terminal!.prompt;
       const askSecret = io.secretPrompt ?? terminal?.secret ?? hiddenPrompt;
@@ -1432,13 +1435,36 @@ export async function runCli(
           registry = await loadModelRegistryV2(workspaceRoot, modelDependencies);
         } catch (error) {
           if (!(error instanceof MercuryError) || error.code !== 'MODEL_NOT_CONFIGURED') throw error;
-          io.stdout([
-            '欢迎使用 Mercury',
-            '把中文 MP3 变成可继续剪辑的校准字幕。',
-            `所有任务都保存在：${workspaceRoot}`,
-            '开始前将配置一个语音转文字服务和一个内容校准服务。',
-            '',
-          ].join('\n'));
+          for (;;) {
+            io.stdout([
+              '欢迎使用 Mercury',
+              '把中文 MP3 变成可继续剪辑的校准字幕。',
+              '',
+              '首次使用',
+              '1. 开始设置模型与服务',
+              '2. 检查 CLI 更新',
+              '3. 查看帮助',
+              '0. 退出',
+              '',
+            ].join('\n'));
+            const firstChoice = (await ask('请选择：')).trim();
+            if (firstChoice === '0') return 0;
+            if (firstChoice === '2') {
+              await runCli(['update', '--check'], io, modelDependencies, integrationDependencies, backgroundDependencies);
+              continue;
+            }
+            if (firstChoice === '3') {
+              io.stdout(`${mainHelp(await readProductVersion())}\n按回车返回首次使用首页。\n`);
+              await ask('');
+              continue;
+            }
+            if (firstChoice !== '1') {
+              io.stderr('请输入 0 到 3。\n');
+              continue;
+            }
+            break;
+          }
+          await ensureWorkspace(workspaceRoot);
           registry = await setupInteractiveV2(workspaceRoot, ask, askSecret, modelDependencies);
           io.stdout(setupResultText(workspaceRoot, registry));
           const checkNow = (await ask('现在用一段中文 MP3 检查两个模型？[Y/n] ')).trim().toLowerCase();
@@ -1507,11 +1533,8 @@ export async function runCli(
           }
           const audio = (await ask('MP3 路径：')).trim();
           const srt = (await ask('参考 SRT 路径（没有可留空）：')).trim();
-          let mode: string[] = [];
-          if (srt) {
-            const modeChoice = (await ask('校准范围：1 只改文字 / 2 文字和断句 [1]：')).trim() || '1';
-            mode = ['--mode', modeChoice === '2' ? 'text-and-segmentation' : 'text-only'];
-          }
+          io.stdout('校准只修改文字；保持纯转写的 cue 数量、断句和时间轴不变。\n');
+          const mode = srt ? ['--mode', 'text-only'] : [];
           if (
             !(await ensureDefaultModelsReady(
               workspaceRoot,

@@ -40,6 +40,10 @@ export interface InstallationOrigin {
   executable_path: string;
   auto_apply: boolean;
   reason: string;
+  npm_global_prefix: string | null;
+  npm_global_root: string | null;
+  prefix_verified: boolean;
+  prefix_error: string | null;
 }
 
 export interface UpdateCheckResult {
@@ -231,7 +235,15 @@ export function parseRegistryMetadata(value: unknown): RegistryFacts {
   return { latest, next, versions };
 }
 
-async function responseBytes(response: Response): Promise<Buffer> {
+function updateTransportError(signal: AbortSignal): MercuryError {
+  return new MercuryError(signal.aborted ? 'UPDATE_CHECK_TIMEOUT' : 'UPDATE_REGISTRY_UNAVAILABLE', signal.aborted
+    ? '检查更新超过 5 秒，已停止联网；当前 Mercury 可以继续使用。'
+    : '读取 Mercury 官方更新服务响应时连接中断；当前 Mercury 可以继续使用。', {
+    remediation: '检查网络后再次运行 mercury update --check。',
+  });
+}
+
+async function responseBytes(response: Response, signal: AbortSignal): Promise<Buffer> {
   const contentLength = response.headers.get('content-length');
   if (contentLength && Number(contentLength) > UPDATE_RESPONSE_LIMIT_BYTES) {
     throw new MercuryError('UPDATE_REGISTRY_TOO_LARGE', '更新服务返回的数据过大，已安全停止检查。', {
@@ -242,17 +254,31 @@ async function responseBytes(response: Response): Promise<Buffer> {
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
-  for (;;) {
-    const part = await reader.read();
-    if (part.done) break;
-    size += part.value.byteLength;
-    if (size > UPDATE_RESPONSE_LIMIT_BYTES) {
-      await reader.cancel();
-      throw new MercuryError('UPDATE_REGISTRY_TOO_LARGE', '更新服务返回的数据过大，已安全停止检查。', {
-        remediation: '稍后重新检查更新；当前 Mercury 可以继续正常使用。',
-      });
+  const aborted = new Promise<never>((_resolve, reject) => {
+    if (signal.aborted) reject(updateTransportError(signal));
+    else signal.addEventListener('abort', () => reject(updateTransportError(signal)), { once: true });
+  });
+  try {
+    for (;;) {
+      let part: ReadableStreamReadResult<Uint8Array>;
+      try {
+        part = await Promise.race([reader.read(), aborted]);
+      } catch (error) {
+        if (error instanceof MercuryError) throw error;
+        throw updateTransportError(signal);
+      }
+      if (part.done) break;
+      size += part.value.byteLength;
+      if (size > UPDATE_RESPONSE_LIMIT_BYTES) {
+        throw new MercuryError('UPDATE_REGISTRY_TOO_LARGE', '更新服务返回的数据过大，已安全停止检查。', {
+          remediation: '稍后重新检查更新；当前 Mercury 可以继续正常使用。',
+        });
+      }
+      chunks.push(part.value);
     }
-    chunks.push(part.value);
+  } catch (error) {
+    void reader.cancel().catch(() => undefined);
+    throw error;
   }
   return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
 }
@@ -306,7 +332,7 @@ export async function fetchRegistryFacts(fetcher: typeof fetch = fetch): Promise
           remediation: '稍后再次运行 mercury update --check。',
         });
       }
-      const bytes = await responseBytes(response);
+      const bytes = await responseBytes(response, controller.signal);
       let metadata: unknown;
       try {
         metadata = JSON.parse(bytes.toString('utf8'));
@@ -358,6 +384,7 @@ export async function detectInstallationOrigin(
   if (!packageIdentityValid || executableRelative.startsWith('..') || path.isAbsolute(executableRelative)) {
     return {
       kind: 'unknown', package_root: packageRoot, executable_path: executablePath, auto_apply: false,
+      npm_global_prefix: null, npm_global_root: null, prefix_verified: false, prefix_error: null,
       reason: '当前执行入口与 Mercury 包身份无法相互验证，因此不会自动升级。',
     };
   }
@@ -385,7 +412,92 @@ export async function detectInstallationOrigin(
     writable = await access(path.dirname(packageRoot), constants.W_OK).then(() => true, () => false);
     if (!writable) reason = '当前 Mercury 是 npm 全局安装，但安装目录不可写；不会请求 sudo。';
   }
-  return { kind, package_root: packageRoot, executable_path: executablePath, auto_apply: kind === 'npm_global' && writable, reason };
+  return {
+    kind,
+    package_root: packageRoot,
+    executable_path: executablePath,
+    auto_apply: false,
+    npm_global_prefix: null,
+    npm_global_root: null,
+    prefix_verified: false,
+    prefix_error: null,
+    reason: kind === 'npm_global' && writable
+      ? `${reason} 尚需用当前 Node.js 对应的 npm 核对实际全局前缀。`
+      : reason,
+  };
+}
+
+function absoluteSingleLine(value: string, label: string): string {
+  const lines = value.trim().split(/\r?\n/u).filter(Boolean);
+  if (lines.length !== 1 || !path.isAbsolute(lines[0]!)) {
+    throw new MercuryError('UPDATE_NPM_PREFIX_INVALID', `npm 返回的${label}不是可验证的绝对路径，Mercury 不会自动升级。`, {
+      exitCode: 4,
+      remediation: '检查当前 Node.js/npm 的全局 prefix 配置后重新运行检查；不要使用 sudo。',
+    });
+  }
+  return path.resolve(lines[0]!);
+}
+
+async function bindNpmGlobalInstallation(input: {
+  installation: InstallationOrigin;
+  nodeExecutable: string;
+  npmCliPath?: string;
+  spawnCommand?: SpawnCommand;
+}): Promise<InstallationOrigin> {
+  if (input.installation.kind !== 'npm_global') return input.installation;
+  const npmCli = await trustedNpmCli(input.nodeExecutable, input.npmCliPath);
+  const runner = input.spawnCommand ?? defaultSpawnCommand;
+  let prefixResult: SpawnResult;
+  let rootResult: SpawnResult;
+  try {
+    prefixResult = await runner(npmCli, ['prefix', '--global'], { timeoutMs: 5_000 });
+    rootResult = await runner(npmCli, ['root', '--global'], { timeoutMs: 5_000 });
+  } catch (error) {
+    if (error instanceof MercuryError) throw error;
+    throw new MercuryError('UPDATE_NPM_PREFIX_UNAVAILABLE', '无法安全读取当前 npm 的全局目录，Mercury 不会自动升级。', {
+      exitCode: 4,
+      remediation: '检查当前 Node.js/npm 配置后重新运行检查；不要使用 sudo。',
+    });
+  }
+  if (prefixResult.code !== 0) {
+    throw new MercuryError('UPDATE_NPM_PREFIX_UNAVAILABLE', '无法读取当前 npm 的全局 prefix，Mercury 不会自动升级。', {
+      exitCode: 4,
+      remediation: '检查当前 Node.js/npm 配置后重新运行检查；不要使用 sudo。',
+    });
+  }
+  if (rootResult.code !== 0) {
+    throw new MercuryError('UPDATE_NPM_PREFIX_UNAVAILABLE', '无法读取当前 npm 的全局模块目录，Mercury 不会自动升级。', {
+      exitCode: 4,
+      remediation: '检查当前 Node.js/npm 配置后重新运行检查；不要使用 sudo。',
+    });
+  }
+  const prefixInput = absoluteSingleLine(prefixResult.stdout, '全局 prefix');
+  const globalRootInput = absoluteSingleLine(rootResult.stdout, '全局模块目录');
+  const prefix = await realpath(prefixInput).catch(() => prefixInput);
+  const globalRoot = await realpath(globalRootInput).catch(() => globalRootInput);
+  const packageRoot = await realpath(input.installation.package_root).catch(() => path.resolve(input.installation.package_root));
+  const expectedPackageRoot = await realpath(path.join(globalRoot, UPDATE_PACKAGE_NAME))
+    .catch(() => path.resolve(globalRoot, UPDATE_PACKAGE_NAME));
+  const rootRelative = path.relative(prefix, globalRoot);
+  const rootBoundToPrefix = !rootRelative.startsWith('..') && !path.isAbsolute(rootRelative);
+  if (!rootBoundToPrefix || packageRoot !== expectedPackageRoot) {
+    throw new MercuryError('UPDATE_NPM_PREFIX_MISMATCH', '当前 Mercury 不属于将执行安装的 npm 全局目录，已拒绝自动升级。', {
+      exitCode: 4,
+      remediation: '核对当前 mercury 与 npm 的实际来源；请用管理该安装的同一个 npm 更新，不要使用 sudo。',
+    });
+  }
+  const writable = await access(globalRoot, constants.W_OK).then(() => true, () => false);
+  return {
+    ...input.installation,
+    auto_apply: writable,
+    npm_global_prefix: prefix,
+    npm_global_root: globalRoot,
+    prefix_verified: true,
+    prefix_error: null,
+    reason: writable
+      ? '当前 Mercury 已与可信 npm 的实际全局 prefix 和模块目录完成绑定。'
+      : '当前 Mercury 已绑定可信 npm 全局目录，但该目录不可写；不会请求 sudo。',
+  };
 }
 
 function recommendedChannel(current: string, facts: RegistryFacts): UpdateChannel {
@@ -402,6 +514,7 @@ function nextAction(origin: InstallationOrigin, updateAvailable: boolean, channe
   if (origin.kind === 'npm_local') return `请在所属项目中把 mercury-subtitles 依赖更新到 ${target}；Mercury 不会改项目文件。`;
   if (origin.kind === 'npm_exec') return `下次运行 npx mercury-subtitles@${target}；Mercury 不会覆盖临时缓存。`;
   if (origin.kind === 'source') return '请按当前源码仓的开发/发布流程更新；Mercury 不会执行全局覆盖。';
+  if (origin.kind === 'npm_global') return `${origin.reason} 请用管理当前安装的同一个 npm 更新；Mercury 不会猜测或请求 sudo。`;
   return `当前入口不能安全自动升级。可在确认安装方式后安装 mercury-subtitles@${target}，不要使用 sudo。`;
 }
 
@@ -410,11 +523,34 @@ export async function checkForUpdates(input: {
   nodeVersion: string;
   packageRoot: string;
   executablePath: string;
+  nodeExecutable?: string;
+  npmCliPath?: string;
+  spawnCommand?: SpawnCommand;
   fetch?: typeof fetch;
 }): Promise<UpdateCheckResult> {
   parseVersion(input.currentVersion);
   const facts = await fetchRegistryFacts(input.fetch);
-  const installation = await detectInstallationOrigin(input.packageRoot, input.executablePath);
+  const detected = await detectInstallationOrigin(input.packageRoot, input.executablePath);
+  let installation = detected;
+  if (detected.kind === 'npm_global') {
+    try {
+      installation = await bindNpmGlobalInstallation({
+        installation: detected,
+        nodeExecutable: input.nodeExecutable ?? process.execPath,
+        ...(input.npmCliPath ? { npmCliPath: input.npmCliPath } : {}),
+        ...(input.spawnCommand ? { spawnCommand: input.spawnCommand } : {}),
+      });
+    } catch (error) {
+      if (!(error instanceof MercuryError) || !error.code.startsWith('UPDATE_NPM_')) throw error;
+      installation = {
+        ...detected,
+        auto_apply: false,
+        prefix_verified: false,
+        prefix_error: error.code,
+        reason: error.message,
+      };
+    }
+  }
   const channel = recommendedChannel(input.currentVersion, facts);
   const target = facts[channel];
   const compared = compareVersions(target.version, input.currentVersion);
@@ -442,25 +578,67 @@ export async function checkForUpdates(input: {
 
 export async function defaultSpawnCommand(command: string, args: string[], options: { timeoutMs: number }): Promise<SpawnResult> {
   return await new Promise((resolve, reject) => {
-    const child = spawn(command, args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+    const useProcessGroup = process.platform !== 'win32';
+    const child = spawn(command, args, { shell: false, detached: useProcessGroup, stdio: ['ignore', 'pipe', 'pipe'] });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let total = 0;
+    let settled = false;
+    let forcedError: MercuryError | null = null;
+    let terminateTimer: ReturnType<typeof setTimeout> | null = null;
+    let hardTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearTimers = () => {
+      clearTimeout(timeout);
+      if (terminateTimer) clearTimeout(terminateTimer);
+      if (hardTimer) clearTimeout(hardTimer);
+    };
+    const settleRejected = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      reject(error);
+    };
+    const terminate = (error: MercuryError) => {
+      if (forcedError) return;
+      forcedError = error;
+      const kill = (signal: NodeJS.Signals) => {
+        try {
+          if (useProcessGroup && child.pid) process.kill(-child.pid, signal);
+          else child.kill(signal);
+        } catch {
+          // The process may have exited between the deadline and the signal.
+        }
+      };
+      kill('SIGTERM');
+      terminateTimer = setTimeout(() => kill('SIGKILL'), 100);
+      hardTimer = setTimeout(() => settleRejected(error), 500);
+    };
     const append = (target: Buffer[], chunk: Buffer) => {
+      if (forcedError) return;
       total += chunk.length;
       if (total > 256 * 1024) {
-        child.kill('SIGTERM');
-        reject(new MercuryError('UPDATE_COMMAND_OUTPUT_TOO_LARGE', '升级命令输出过大，已停止并保留当前安装。'));
+        terminate(new MercuryError('UPDATE_COMMAND_OUTPUT_TOO_LARGE', '升级命令输出过大，已停止并保留当前安装。'));
         return;
       }
       target.push(chunk);
     };
     child.stdout.on('data', (chunk: Buffer) => append(stdout, chunk));
     child.stderr.on('data', (chunk: Buffer) => append(stderr, chunk));
-    child.once('error', reject);
-    const timeout = setTimeout(() => child.kill('SIGTERM'), options.timeoutMs);
+    child.once('error', () => settleRejected(new MercuryError('UPDATE_COMMAND_START_FAILED', '无法启动受控升级命令，当前安装未被确认修改。', {
+      remediation: '检查当前 Node.js/npm 安装与执行权限后重新运行更新检查；不要使用 sudo。',
+    })));
+    const timeout = setTimeout(() => terminate(new MercuryError('UPDATE_COMMAND_TIMEOUT', '升级命令超过安全时限，已终止；不会把晚到的成功当作已升级。', {
+      remediation: '检查 npm/网络状态后重新运行更新检查；不要重复运行仍在执行的安装进程。',
+    })), options.timeoutMs);
     child.once('close', (code) => {
-      clearTimeout(timeout);
+      if (settled) return;
+      clearTimers();
+      if (forcedError) {
+        settled = true;
+        reject(forcedError);
+        return;
+      }
+      settled = true;
       resolve({ code, stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8') });
     });
   });
@@ -510,7 +688,6 @@ export async function applyUpdate(input: {
     throw new MercuryError('UPDATE_TARGET_REQUIRED', 'update apply 必须且只能指定 --channel 或 --version。', { exitCode: 2 });
   }
   const facts = await fetchRegistryFacts(input.fetch);
-  const installation = await detectInstallationOrigin(input.packageRoot, input.executablePath);
   const requestedVersion = input.version ?? facts[input.channel!].version;
   const target = facts.versions.get(requestedVersion);
   if (!target) {
@@ -527,17 +704,27 @@ export async function applyUpdate(input: {
       remediation: `如确需回退，请明确使用 --version ${requestedVersion}；回退不是推荐升级。`,
     });
   }
+  if (!nodeSatisfiesEngine(input.nodeVersion, target.node_engine)) {
+    throw new MercuryError('UPDATE_NODE_INCOMPATIBLE', `当前 Node.js ${input.nodeVersion} 不满足目标版本要求 ${target.node_engine}，未执行升级。`, {
+      exitCode: 4,
+      remediation: '先切换到兼容的 Node.js，再重新运行 update apply；Mercury 不会自动切换 Node。',
+    });
+  }
   const baseCheck = await checkForUpdates({
     currentVersion: input.currentVersion,
     nodeVersion: input.nodeVersion,
     packageRoot: input.packageRoot,
     executablePath: input.executablePath,
+    nodeExecutable: input.nodeExecutable,
+    ...(input.npmCliPath ? { npmCliPath: input.npmCliPath } : {}),
+    ...(input.spawnCommand ? { spawnCommand: input.spawnCommand } : {}),
     fetch: async () => Response.json({
       name: UPDATE_PACKAGE_NAME,
       'dist-tags': { latest: facts.latest.version, next: facts.next.version },
       versions: Object.fromEntries([...facts.versions].map(([version, fact]) => [version, { name: UPDATE_PACKAGE_NAME, version, engines: { node: fact.node_engine } }])),
     }),
   });
+  const installation = baseCheck.installation;
   if (comparison === 0) {
     return {
       ...baseCheck,
@@ -547,31 +734,54 @@ export async function applyUpdate(input: {
       npm: { command: '', arguments: [], exit_code: null },
     };
   }
-  if (!nodeSatisfiesEngine(input.nodeVersion, target.node_engine)) {
-    throw new MercuryError('UPDATE_NODE_INCOMPATIBLE', `当前 Node.js ${input.nodeVersion} 不满足目标版本要求 ${target.node_engine}，未执行升级。`, {
-      exitCode: 4,
-      remediation: '先切换到兼容的 Node.js，再重新运行 update apply；Mercury 不会自动切换 Node。',
-    });
-  }
   if (!installation.auto_apply) {
+    if (installation.prefix_error) {
+      throw new MercuryError(installation.prefix_error, installation.reason, {
+        exitCode: 4,
+        remediation: '核对当前 mercury 与 npm 的实际来源；请用管理该安装的同一个 npm 更新，不要使用 sudo。',
+      });
+    }
     throw new MercuryError('UPDATE_INSTALLATION_NOT_WRITABLE', `当前安装来源为 ${installation.kind}，Mercury 不会自动覆盖。`, {
       exitCode: 4,
       remediation: nextAction(installation, true, input.channel ?? 'latest', requestedVersion),
     });
   }
   const npmCli = await trustedNpmCli(input.nodeExecutable, input.npmCliPath);
+  const verifiedPrefix = installation.npm_global_prefix;
+  if (!verifiedPrefix || !installation.prefix_verified) {
+    throw new MercuryError('UPDATE_NPM_PREFIX_MISMATCH', '当前 Mercury 未与将执行安装的 npm global prefix 完成绑定，已拒绝自动升级。', {
+      exitCode: 4,
+      remediation: '重新运行更新检查并核对安装来源；不要使用 sudo。',
+    });
+  }
   const npmArgs = [
-    'install', '--global', `${UPDATE_PACKAGE_NAME}@${requestedVersion}`,
+    'install', '--global', '--prefix', verifiedPrefix, `${UPDATE_PACKAGE_NAME}@${requestedVersion}`,
     '--registry', 'https://registry.npmjs.org/', '--no-audit', '--no-fund', '--ignore-scripts',
   ];
   const runner = input.spawnCommand ?? defaultSpawnCommand;
-  const installed = await runner(npmCli, npmArgs, { timeoutMs: 120_000 });
+  let installed: SpawnResult;
+  try {
+    installed = await runner(npmCli, npmArgs, { timeoutMs: 120_000 });
+  } catch (error) {
+    if (error instanceof MercuryError) throw error;
+    throw new MercuryError('UPDATE_INSTALL_FAILED', 'npm 安装进程异常结束；Mercury 工作区未被修改。', {
+      remediation: '检查 npm、安装目录权限和网络后重新检查；Mercury 不会请求 sudo。',
+    });
+  }
   if (installed.code !== 0) {
     throw new MercuryError('UPDATE_INSTALL_FAILED', `npm 未能完成安装（退出码 ${installed.code ?? 'unknown'}）；Mercury 工作区未被修改。`, {
       remediation: '检查安装目录权限和网络后重新检查；Mercury 不会请求 sudo。',
     });
   }
-  const verified = await runner(input.nodeExecutable, [input.executablePath, '--version'], { timeoutMs: 5_000 });
+  let verified: SpawnResult;
+  try {
+    verified = await runner(input.nodeExecutable, [input.executablePath, '--version'], { timeoutMs: 5_000 });
+  } catch (error) {
+    if (error instanceof MercuryError) throw error;
+    throw new MercuryError('UPDATE_VERIFY_FAILED', '安装后无法启动实际 Mercury 入口完成版本复核。', {
+      remediation: '重新打开终端并运行 mercury --version；检查 PATH 指向后再决定是否重试。',
+    });
+  }
   const verifiedVersion = verified.stdout.trim();
   if (verified.code !== 0 || verifiedVersion !== requestedVersion) {
     throw new MercuryError('UPDATE_VERIFY_FAILED', `安装后实际入口版本为 ${verifiedVersion || '无法读取'}，与目标 ${requestedVersion} 不一致。`, {
