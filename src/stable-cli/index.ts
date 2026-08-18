@@ -20,6 +20,7 @@ import { listJobsIsolated } from '../background/storage.js';
 import { acceptAllV5ReviewChanges, decideV5ReviewChange, finalizeV5Review, readVerifiedV5Review } from '../review-v5.js';
 import type { ReviewActor } from '../review.js';
 import { applyUpdate, checkForUpdates, runtimePackageRoot, type UpdateDependencies } from '../update.js';
+import { unknownCommandRemediation } from '../help.js';
 
 export interface StableCliContext {
   workspaceRoot: string;
@@ -292,6 +293,9 @@ export async function tryRunStableCli(args: string[], context: StableCliContext)
       } else {
         const operation = args[1]!;
         const commandArgs = args.slice(2);
+      if (!['submit', 'list', 'watch', 'status', 'result', 'pause', 'resume', 'retry-plan', 'retry', 'cancel', 'deliver'].includes(operation)) {
+        throw new MercuryError('CLI_COMMAND_INVALID', `不支持的稳定任务命令：${operation}`, { exitCode: 2 });
+      }
       if (operation === 'submit') {
         exactJson(commandArgs, ['--request']);
         const requestPath = value(commandArgs, '--request');
@@ -379,7 +383,10 @@ export async function tryRunStableCli(args: string[], context: StableCliContext)
     output(context.io, stableSuccess(command, data, version));
     return 0;
   } catch (error) {
-    const failed = stableFailure(command, error, version);
+    const projected = error instanceof MercuryError && error.code === 'CLI_COMMAND_INVALID' && !error.remediation
+      ? new MercuryError(error.code, error.message, { exitCode: error.exitCode, remediation: unknownCommandRemediation(args) })
+      : error;
+    const failed = stableFailure(command, projected, version);
     output(context.io, failed.envelope);
     return failed.exitCode;
   }

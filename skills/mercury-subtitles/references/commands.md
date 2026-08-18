@@ -17,6 +17,34 @@ mercury dictionary show <dictionary-id> --json
 
 `config status` exposes only non-sensitive defaults/readiness. If not configured/current/ready, send the user to interactive `mercury` → 模型中心. Do not inspect config files.
 
+## CLI and Skill updates
+
+They are separate installation facts. Check the Mercury CLI only when the user asks:
+
+```sh
+mercury update check --json
+```
+
+This is a bounded read from Mercury's official npm registry and does not update the Skill. Show the current/target version, channel, detected installation source, compatibility, and action from the envelope. Never infer a successful install from metadata alone.
+
+Only after the user explicitly approves the exact target may you run one stable apply command:
+
+```sh
+mercury update apply --channel latest --yes --json
+mercury update apply --channel next --yes --json
+mercury update apply --version <exact-semver> --yes --json
+```
+
+Do not add `--yes` on the user's behalf before confirmation. Mercury may auto-apply only to a verified writable npm-global installation; for local, npm exec/npx, source, or unknown origins, follow the returned manual action. Never add sudo, change registry, build a shell command, or retry a failed install silently.
+
+The packaged Mercury Skill is updated independently with the standard Skills CLI:
+
+```sh
+npx skills update mercury-subtitles
+```
+
+Never run that command silently, parse a third-party Skills CLI private database, or claim the Skill changed because the CLI changed.
+
 For `models.asr` and `models.chat`, copy only an exact Mercury model instance ID from `config status.data.defaults` or a ready `config status.data.models[].model_id`. Never use `provider`, `name`, or `category` as a model ID. If the selected model ID changes after a request was derived, that is a new logical request: derive a new stable request ID and write a new request file; never reuse the old ID.
 
 ## Create and maintain a dictionary

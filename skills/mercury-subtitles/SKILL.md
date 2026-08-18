@@ -16,6 +16,8 @@ Use only `mercury.cli/v1` machine commands. Never call a Provider directly. Neve
 5. Use pause/resume/retry only according to the task's current `pause.allowed`, `resume.allowed`, and `retry.allowed` fields—not contract-level support—and [task-states.md](references/task-states.md). Always show a retry plan before executing it.
 6. After completion, follow [review.md](references/review.md). Only `approved_srt` is final. If delivery was requested, use the projected delivery state and local-only `task deliver` recovery.
 
+CLI and Skill are separate installations. Only check or update either one when the user asks. Use Mercury's stable update commands for the CLI; use the standard Skills CLI for this Skill. Never treat one update as proof that the other changed.
+
 Read [commands.md](references/commands.md) for exact commands/request shape. Read [task-states.md](references/task-states.md) before any control or recovery action. Read [review.md](references/review.md) for decisions/finalize. Read [troubleshooting.md](references/troubleshooting.md) only after a structured failure.
 
 ## Safety
@@ -25,3 +27,4 @@ Read [commands.md](references/commands.md) for exact commands/request shape. Rea
 - Pause never means an in-flight Provider call was aborted. `pausing` means wait for a safe checkpoint.
 - Do not copy `transcribed` or `calibrated` as a final result. Do not construct result paths; trust only passed artifacts in Mercury output.
 - Do not paste full transcripts into chat unless the user asks to inspect specific text.
+- Never run `update apply` without the user's explicit approval of the exact target. Do not silently run `npx skills update mercury-subtitles` or inspect third-party Skills CLI private state.

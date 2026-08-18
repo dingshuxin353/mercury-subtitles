@@ -482,7 +482,7 @@ try {
     await runCli(['calibrate', '--audio', audio]);
     throw new Error('calibrate unexpectedly succeeded without model config');
   } catch (error) {
-    if (!String(error.stderr ?? '').includes('MODEL_NOT_CONFIGURED')) {
+    if (!String(error.stderr ?? '').includes('尚未找到模型配置')) {
       throw error;
     }
   }
@@ -495,7 +495,7 @@ try {
     ]);
     throw new Error('legacy verification option unexpectedly succeeded');
   } catch (error) {
-    if (!String(error.stderr ?? '').includes('VERIFY_AUDIO_REMOVED')) {
+    if (!String(error.stderr ?? '').includes('--verify-audio 已移除')) {
       throw error;
     }
   }
