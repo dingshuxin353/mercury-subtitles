@@ -1,0 +1,107 @@
+name: Publish to npm
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing Git tag to publish (for example, v0.3.0-alpha.2)
+        required: true
+        type: string
+      dist_tag:
+        description: npm distribution tag
+        required: true
+        default: next
+        type: choice
+        options:
+          - next
+          - latest
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-publish-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Resolve release metadata
+        id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_DIST_TAG: ${{ inputs.dist_tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "release" ]]; then
+            tag="$RELEASE_TAG"
+            if [[ "$RELEASE_PRERELEASE" == "true" ]]; then
+              dist_tag="next"
+            else
+              dist_tag="latest"
+            fi
+          else
+            tag="$INPUT_TAG"
+            dist_tag="$INPUT_DIST_TAG"
+          fi
+
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Unsupported release tag: $tag" >&2
+            exit 1
+          fi
+
+          if [[ "$dist_tag" != "next" && "$dist_tag" != "latest" ]]; then
+            echo "Unsupported npm dist-tag: $dist_tag" >&2
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "dist_tag=$dist_tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Verify tag and package version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin
+          test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$(git rev-parse HEAD)"
+          node -e '
+            const pkg = require("./package.json");
+            const fs = require("node:fs");
+            const tag = process.env.RELEASE_TAG;
+            const version = fs.readFileSync("VERSION", "utf8").trim();
+            if (tag !== `v${version}` || pkg.version !== version) {
+              throw new Error(`Version mismatch: tag=${tag}, VERSION=${version}, package=${pkg.version}`);
+            }
+          '
+
+      - run: npm ci
+      - run: npm run verify
+      - run: npm run verify:public-snapshot
+
+      - name: Publish with npm Trusted Publishing
+        env:
+          DIST_TAG: ${{ steps.release.outputs.dist_tag }}
+        run: npm publish --access public --tag "$DIST_TAG"
