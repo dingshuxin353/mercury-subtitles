@@ -23,6 +23,22 @@ import { deliverApprovedSrt, SimulatedDeliveryCrash } from '../src/delivery.js';
 
 function sha(value: Buffer | string) { return createHash('sha256').update(value).digest('hex'); }
 
+async function expectFixedCueTimeline(directory: string, task: Awaited<ReturnType<typeof readV5Task>>): Promise<void> {
+  const timestampMs = (value: string): number => {
+    const [hours, minutes, seconds, milliseconds] = value.split(/[:,]/u).map(Number) as [number, number, number, number];
+    return (((hours * 60) + minutes) * 60 + seconds) * 1_000 + milliseconds;
+  };
+  const transcribed = parseSrt(await readFile(path.join(directory, task.artifacts.transcribed!.path), 'utf8'));
+  const calibrated = parseSrt(await readFile(path.join(directory, task.artifacts.calibrated!.path), 'utf8'));
+  expect(calibrated).toEqual(transcribed);
+  if (task.artifacts.approved) {
+    expect(parseSrt(await readFile(path.join(directory, task.artifacts.approved.path), 'utf8'))).toEqual(transcribed);
+  }
+  const artifact = JSON.parse(await readFile(path.join(directory, 'work/transcript.calibrated.json'), 'utf8')) as { segments: Array<{ start_ms: number; end_ms: number }>; modifications: Array<{ type: string; applied: boolean }> };
+  expect(artifact.segments.map(({ start_ms, end_ms }) => ({ start_ms, end_ms }))).toEqual(transcribed.map(({ start, end }) => ({ start_ms: timestampMs(start), end_ms: timestampMs(end) })));
+  expect(artifact.modifications.filter((entry) => entry.applied && ['split', 'merge', 'segmentation', 'timing_adjustment'].includes(entry.type))).toEqual([]);
+}
+
 async function directoryManifest(root: string): Promise<string[]> {
   const output: string[] = [];
   const visit = async (directory: string): Promise<void> => {
@@ -259,8 +275,9 @@ describe('Exchange v1 external transcript task', () => {
     expect(bridge.segments[0].text).toBe(multilineText.replace('\n', ' '));
     expect(bridge.full_text).toBe(bridge.segments.map((segment: { text: string }) => segment.text).join('\n'));
     expect(validateContract('transcript.raw', bridge).valid).toBe(true);
-    expect(transcribed).toContain(visibleMultilineText);
+    expect(transcribed).toContain(visibleMultilineText.replace('第一行内容', '第一行 内容'));
     expect(transcribed).not.toMatch(/[，！]/u);
+    await expectFixedCueTimeline(directory, task);
   });
 
   it('reports the transcript timing hard limit instead of a fabricated reference limit and dispatches no Provider', async () => {
@@ -277,13 +294,13 @@ describe('Exchange v1 external transcript task', () => {
     const task = await readV5Task(path.join(input.workspace, 'tasks', submitted.task.identity.task_directory));
     expect(task.status).toBe('failed');
     expect(task.error).toMatchObject({
-      code: 'CALIBRATED_HARD_LIMIT_INVALID_FOR_TEXT_ONLY',
+      code: 'CALIBRATED_HARD_LIMIT_INVALID_FOR_FIXED_TIMELINE',
       category: 'input',
-      message: '校验后的字幕片段 subtitle-0001 超过 24 字或两行限制，且当前没有可安全拆分的真实时间边界。',
+      message: '校验后的固定字幕片段 subtitle-0001 超过 24 字或两行限制；当前版本不会改动纯转写时间轴。',
       retryability: 'after_user_action',
-      remediation: ['请依据真实时间边界把该 cue/segment 拆成不超过 24 字且不超过两行的合规片段，并使用新的 request ID 创建任务；不要重放当前任务。'],
+      remediation: ['请保持纯转写的真实 cue 时间不变，按这些既有时间边界准备修正后的外部转录文字，并使用新的 request ID 创建任务；不要重放当前任务，也不要让校验阶段自动拆段。'],
     });
-    expect(task.error?.technical?.detail).toBe('Calibrated segment subtitle-0001 exceeds the 24-character or two-line hard limit.');
+    expect(task.error?.technical?.detail).toBe('Calibrated segment subtitle-0001 exceeds the 24-character or two-line hard limit while its transcribed cue timeline is frozen.');
     expect(task.error?.code).not.toContain('REFERENCE');
     expect(task.calibration_sources.reference).toBeNull();
     expect(task.execution.provider_calls).toMatchObject({ asr: { count: 0, state: 'not_started', outcome: 'not_dispatched' }, chat: { count: 0, state: 'not_started', outcome: 'not_dispatched' } });
@@ -302,13 +319,13 @@ describe('Exchange v1 external transcript task', () => {
     const watchSnapshot = JSON.parse(watchOutput[0]!).data.task;
     for (const projected of [view, result, watchSnapshot]) {
       expect(projected.error).toMatchObject({
-        code: 'CALIBRATED_HARD_LIMIT_INVALID_FOR_TEXT_ONLY',
+        code: 'CALIBRATED_HARD_LIMIT_INVALID_FOR_FIXED_TIMELINE',
         category: 'input',
         retryability: 'after_user_action',
       });
       expect(projected.error?.message).toContain('subtitle-0001');
       expect(projected.error?.message).toContain('24 字或两行');
-      expect(projected.next_action).toBe('请依据真实时间边界把该 cue/segment 拆成不超过 24 字且不超过两行的合规片段，并使用新的 request ID 创建任务；不要重放当前任务。');
+      expect(projected.next_action).toBe('请保持纯转写的真实 cue 时间不变，按这些既有时间边界准备修正后的外部转录文字，并使用新的 request ID 创建任务；不要重放当前任务，也不要让校验阶段自动拆段。');
       expect(projected.next_action).not.toContain('模型配置');
       if ('capabilities' in projected) {
         expect(projected).toMatchObject({
@@ -2033,7 +2050,7 @@ describe('Exchange v1 external transcript task', () => {
     const task = await readV5Task(directory); const delivered = await readFile(task.delivery!.final_path!, 'utf8');
     const calibrated = await readFile(path.join(directory, task.artifacts.calibrated!.path), 'utf8');
     expect(parseSrt(delivered)).toEqual(parseSrt(calibrated));
-    expect(delivered).toContain('甲原文校'); expect(delivered).toContain('乙原文'); expect(delivered).toContain('丙人工确认'); expect(delivered).not.toMatch(/[，！]/u);
+    expect(delivered).toContain('甲原文校'); expect(delivered).toContain('乙原文'); expect(delivered).toContain('丙 人工确认'); expect(delivered).not.toMatch(/[，！]/u);
     expect(task.delivery).toMatchObject({ status: 'delivered', sha256: finalized.approved_artifact!.sha256 });
     expect(calls).toEqual(['chat']);
   });
@@ -2276,6 +2293,7 @@ describe('Exchange v1 external transcript task', () => {
     const completed = await readV5Task(directory);
     expect(completed).toMatchObject({ status: 'completed', execution: { attempt_id: attemptId, attempt_count: 1, provider_calls: { chat: { count: 1 } } } });
     expect(blockingFetch).toHaveBeenCalledTimes(1);
+    await expectFixedCueTimeline(directory, completed);
   });
 
   it('pins the actual Gemini budget through response_persisted pause/resume without replay', async () => {
@@ -2356,6 +2374,7 @@ describe('Exchange v1 external transcript task', () => {
     expect(completed.execution.provider_calls.chat.count).toBe(1);
     expect(providerCalls).toBe(1);
     expect(JSON.parse(await readFile(responsePath, 'utf8')).strategy.output_budget_tokens).toBe(12_288);
+    await expectFixedCueTimeline(directory, completed);
   });
 
   it('waits for an in-flight ASR response, then resumes from the pinned response without replaying ASR', async () => {
@@ -2397,6 +2416,7 @@ describe('Exchange v1 external transcript task', () => {
     const completed = await readV5Task(directory);
     expect(completed).toMatchObject({ status: 'completed', execution: { attempt_id: attemptId, attempt_count: 1, provider_calls: { asr: { count: 1 }, chat: { count: 1 } } } });
     expect(calls).toEqual(['asr', 'chat']);
+    await expectFixedCueTimeline(directory, completed);
   });
 
   it('lets cancellation win over an in-flight pause request at the next safe boundary', async () => {

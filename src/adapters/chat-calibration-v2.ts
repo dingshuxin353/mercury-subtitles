@@ -13,7 +13,6 @@ import type {
 import { validateV3CalibrationResult } from '../contracts/index.js';
 import type { ReferenceSrtInput } from '../contracts/adapters/types.js';
 import {
-  mappedAsrRefs,
   normalizeCalibrationUnitText,
   parseReferenceSrt,
   type AlignmentArtifact,
@@ -183,56 +182,17 @@ function calibrationUnits(input: ChatCalibrationV2Input): CalibrationUnit[] {
   if (input.alignment.task_id !== input.taskId) {
     throw new Error('校准单元的对齐产物与任务不匹配。');
   }
-  if (input.referenceSrt === null) {
-    return input.transcript.segments.map((segment) => ({
+  return input.transcript.segments.map((segment) => {
+    const referenceRefs = unique(input.alignment.relations
+      .filter((relation) => relation.asr_segment_refs.includes(segment.segment_id))
+      .flatMap((relation) => relation.reference_segment_refs));
+    return {
       unit_id: segment.segment_id,
       original_text: normalizeCalibrationUnitText(segment.text),
       start_ms: segment.start_ms,
       end_ms: segment.end_ms,
       asr_segment_refs: [segment.segment_id],
-      reference_segment_refs: [],
-    }));
-  }
-  const parsed = parseReferenceSrt(input.referenceSrt.text);
-  if (!parsed.ok) throw new Error('参考 SRT 无法形成完整校验单元。');
-  const segmentById = new Map(
-    input.transcript.segments.map((segment) => [segment.segment_id, segment]),
-  );
-  return parsed.segments.map((segment) => {
-    const relations = input.alignment.relations.filter((relation) =>
-      relation.reference_segment_refs.includes(segment.reference_segment_id),
-    );
-    const mapped = mappedAsrRefs(input.alignment, [segment.reference_segment_id]);
-    const overlapping = input.transcript.segments
-      .filter(
-        (candidate) =>
-          candidate.end_ms > segment.start_ms &&
-          candidate.start_ms < segment.end_ms,
-      )
-      .map((candidate) => candidate.segment_id);
-    const asrRefs = unique(mapped.length > 0 ? mapped : overlapping);
-    const evidence = asrRefs
-      .map((id) => segmentById.get(id))
-      .filter(
-        (candidate): candidate is TranscriptRaw['segments'][number] =>
-          candidate !== undefined,
-      );
-    const useReferenceTimeline = input.mode === 'text-only' || (relations.length === 0 && evidence.length === 0);
-    return {
-      unit_id: segment.reference_segment_id,
-      original_text: normalizeCalibrationUnitText(segment.text),
-      start_ms: useReferenceTimeline
-        ? segment.start_ms
-        : relations.length > 0
-          ? Math.min(...relations.map((relation) => relation.start_ms))
-          : Math.min(...evidence.map((candidate) => candidate.start_ms)),
-      end_ms: useReferenceTimeline
-        ? segment.end_ms
-        : relations.length > 0
-          ? Math.max(...relations.map((relation) => relation.end_ms))
-          : Math.max(...evidence.map((candidate) => candidate.end_ms)),
-      asr_segment_refs: asrRefs,
-      reference_segment_refs: [segment.reference_segment_id],
+      reference_segment_refs: referenceRefs,
     };
   });
 }
@@ -342,6 +302,7 @@ function prompt(input: ChatCalibrationV2Input, units: CalibrationUnit[]): string
     '按输入顺序逐个审查每个校验单元，重点检查同音/近音词、ASR 音译、专名、英文大小写、数字、漏字、多字和跨片段上下文；同一术语的多种 ASR 音近写法必须依据全文内部证据统一。',
     '数字和版本号只有在音频声学证据或全文重复证据充分时才可修改；证据不足时保留请求内原写法，禁止因常识改成另一个更熟悉的版本。',
     '每个输入 unit_id 必须恰好返回一次，顺序、数量和 ID 必须完全一致；未修改单元也必须原样返回 corrected_text。',
+    '每个单元就是一个权威 transcribed cue；corrected_text 必须仍只属于该 cue。不得跨单元移动文字、拆分、合并、调序或要求调整时间轴。',
     '返回前复检是否遗漏、重复或新增任何 ID，并确认 corrected_text 仍对应该单元原时间范围内的说话内容。',
     '返回前再做一次全文术语一致性和无依据改写复检：同一术语应全局一致，任何无法由请求内部证据支持的产品名、版本号或数字改写都必须撤销。',
     '只校对字幕文字；不得翻译、总结、扩写背景知识、创作或写入“听不清”等说明性占位符。',
@@ -359,6 +320,18 @@ function prompt(input: ChatCalibrationV2Input, units: CalibrationUnit[]): string
         end_ms: segment.end_ms,
         text: segment.text,
       })),
+      reference_context: input.referenceSrt === null
+        ? []
+        : (() => {
+            const parsed = parseReferenceSrt(input.referenceSrt.text);
+            if (!parsed.ok) throw new Error('参考 SRT 无法形成完整文字证据。');
+            return parsed.segments.map((segment) => ({
+              reference_segment_id: segment.reference_segment_id,
+              start_ms: segment.start_ms,
+              end_ms: segment.end_ms,
+              text: segment.text,
+            }));
+          })(),
       dictionary_context: input.dictionaryContext ?? { snapshot_refs: [], entries: [] },
     }),
   ].join('\n');

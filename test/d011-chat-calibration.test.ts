@@ -892,7 +892,7 @@ describe('V01-D011 C01-C09/C11', () => {
     expect(requests[0].config.maxOutputTokens).toBe(12_288);
     const sentPrompt = requests[0].contents[0].parts.find((part: any) => typeof part.text === 'string').text;
     const sentUnit = promptPayload(sentPrompt).calibration_units[0]!;
-    expect(sentUnit.original_text).toBe('您好世界， 和平发展。');
+    expect(sentUnit.original_text).toBe('您好世界，和平发展。');
     expect(sentUnit.original_text).not.toMatch(/[\r\n]/u);
     const result = JSON.parse(
       await readFile(path.join(root, 'work/calibration-result.json'), 'utf8'),
@@ -913,11 +913,11 @@ describe('V01-D011 C01-C09/C11', () => {
         item.text,
       ]),
     ).toEqual([
-      [0, 0, 26, '您好世界和平与共同发展'],
+      [0, 0, 26, '您好世界 和平与共同发展'],
       [1, 26, 52, '美好未来'],
     ]);
   });
-  it('C04 maps a complete reference unit onto traceable ASR timing and allowed splits', async () => {
+  it('C04 keeps transcribed units authoritative when reference uses one joined cue', async () => {
     const input = await prepared(model('chat-gemini', 'chat', 'gemini', AUDIO));
     const srt = path.join(input.root, 'source.srt');
     await writeFile(srt, REFERENCE_JOINED);
@@ -955,23 +955,13 @@ describe('V01-D011 C01-C09/C11', () => {
       evidence_mode: 'audio_multimodal',
     });
     expect(result.strategy).toMatchObject({
-      input_unit_count: 1,
-      returned_unit_count: 1,
+      input_unit_count: 2,
+      returned_unit_count: 2,
       coverage_complete: true,
     });
     expect(calibrated.segments).toHaveLength(2);
-    expect(calibrated.modifications).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: 'split',
-          start_ms: 0,
-          end_ms: 52,
-          evidence: expect.objectContaining({
-            asr_segment_refs: expect.arrayContaining(['seg-1', 'seg-2']),
-          }),
-        }),
-      ]),
-    );
+    expect(calibrated.segments.map((segment: any) => [segment.start_ms, segment.end_ms])).toEqual([[0, 26], [26, 52]]);
+    expect(calibrated.modifications.filter((item: any) => ['split', 'merge', 'segmentation', 'timing_adjustment'].includes(item.type))).toEqual([]);
   });
   it('C05/C06 freezes explicit non-default selections and historical artifacts after defaults change', async () => {
     const defaultChat = model(

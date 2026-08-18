@@ -5,7 +5,7 @@ import type {
 } from '../contracts/index.js';
 
 export const SUBTITLE_THRESHOLDS_VERSION = 'v0.1' as const;
-export const SEGMENTATION_POLICY_VERSION = 'source-boundary-v2' as const;
+export const SEGMENTATION_POLICY_VERSION = 'fixed-cue-text-only-v1' as const;
 export const MATCH_COVERAGE_THRESHOLD = 0.8 as const;
 export const TARGET_MIN_CHARACTERS = 8 as const;
 export const TARGET_MAX_CHARACTERS = 18 as const;

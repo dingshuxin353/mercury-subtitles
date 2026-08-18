@@ -7,13 +7,11 @@ import { validateContract } from '../contracts/index.js';
 import {
   alignTranscriptToReference,
   audioOnlyAlignment,
-  mapTextPartsToTranscriptUnits,
-  mappedAsrRefs,
   mappedReferenceRefs,
-  normalizeMatchText,
-  type TextPart
+  normalizeMatchText
 } from './alignment.js';
-import { parseReferenceSrt, textOnlyTimelineIssue } from './srt.js';
+import { parseReferenceSrt } from './srt.js';
+import { normalizeCalibrationUnitText } from './srt.js';
 import type {
   AlignmentArtifact,
   CalibratedSubtitleSegment,
@@ -23,8 +21,7 @@ import type {
   SubtitleCoreIssue,
   SubtitleCoreResult,
   SubtitleCoreWarning,
-  SubtitleModification,
-  TimedTextUnit
+  SubtitleModification
 } from './types.js';
 import { countSubtitleCharacters, lineCount } from './text.js';
 import { normalizeVisibleSubtitleText, VISIBLE_SUBTITLE_STYLE_VERSION } from './visible-text.js';
@@ -54,13 +51,6 @@ interface AppliedSuggestions {
   modifications: SubtitleModification[];
   warnings: SubtitleCoreWarning[];
 }
-
-interface SegmentationResult {
-  segments: CalibratedSubtitleSegment[];
-  warnings: SubtitleCoreWarning[];
-}
-
-type BoundaryReason = 'source_boundary' | 'sentence_punctuation' | 'punctuated_pause' | 'hard_limit';
 
 export function runSubtitleCore(input: SubtitleCoreInput): SubtitleCoreResult {
   const transcriptValidation = validateContract('transcript.raw', input.transcript);
@@ -108,10 +98,8 @@ export function runSubtitleCore(input: SubtitleCoreInput): SubtitleCoreResult {
     const parsed = parseReferenceSrt(input.referenceSrtText);
     if (!parsed.ok) return rejected(parsed.issue);
     referenceSegments = parsed.segments;
-    if (mode === 'text-only') {
-      const issue = textOnlyTimelineIssue(referenceSegments, transcript.audio.duration_ms);
-      if (issue) return needsInput(issue, null);
-    }
+    const issue = referenceTimelineIssue(referenceSegments, transcript.audio.duration_ms);
+    if (issue) return needsInput(issue, null);
     alignment = alignTranscriptToReference(transcript, referenceSegments);
     if (alignment.conclusion !== 'matched') {
       return needsInput({
@@ -124,10 +112,7 @@ export function runSubtitleCore(input: SubtitleCoreInput): SubtitleCoreResult {
     alignment = audioOnlyAlignment(transcript);
   }
 
-  const documentUsesReference = referenceSegments !== null;
-  const sourceDocument = documentUsesReference
-    ? documentFromReference(referenceSegments ?? [], alignment, transcript)
-    : documentFromTranscript(transcript);
+  const sourceDocument = documentFromTranscript(transcript);
   const nextModificationId = sequentialId('modification');
   const applied = applyCalibrationSuggestions(
     sourceDocument,
@@ -136,7 +121,6 @@ export function runSubtitleCore(input: SubtitleCoreInput): SubtitleCoreResult {
     alignment,
     documentMode,
     referenceSegments,
-    documentUsesReference,
     nextModificationId
   );
 
@@ -145,58 +129,63 @@ export function runSubtitleCore(input: SubtitleCoreInput): SubtitleCoreResult {
     ...alignmentWarnings(alignment),
     ...applied.warnings
   ];
-  if (documentMode === 'text-only') {
-    segments = referenceSegments
-      ? textOnlySegments(applied.document, referenceSegments, transcript, alignment, applied.modifications)
-      : transcriptTextOnlySegments(applied.document, transcript, applied.modifications);
-    const visible = visibleSubtitleSegments(segments);
-    if ('issue' in visible) return failed(visible.issue.code, visible.issue.message, alignment);
-    segments = visible.segments;
-    if (visible.removed > 0) warnings.push(visibleStyleWarning(segments, visible.removed, visible.protected));
-    const illegalSegment = segments.find((segment) =>
-      countSubtitleCharacters(segment.text) > HARD_MAX_CHARACTERS || lineCount(segment.text) > 2
-    );
-    if (illegalSegment) {
-      return needsInput({
-        code: 'CALIBRATED_HARD_LIMIT_INVALID_FOR_TEXT_ONLY',
-        message: `Calibrated segment ${illegalSegment.subtitle_segment_id} exceeds the 24-character or two-line hard limit.`,
-        remediation: 'Use text-and-segmentation mode so the corrected text can be split without changing its content.'
-      }, alignment);
+  segments = transcriptTextOnlySegments(applied.document, transcript, applied.modifications);
+  if (referenceSegments !== null) {
+    for (const segment of segments) {
+      segment.reference_segment_refs = mappedReferenceRefs(alignment, segment.asr_segment_refs, {
+        startMs: segment.start_ms,
+        endMs: segment.end_ms
+      });
     }
-  } else {
-    const parts = documentParts(applied.document);
-    const units = mapTextPartsToTranscriptUnits(transcript, parts);
-    if (!units) {
-      return failed(
-        'TIMELINE_EVIDENCE_UNAVAILABLE',
-        'The calibrated text could not be mapped to ASR timing evidence.',
-        alignment
-      );
+  }
+  const visible = visibleSubtitleSegments(segments);
+  if ('issue' in visible) return failed(visible.issue.code, visible.issue.message, alignment);
+  segments = visible.segments;
+  if (visible.removed > 0) warnings.push(visibleStyleWarning(segments, visible.removed, visible.protected));
+  warnings.push({
+    warning_id: 'warning-segmentation-policy-0001',
+    code: 'CALIBRATION_TIMELINE_FROZEN',
+    message: `${SEGMENTATION_POLICY_VERSION} preserved ${segments.length} transcribed cues without split, merge, reorder, or timing changes.`,
+    segment_refs: unique(segments.flatMap((segment) => [...segment.asr_segment_refs, ...segment.reference_segment_refs]))
+  });
+  for (const segment of segments) {
+    const count = countSubtitleCharacters(segment.text);
+    const duration = segment.end_ms - segment.start_ms;
+    const speed = duration > 0 ? count / (duration / 1_000) : Number.POSITIVE_INFINITY;
+    if (count < TARGET_MIN_CHARACTERS || count > TARGET_MAX_CHARACTERS) {
+      warnings.push({
+        warning_id: `warning-character-target-${String(segment.index + 1).padStart(4, '0')}`,
+        code: 'SUBTITLE_CHARACTER_TARGET_EXCEEDED',
+        message: `Segment ${segment.index + 1} contains ${count} counted characters; the soft target is 8–18 and does not change the frozen cue.`,
+        segment_refs: unique([...segment.asr_segment_refs, ...segment.reference_segment_refs])
+      });
     }
-    const segmented = segmentTimedUnits(units, transcript.audio.duration_ms, applied.modifications);
-    if ('issue' in segmented) return failed(segmented.issue.code, segmented.issue.message, alignment);
-    segments = segmented.segments;
-    warnings.push(...segmented.warnings);
-    const visible = visibleSubtitleSegments(segments);
-    if ('issue' in visible) return failed(visible.issue.code, visible.issue.message, alignment);
-    segments = visible.segments;
-    if (visible.removed > 0) warnings.push(visibleStyleWarning(segments, visible.removed, visible.protected));
-    if (referenceSegments !== null) {
-      for (const segment of segments) {
-        segment.reference_segment_refs = mappedReferenceRefs(alignment, segment.asr_segment_refs, {
-          startMs: segment.start_ms,
-          endMs: segment.end_ms
-        });
-      }
-      addAsrGapModifications(applied.modifications, segments, alignment, nextModificationId);
+    if (duration < SOFT_MIN_DURATION_MS || duration > SOFT_MAX_DURATION_MS) {
+      warnings.push({
+        warning_id: `warning-duration-target-${String(segment.index + 1).padStart(4, '0')}`,
+        code: 'SUBTITLE_DURATION_TARGET_EXCEEDED',
+        message: `Segment ${segment.index + 1} lasts ${duration} ms; the soft target is 800–6,000 ms and does not change the frozen cue.`,
+        segment_refs: unique([...segment.asr_segment_refs, ...segment.reference_segment_refs])
+      });
     }
-    addStructuralModifications(
-      applied.modifications,
-      segments,
-      referenceSegments,
-      transcript,
-      nextModificationId
-    );
+    if (speed > SOFT_MAX_READING_SPEED) {
+      warnings.push({
+        warning_id: `warning-reading-speed-${String(segment.index + 1).padStart(4, '0')}`,
+        code: 'SUBTITLE_READING_SPEED_TARGET_EXCEEDED',
+        message: `Segment ${segment.index + 1} reads at ${speed.toFixed(2)} counted characters per second; this diagnostic does not change the frozen cue.`,
+        segment_refs: unique([...segment.asr_segment_refs, ...segment.reference_segment_refs])
+      });
+    }
+  }
+  const illegalSegment = segments.find((segment) =>
+    countSubtitleCharacters(segment.text) > HARD_MAX_CHARACTERS || lineCount(segment.text) > 2
+  );
+  if (illegalSegment) {
+    return needsInput({
+      code: 'CALIBRATED_HARD_LIMIT_INVALID_FOR_FIXED_TIMELINE',
+      message: `Calibrated segment ${illegalSegment.subtitle_segment_id} exceeds the 24-character or two-line hard limit while its transcribed cue timeline is frozen.`,
+      remediation: 'Keep the transcribed cue timeline unchanged; prepare corrected external transcript text on the same real cue boundaries and create a new request ID.'
+    }, alignment);
   }
 
   populateModificationResults(applied.modifications, segments);
@@ -235,13 +224,49 @@ function resolveMode(
   return { mode: requestedMode ?? 'text-only' };
 }
 
+function referenceTimelineIssue(
+  segments: ReferenceSrtSegment[],
+  audioDurationMs: number
+): SubtitleCoreIssue | null {
+  for (const [index, segment] of segments.entries()) {
+    if (segment.start_ms < 0 || segment.end_ms > audioDurationMs || segment.start_ms >= segment.end_ms) {
+      return {
+        code: 'REFERENCE_TIMELINE_INVALID_FOR_CALIBRATION_EVIDENCE',
+        message: `Reference SRT block ${index + 1} has an invalid or out-of-range timeline.`,
+        remediation: 'Provide a reference SRT with ordered, non-overlapping cue times inside the current audio; the transcribed cue timeline will remain unchanged.'
+      };
+    }
+    const previous = segments[index - 1];
+    if (previous && segment.start_ms < previous.end_ms) {
+      return {
+        code: 'REFERENCE_TIMELINE_INVALID_FOR_CALIBRATION_EVIDENCE',
+        message: `Reference SRT block ${index + 1} overlaps the previous block.`,
+        remediation: 'Provide a reference SRT with ordered, non-overlapping cue times inside the current audio; the transcribed cue timeline will remain unchanged.'
+      };
+    }
+  }
+  return null;
+}
+
 function validateSuggestionEvidenceBoundary(
   suggestions: CalibrationSuggestion[],
   transcript: TranscriptRaw
 ): SubtitleCoreIssue | null {
   const segmentById = new Map(transcript.segments.map((segment) => [segment.segment_id, segment]));
   for (const suggestion of suggestions) {
+    if (suggestion.kind !== 'text_correction') {
+      return {
+        code: 'UPSTREAM_SUGGESTION_CUE_MAPPING_INVALID',
+        message: `Suggestion ${suggestion.suggestion_id} attempts a structural or timing change while the transcribed cue timeline is frozen.`
+      };
+    }
     const sourceSegments = suggestion.source_segment_refs.map((reference) => segmentById.get(reference));
+    if (suggestion.source_segment_refs.length !== 1) {
+      return {
+        code: 'UPSTREAM_SUGGESTION_CUE_MAPPING_INVALID',
+        message: `Suggestion ${suggestion.suggestion_id} must map to exactly one transcribed cue.`
+      };
+    }
     if (sourceSegments.some((segment) => segment === undefined)) {
       return {
         code: 'UPSTREAM_SUGGESTION_EVIDENCE_INVALID',
@@ -261,10 +286,10 @@ function validateSuggestionEvidenceBoundary(
     }
     const earliestStart = Math.min(...resolved.map((segment) => segment.start_ms));
     const latestEnd = Math.max(...resolved.map((segment) => segment.end_ms));
-    if (suggestion.start_ms < earliestStart || suggestion.end_ms > latestEnd) {
+    if (suggestion.start_ms !== earliestStart || suggestion.end_ms !== latestEnd) {
       return {
-        code: 'UPSTREAM_SUGGESTION_EVIDENCE_INVALID',
-        message: `Suggestion ${suggestion.suggestion_id} has a time range outside its transcript evidence.`
+        code: 'UPSTREAM_SUGGESTION_CUE_MAPPING_INVALID',
+        message: `Suggestion ${suggestion.suggestion_id} must preserve its transcribed cue time range exactly.`
       };
     }
   }
@@ -278,7 +303,6 @@ function applyCalibrationSuggestions(
   alignment: AlignmentArtifact,
   mode: CalibrationMode | null,
   referenceSegments: ReferenceSrtSegment[] | null,
-  documentUsesReference: boolean,
   nextModificationId: () => string
 ): AppliedSuggestions {
   let document = initialDocument;
@@ -293,9 +317,7 @@ function applyCalibrationSuggestions(
           endMs: suggestion.end_ms
         })
       : [];
-    const documentTargetRefs = documentUsesReference
-      ? referenceTargetRefs
-      : unique(suggestion.source_segment_refs);
+    const documentTargetRefs = unique(suggestion.source_segment_refs);
     const allowedByMode = mode !== 'text-only' || suggestion.kind === 'text_correction';
     const evidenceText = transcriptEvidenceText(transcript, suggestion);
     const placeholder = isExplanationPlaceholder(suggestion.suggested_text, evidenceText);
@@ -307,7 +329,7 @@ function applyCalibrationSuggestions(
           suggestion.suggested_text,
           documentTargetRefs,
           mode === 'text-only',
-          documentUsesReference ? null : { startMs: suggestion.start_ms, endMs: suggestion.end_ms }
+          { startMs: suggestion.start_ms, endMs: suggestion.end_ms }
         )
       : null;
     const applied = replacement !== null;
@@ -317,7 +339,7 @@ function applyCalibrationSuggestions(
     );
 
     const asrRefs = unique(suggestion.source_segment_refs);
-    const referenceRefs = hasReference ? resolvedTargetRefs : [];
+    const referenceRefs = hasReference ? referenceTargetRefs : [];
     modifications.push({
       modification_id: nextModificationId(),
       type: suggestion.kind === 'text_correction'
@@ -374,39 +396,6 @@ function applyCalibrationSuggestions(
   return { document, modifications, warnings };
 }
 
-function textOnlySegments(
-  document: DocumentCharacter[],
-  referenceSegments: ReferenceSrtSegment[],
-  transcript: TranscriptRaw,
-  alignment: AlignmentArtifact,
-  modifications: SubtitleModification[]
-): CalibratedSubtitleSegment[] {
-  return referenceSegments.map((reference, index) => {
-    const text = document
-      .filter((entry) => entry.sourceRefs.includes(reference.reference_segment_id))
-      .map((entry) => entry.value)
-      .join('');
-    const asrRefs = mappedAsrRefs(alignment, [reference.reference_segment_id]);
-    const appliedConfidence = modifications
-      .filter((modification) =>
-        modification.applied && modification.original_segment_refs.includes(reference.reference_segment_id)
-      )
-      .map((modification) => modification.confidence);
-    return {
-      subtitle_segment_id: subtitleId(index),
-      index,
-      start_ms: reference.start_ms,
-      end_ms: reference.end_ms,
-      text,
-      confidence: lowestConfidence(appliedConfidence),
-      asr_segment_refs: asrRefs.length > 0 ? asrRefs : transcript.segments
-        .filter((segment) => segment.end_ms > reference.start_ms && segment.start_ms < reference.end_ms)
-        .map((segment) => segment.segment_id),
-      reference_segment_refs: [reference.reference_segment_id]
-    };
-  });
-}
-
 function transcriptTextOnlySegments(
   document: DocumentCharacter[],
   transcript: TranscriptRaw,
@@ -431,140 +420,6 @@ function transcriptTextOnlySegments(
       reference_segment_refs: [],
     };
   });
-}
-
-function segmentTimedUnits(
-  units: TimedTextUnit[],
-  audioDurationMs: number,
-  modifications: SubtitleModification[]
-): SegmentationResult | { issue: SubtitleCoreIssue } {
-  const usable = units.filter((unit) => unit.text.trim().length > 0);
-  if (usable.length === 0) {
-    return { issue: { code: 'CALIBRATED_TEXT_EMPTY', message: 'No usable calibrated subtitle text remains.' } };
-  }
-
-  const groups: TimedTextUnit[][] = [];
-  const boundaryCounts: Record<BoundaryReason, number> = {
-    source_boundary: 0,
-    sentence_punctuation: 0,
-    punctuated_pause: 0,
-    hard_limit: 0,
-  };
-  let current: TimedTextUnit[] = [];
-  for (const unit of usable) {
-    if (
-      unit.start_ms < 0 || unit.end_ms <= unit.start_ms || unit.end_ms > audioDurationMs ||
-      countSubtitleCharacters(unit.text) > HARD_MAX_CHARACTERS
-    ) {
-      return {
-        issue: {
-          code: 'TIMELINE_HARD_LIMIT_UNRESOLVABLE',
-          message: 'ASR timing evidence cannot produce a legal segment within the 24-character hard limit.'
-        }
-      };
-    }
-    if (current.length > 0) {
-      const reason = breakReason(current, unit);
-      if (reason) {
-        groups.push(current);
-        boundaryCounts[reason] += 1;
-        current = [];
-      }
-    }
-    current.push(unit);
-    const currentText = joinedUnitText(current);
-    if (countSubtitleCharacters(currentText) > HARD_MAX_CHARACTERS) {
-      return {
-        issue: {
-          code: 'TIMELINE_HARD_LIMIT_UNRESOLVABLE',
-          message: 'Overlapping ASR evidence would require a subtitle longer than 24 counted characters.'
-        }
-      };
-    }
-  }
-  if (current.length > 0) groups.push(current);
-
-  const warnings: SubtitleCoreWarning[] = [];
-  const segments = groups.map((group, index): CalibratedSubtitleSegment => {
-    const startMs = Math.min(...group.map((entry) => entry.start_ms));
-    const endMs = Math.max(...group.map((entry) => entry.end_ms));
-    const text = joinedUnitText(group).replaceAll(/\s*\n\s*/gu, ' ').trim();
-    const count = countSubtitleCharacters(text);
-    const duration = endMs - startMs;
-    const speed = duration > 0 ? count / (duration / 1_000) : Number.POSITIVE_INFINITY;
-    const refs = unique(group.flatMap((entry) => entry.source_segment_refs));
-    if (count < TARGET_MIN_CHARACTERS || count > TARGET_MAX_CHARACTERS) {
-      warnings.push({
-        warning_id: `warning-character-target-${String(index + 1).padStart(4, '0')}`,
-        code: 'SUBTITLE_CHARACTER_TARGET_EXCEEDED',
-        message: `Segment ${index + 1} contains ${count} counted characters; the soft target is 8–18.`,
-        segment_refs: refs
-      });
-    }
-    if (duration < SOFT_MIN_DURATION_MS || duration > SOFT_MAX_DURATION_MS) {
-      warnings.push({
-        warning_id: `warning-duration-target-${String(index + 1).padStart(4, '0')}`,
-        code: 'SUBTITLE_DURATION_TARGET_EXCEEDED',
-        message: `Segment ${index + 1} lasts ${duration} ms; the soft target is 800–6,000 ms.`,
-        segment_refs: refs
-      });
-    }
-    if (speed > SOFT_MAX_READING_SPEED) {
-      warnings.push({
-        warning_id: `warning-reading-speed-${String(index + 1).padStart(4, '0')}`,
-        code: 'SUBTITLE_READING_SPEED_TARGET_EXCEEDED',
-        message: `Segment ${index + 1} reads at ${speed.toFixed(2)} counted characters per second; the soft maximum is 12.`,
-        segment_refs: refs
-      });
-    }
-    const confidence = lowestConfidence(
-      modifications
-        .filter((modification) => modification.applied && modification.evidence.asr_segment_refs.some((ref) =>
-          group.some((entry) => entry.asr_segment_refs.includes(ref))
-        ))
-        .map((modification) => modification.confidence)
-    );
-    return {
-      subtitle_segment_id: subtitleId(index),
-      index,
-      start_ms: startMs,
-      end_ms: endMs,
-      text,
-      confidence,
-      asr_segment_refs: unique(group.flatMap((entry) => entry.asr_segment_refs)),
-      reference_segment_refs: unique(group.flatMap((entry) => entry.source_segment_refs).filter((ref) => ref.startsWith('reference-')))
-    };
-  });
-
-  for (let index = 1; index < segments.length; index += 1) {
-    if (segments[index]!.start_ms < segments[index - 1]!.end_ms) {
-      return { issue: { code: 'TIMELINE_OVERLAP', message: 'ASR evidence produced overlapping subtitle segments.' } };
-    }
-  }
-  warnings.push({
-    warning_id: 'warning-segmentation-policy-0001',
-    code: 'SEGMENTATION_POLICY_APPLIED',
-    message: `${SEGMENTATION_POLICY_VERSION} kept source boundaries and created ${boundaryCounts.sentence_punctuation} sentence, ${boundaryCounts.punctuated_pause} punctuation-plus-pause, and ${boundaryCounts.hard_limit} hard-limit boundaries; ${boundaryCounts.source_boundary} source boundaries were preserved.`,
-    segment_refs: unique(segments.flatMap((segment) => [...segment.asr_segment_refs, ...segment.reference_segment_refs]))
-  });
-  return { segments, warnings };
-}
-
-function breakReason(current: TimedTextUnit[], next: TimedTextUnit): BoundaryReason | null {
-  const text = joinedUnitText(current);
-  const combined = `${text}${next.text}`;
-  const currentEnd = Math.max(...current.map((entry) => entry.end_ms));
-  const canSeparate = next.start_ms >= currentEnd;
-  if (!canSeparate) return null;
-  const previous = current.at(-1)!;
-  if (
-    !sameValues(previous.asr_segment_refs, next.asr_segment_refs) ||
-    !sameValues(previous.source_segment_refs, next.source_segment_refs)
-  ) return 'source_boundary';
-  if (/[。！？!?；;]$/u.test(text.trim())) return 'sentence_punctuation';
-  if (next.start_ms - currentEnd >= 400 && /[，,、：:]$/u.test(text.trim())) return 'punctuated_pause';
-  if (countSubtitleCharacters(combined) > HARD_MAX_CHARACTERS) return 'hard_limit';
-  return null;
 }
 
 function visibleSubtitleSegments(
@@ -596,143 +451,9 @@ function visibleStyleWarning(
 ): SubtitleCoreWarning {
   return {
     warning_id: 'warning-visible-subtitle-style-0001',
-    code: 'VISIBLE_SENTENCE_PUNCTUATION_REMOVED',
-    message: `${VISIBLE_SUBTITLE_STYLE_VERSION} removed ${removed} sentence punctuation characters after preserving ${protectedCount} lexical spans.`,
+    code: 'VISIBLE_SENTENCE_PUNCTUATION_SPACED',
+    message: `${VISIBLE_SUBTITLE_STYLE_VERSION} replaced ${removed} sentence punctuation characters with collapsed spaces after preserving ${protectedCount} lexical spans.`,
     segment_refs: unique(segments.flatMap((segment) => [...segment.asr_segment_refs, ...segment.reference_segment_refs]))
-  };
-}
-
-function addStructuralModifications(
-  modifications: SubtitleModification[],
-  segments: CalibratedSubtitleSegment[],
-  referenceSegments: ReferenceSrtSegment[] | null,
-  transcript: TranscriptRaw,
-  nextModificationId: () => string
-): void {
-  const sourceSegments = referenceSegments ?? transcript.segments.map((segment) => ({
-    reference_segment_id: segment.segment_id,
-    start_ms: segment.start_ms,
-    end_ms: segment.end_ms,
-    text: segment.text
-  }));
-  const sourceId = (segment: (typeof sourceSegments)[number]) => segment.reference_segment_id;
-
-  for (const source of sourceSegments) {
-    const outputs = segments.filter((segment) =>
-      [...segment.reference_segment_refs, ...segment.asr_segment_refs].includes(sourceId(source))
-    );
-    if (outputs.length > 1) {
-      modifications.push(structuralModification(
-        nextModificationId(), 'split', source.text, [sourceId(source)], outputs,
-        source.start_ms, source.end_ms, 'ASR timing and subtitle hard limits require a traceable split.'
-      ));
-    }
-  }
-
-  for (const segment of segments) {
-    const refs = referenceSegments ? segment.reference_segment_refs : segment.asr_segment_refs;
-    if (refs.length > 1) {
-      const originals = sourceSegments.filter((source) => refs.includes(sourceId(source)));
-      modifications.push(structuralModification(
-        nextModificationId(), 'merge', originals.map((source) => source.text).join(''), refs, [segment],
-        Math.min(...originals.map((source) => source.start_ms)),
-        Math.max(...originals.map((source) => source.end_ms)),
-        'Adjacent source units were merged at an ASR-backed semantic boundary.'
-      ));
-    }
-    if (referenceSegments && refs.length > 0) {
-      const originals = referenceSegments.filter((source) => refs.includes(source.reference_segment_id));
-      const originalStart = Math.min(...originals.map((source) => source.start_ms));
-      const originalEnd = Math.max(...originals.map((source) => source.end_ms));
-      if (segment.start_ms !== originalStart || segment.end_ms !== originalEnd) {
-        modifications.push(structuralModification(
-          nextModificationId(), 'timing_adjustment', originals.map((source) => source.text).join(''), refs, [segment],
-          originalStart, originalEnd, 'The rebuilt timeline follows monotonic ASR timing evidence.'
-        ));
-      }
-    }
-  }
-}
-
-function addAsrGapModifications(
-  modifications: SubtitleModification[],
-  segments: CalibratedSubtitleSegment[],
-  alignment: AlignmentArtifact,
-  nextModificationId: () => string
-): void {
-  for (const region of alignment.unaligned_regions.filter((entry) => entry.side === 'asr')) {
-    const previousRelation = alignment.relations
-      .filter((relation) => relation.asr_character_range.end <= region.character_range.start)
-      .sort((left, right) => right.asr_character_range.end - left.asr_character_range.end)[0];
-    const nextRelation = alignment.relations
-      .filter((relation) => relation.asr_character_range.start >= region.character_range.end)
-      .sort((left, right) => left.asr_character_range.start - right.asr_character_range.start)[0];
-    const referenceSlotStart = previousRelation?.reference_character_range.end ?? 0;
-    const referenceSlotEnd = nextRelation?.reference_character_range.start ??
-      alignment.reference_character_count ?? referenceSlotStart;
-    const replacementGap = alignment.unaligned_regions.some((candidate) =>
-      candidate.side === 'reference' &&
-      candidate.character_range.start < referenceSlotEnd &&
-      candidate.character_range.end > referenceSlotStart
-    );
-    if (replacementGap) continue;
-
-    const referenceRefs = unique([
-      ...(previousRelation?.reference_segment_refs ?? []),
-      ...(nextRelation?.reference_segment_refs ?? [])
-    ]);
-    const outputs = segments.filter((segment) =>
-      segment.end_ms > region.start_ms && segment.start_ms < region.end_ms &&
-      segment.asr_segment_refs.some((reference) => region.segment_refs.includes(reference))
-    );
-    modifications.push({
-      modification_id: nextModificationId(),
-      type: 'omission_recovery',
-      original_text: '',
-      original_segment_refs: referenceRefs,
-      replacement_text: region.normalized_text,
-      result_segment_refs: outputs.map((segment) => segment.subtitle_segment_id),
-      start_ms: region.start_ms,
-      end_ms: region.end_ms,
-      evidence: {
-        asr_segment_refs: region.segment_refs,
-        reference_segment_refs: referenceRefs,
-        calibration_suggestion_ref: null
-      },
-      reason: 'ASR timing evidence contains spoken content that is absent from the aligned reference text.',
-      confidence: 'high',
-      applied: true
-    });
-  }
-}
-
-function structuralModification(
-  id: string,
-  type: 'split' | 'merge' | 'timing_adjustment',
-  originalText: string,
-  originalRefs: string[],
-  outputs: CalibratedSubtitleSegment[],
-  startMs: number,
-  endMs: number,
-  reason: string
-): SubtitleModification {
-  return {
-    modification_id: id,
-    type,
-    original_text: originalText,
-    original_segment_refs: originalRefs,
-    replacement_text: outputs.map((segment) => segment.text).join(''),
-    result_segment_refs: outputs.map((segment) => segment.subtitle_segment_id),
-    start_ms: startMs,
-    end_ms: endMs,
-    evidence: {
-      asr_segment_refs: unique(outputs.flatMap((segment) => segment.asr_segment_refs)),
-      reference_segment_refs: unique(outputs.flatMap((segment) => segment.reference_segment_refs)),
-      calibration_suggestion_ref: null
-    },
-    reason,
-    confidence: 'high',
-    applied: true
   };
 }
 
@@ -760,111 +481,20 @@ function alignmentWarnings(alignment: AlignmentArtifact): SubtitleCoreWarning[] 
   }));
 }
 
-function documentFromReference(
-  referenceSegments: ReferenceSrtSegment[],
-  alignment: AlignmentArtifact,
-  transcript: TranscriptRaw
-): DocumentCharacter[] {
-  const transcriptDocument = documentFromTranscript(transcript);
-  return referenceSegments.flatMap((segment) => {
-    const asrRefs = mappedAsrRefs(alignment, [segment.reference_segment_id]);
-    const relations = alignment.relations.filter((relation) =>
-      relation.reference_segment_refs.includes(segment.reference_segment_id)
-    );
-    const evidenceCharacters = transcriptDocument.filter((character) => {
-      if (
-        !character.evidence ||
-        !character.sourceRefs.some((reference) => asrRefs.includes(reference))
-      ) return false;
-      const midpoint = (character.evidence.startMs + character.evidence.endMs) / 2;
-      return relations.some((relation) =>
-        relation.asr_segment_refs.some((reference) =>
-          character.evidence!.asrSegmentRefs.includes(reference)
-        ) && midpoint >= relation.start_ms && midpoint <= relation.end_ms
-      );
-    });
-    const characters = [...segment.text];
-    return characters.map((value, index) => {
-      const evidence = evidenceCharacters.length === 0
-        ? undefined
-        : evidenceCharacters[
-            Math.min(
-              evidenceCharacters.length - 1,
-              Math.floor((index * evidenceCharacters.length) / Math.max(1, characters.length))
-            )
-          ]?.evidence;
-      return {
-      value,
-      sourceRefs: [segment.reference_segment_id],
-      ...(evidence === undefined ? {} : { evidence })
-      };
-    });
-  });
-}
-
 function documentFromTranscript(transcript: TranscriptRaw): DocumentCharacter[] {
   return transcript.segments.flatMap((segment) => {
-    const characters = [...segment.text];
+    const characters = [...normalizeCalibrationUnitText(segment.text)];
     const fallbackEvidence = {
       startMs: segment.start_ms,
       endMs: segment.end_ms,
       asrSegmentRefs: [segment.segment_id]
     };
-    const evidence: Array<typeof fallbackEvidence | undefined> = characters.map(() => undefined);
-    let cursor = 0;
-    for (const word of segment.words) {
-      const wordCharacters = [...word.text];
-      const start = findCharacterSubsequence(characters, wordCharacters, cursor);
-      if (start < 0) continue;
-      for (let index = start; index < start + wordCharacters.length; index += 1) {
-        evidence[index] = {
-          startMs: word.start_ms,
-          endMs: word.end_ms,
-          asrSegmentRefs: [segment.segment_id]
-        };
-      }
-      cursor = start + wordCharacters.length;
-    }
-    let previousEvidence: typeof fallbackEvidence | undefined;
-    for (let index = 0; index < evidence.length; index += 1) {
-      if (evidence[index]) previousEvidence = evidence[index];
-      else if (previousEvidence) evidence[index] = previousEvidence;
-    }
-    let nextEvidence: typeof fallbackEvidence | undefined;
-    for (let index = evidence.length - 1; index >= 0; index -= 1) {
-      if (evidence[index]) nextEvidence = evidence[index];
-      else if (nextEvidence) evidence[index] = nextEvidence;
-    }
-    return characters.map((value, index) => ({
+    return characters.map((value) => ({
       value,
       sourceRefs: [segment.segment_id],
-      evidence: evidence[index] ?? fallbackEvidence
+      evidence: fallbackEvidence
     }));
   });
-}
-
-function documentParts(document: DocumentCharacter[]): TextPart[] {
-  const parts: TextPart[] = [];
-  for (const character of document) {
-    const id = character.sourceRefs[0];
-    if (!id) continue;
-    const previous = parts.at(-1);
-    if (
-      previous &&
-      sameValues(previous.sourceRefs ?? [previous.id], character.sourceRefs) &&
-      sameEvidence(previous.evidence, character.evidence)
-    ) {
-      previous.text += character.value;
-    } else {
-      parts.push({
-        id,
-        text: character.value,
-        sourceRefs: character.sourceRefs,
-        ...(character.evidence === undefined ? {} : { evidence: character.evidence })
-      });
-    }
-  }
-  return parts;
 }
 
 function replaceDocumentText(
@@ -1008,10 +638,6 @@ function transcriptEvidenceText(
     .join('');
 }
 
-function joinedUnitText(units: TimedTextUnit[]): string {
-  return units.map((unit) => unit.text).join('');
-}
-
 function lowestConfidence(values: Array<'high' | 'medium' | 'low'>): 'high' | 'medium' | 'low' {
   if (values.includes('low')) return 'low';
   if (values.includes('medium') || values.length === 0) return 'medium';
@@ -1033,27 +659,6 @@ function percentage(value: number): string {
 
 function unique(values: readonly string[]): string[] {
   return [...new Set(values)];
-}
-
-function sameValues(left: readonly string[], right: readonly string[]): boolean {
-  return left.length === right.length && left.every((value, index) => value === right[index]);
-}
-
-function sameEvidence(
-  left: TextPart['evidence'],
-  right: DocumentCharacter['evidence']
-): boolean {
-  if (left === undefined || right === undefined) return left === undefined && right === undefined;
-  return left.startMs === right.startMs && left.endMs === right.endMs &&
-    sameValues(left.asrSegmentRefs, right.asrSegmentRefs);
-}
-
-function findCharacterSubsequence(haystack: string[], needle: string[], from: number): number {
-  if (needle.length === 0) return -1;
-  for (let index = from; index <= haystack.length - needle.length; index += 1) {
-    if (needle.every((value, offset) => haystack[index + offset] === value)) return index;
-  }
-  return -1;
 }
 
 function rejected(issue: SubtitleCoreIssue): SubtitleCoreResult {

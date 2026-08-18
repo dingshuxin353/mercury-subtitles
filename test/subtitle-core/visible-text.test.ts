@@ -10,20 +10,22 @@ import {
   VISIBLE_SUBTITLE_STYLE_VERSION,
 } from '../../src/subtitle-core/index.js';
 
-describe('V03-F017 visible subtitle style', () => {
+describe('V03-F018 visible subtitle style', () => {
   it.each([
-    ['你好，世界！', '你好世界'],
-    ['版本 3.0，使用 B-roll。', '版本 3.0使用 B-roll'],
+    ['你好，世界！', '你好 世界'],
+    ['版本 3.0，使用 B-roll。', '版本 3.0 使用 B-roll'],
     ['访问 https://example.com/a?x=1。', '访问 https://example.com/a?x=1'],
     ['访问 https://example.com/a.', '访问 https://example.com/a'],
-    ['U.S. 版本，价格 1,000 元。', 'U.S. 版本价格 1,000 元'],
-    ['v0.3.0-alpha.2：A/B、C++。', 'v0.3.0-alpha.2A/BC++'],
-    ["don't，C#！", "don'tC#"],
-  ])('removes sentence punctuation while preserving lexical spans: %s', (source, expected) => {
+    ['U.S. 版本，价格 1,000 元。', 'U.S. 版本 价格 1,000 元'],
+    ['v0.3.0-alpha.2：A/B、C++。', 'v0.3.0-alpha.2 A/B C++'],
+    ["don't，C#！", "don't C#"],
+    ['“你好”（世界）', '你好 世界'],
+    ['你好，，  世界！！', '你好 世界'],
+  ])('replaces sentence punctuation with one space while preserving lexical spans: %s', (source, expected) => {
     const result = normalizeVisibleSubtitleText(source);
     expect(result.text).toBe(expected);
     expect(result.removed_punctuation_count).toBeGreaterThan(0);
-    expect(VISIBLE_SUBTITLE_STYLE_VERSION).toBe('no-sentence-punctuation-v1');
+    expect(VISIBLE_SUBTITLE_STYLE_VERSION).toBe('sentence-punctuation-as-space-v2');
   });
 
   it('returns an empty visible value when a segment contains punctuation only', () => {
@@ -46,7 +48,7 @@ describe('V03-F017 visible subtitle style', () => {
   });
 });
 
-describe('V03-F017 source-boundary-first segmentation', () => {
+describe('V03-F018 frozen transcribed cue segmentation', () => {
   async function validFixture<T>(name: string): Promise<T> {
     return JSON.parse(await readFile(fileURLToPath(new URL(`../fixtures/valid/${name}`, import.meta.url)), 'utf8')) as T;
   }
@@ -100,17 +102,18 @@ describe('V03-F017 source-boundary-first segmentation', () => {
     expect(result.artifact.segments[0]!.text).toBe(text);
   });
 
-  it('uses full-stop evidence before removing punctuation from visible output', async () => {
+  it('keeps sentence punctuation cleanup inside the original cue', async () => {
     const result = await runSegments(['第一句话结束。第二句话继续']);
     expect(result.status).toBe('completed');
     if (result.status !== 'completed') return;
-    expect(result.artifact.segments.map((segment) => segment.text)).toEqual(['第一句话结束', '第二句话继续']);
+    expect(result.artifact.segments.map((segment) => segment.text)).toEqual(['第一句话结束 第二句话继续']);
     expect(result.artifact.warnings).toEqual(expect.arrayContaining([
-      expect.objectContaining({ code: 'VISIBLE_SENTENCE_PUNCTUATION_REMOVED' }),
+      expect.objectContaining({ code: 'VISIBLE_SENTENCE_PUNCTUATION_SPACED' }),
+      expect.objectContaining({ code: 'CALIBRATION_TIMELINE_FROZEN' }),
     ]));
   });
 
-  it('does not split on silence alone and requires punctuation plus a 400 ms pause', async () => {
+  it('does not split on silence or punctuation-plus-pause', async () => {
     const withGap = async (gap: number, punctuation: boolean) => {
       const transcript = await validFixture<TranscriptRaw>('transcript.raw.json');
       transcript.audio.duration_ms = 2_000;
@@ -134,7 +137,7 @@ describe('V03-F017 source-boundary-first segmentation', () => {
     expect(shortPunctuatedPause.status).toBe('completed');
     if (silenceOnly.status !== 'completed' || punctuatedPause.status !== 'completed' || shortPunctuatedPause.status !== 'completed') return;
     expect(silenceOnly.artifact.segments).toHaveLength(1);
-    expect(punctuatedPause.artifact.segments).toHaveLength(2);
+    expect(punctuatedPause.artifact.segments).toHaveLength(1);
     expect(shortPunctuatedPause.artifact.segments).toHaveLength(1);
   });
 

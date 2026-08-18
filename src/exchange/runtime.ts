@@ -14,7 +14,7 @@ import { CHAT_INLINE_AUDIO_LIMIT_BYTES, createChatCalibrationRuntimeV2, type Cha
 import { VolcengineAsrAdapter, type ResolvedVolcengineCredential } from '../adapters/volcengine-asr.js';
 import { VolcengineSubtitleAsrAdapter } from '../adapters/volcengine-subtitle-asr.js';
 import { legacyAsrEntry } from '../core-integration-v2.js';
-import { normalizeReferenceSrtForCalibration, normalizeVisibleSubtitleText, parseReferenceSrt, runSubtitleCore, type CalibratedTranscript } from '../subtitle-core/index.js';
+import { normalizeReferenceSrtForCalibration, normalizeVisibleSubtitleText, parseReferenceSrt, runSubtitleCore, SEGMENTATION_POLICY_VERSION, VISIBLE_SUBTITLE_STYLE_VERSION, type CalibratedTranscript } from '../subtitle-core/index.js';
 import { serializeCalibratedSrt, validateSrtFile } from '../output-report/srt.js';
 import { createTaskId, safeAudioStem, sha256File } from '../tasks.js';
 import { appendStableJsonLine, canonicalJson, readStableJson, repairTrailingJsonlFragment, TRANSCRIPT_STABLE_JSON_MAX_NODES, writeStableJsonAtomic } from './storage.js';
@@ -639,8 +639,9 @@ const REFERENCE_AUDIO_MISMATCH_ACTION = '参考字幕与音频正文不完整对
 const TEXT_ONLY_HARD_LIMIT_CODES = new Set([
   'CALIBRATED_HARD_LIMIT_INVALID_FOR_TEXT_ONLY',
   'REFERENCE_HARD_LIMIT_INVALID_FOR_TEXT_ONLY',
+  'CALIBRATED_HARD_LIMIT_INVALID_FOR_FIXED_TIMELINE',
 ]);
-const TEXT_ONLY_HARD_LIMIT_ACTION = '请依据真实时间边界把该 cue/segment 拆成不超过 24 字且不超过两行的合规片段，并使用新的 request ID 创建任务；不要重放当前任务。';
+const TEXT_ONLY_HARD_LIMIT_ACTION = '请保持纯转写的真实 cue 时间不变，按这些既有时间边界准备修正后的外部转录文字，并使用新的 request ID 创建任务；不要重放当前任务，也不要让校验阶段自动拆段。';
 
 function referenceAudioMismatchError(
   detail: string,
@@ -660,10 +661,13 @@ function textOnlyHardLimitError(
   detail: string,
   providerOutcome: NonNullable<TaskRecordV5['error']>['provider_outcome'],
 ): NonNullable<TaskRecordV5['error']> {
-  const calibrated = /Calibrated segment ([A-Za-z0-9._:-]+) exceeds the 24-character or two-line hard limit\.?/u.exec(detail);
+  const calibrated = /Calibrated segment ([A-Za-z0-9._:-]+) exceeds the 24-character or two-line hard limit/u.exec(detail);
   const reference = /Reference SRT block ([0-9]+) exceeds the 24-character or two-line hard limit\.?/u.exec(detail);
-  const message = calibrated
-    ? `校验后的字幕片段 ${calibrated[1]} 超过 24 字或两行限制，且当前没有可安全拆分的真实时间边界。`
+  const fixedTimeline = code === 'CALIBRATED_HARD_LIMIT_INVALID_FOR_FIXED_TIMELINE';
+  const message = calibrated && fixedTimeline
+    ? `校验后的固定字幕片段 ${calibrated[1]} 超过 24 字或两行限制；当前版本不会改动纯转写时间轴。`
+    : calibrated
+      ? `校验后的字幕片段 ${calibrated[1]} 超过 24 字或两行限制，且当前没有可安全拆分的真实时间边界。`
     : reference
       ? `参考字幕第 ${reference[1]} 个 cue 超过 24 字或两行限制，且当前没有可安全拆分的真实时间边界。`
       : '字幕片段超过 24 字或两行限制，且当前没有可安全拆分的真实时间边界。';
@@ -690,7 +694,7 @@ async function writeReport(directory: string, task: TaskRecordV5, snapshot: Mode
   const dictionary = await readStableJson(dictionaryPath, 'DICTIONARY_RECORD_INVALID') as ResolvedDictionarySnapshot;
   if (dictionary.contract !== 'mercury.dictionary-snapshot/v1' || dictionary.task_id !== task.identity.task_id) throw new MercuryError('DICTIONARY_RECORD_INVALID', '词典快照 identity 与任务不一致；未生成报告。');
   const source = task.input_config.transcription_mode === 'provided' ? '外部提供' : `${snapshot.models.asr?.name ?? 'ASR Provider'}`;
-  const text = ['# Mercury 字幕校准工作报告', '', `- 任务 ID：\`${task.identity.task_id}\``, `- 转写来源：${source}（ASR 调用数：${task.execution.provider_calls.asr.count}）`, `- 外部格式：${task.inputs.transcript_source?.format ?? task.inputs.reference?.format ?? '—'}`, `- 原件 SHA-256：${task.inputs.transcript_source?.sha256 ?? task.inputs.media?.sha256 ?? '—'}`, `- 规范化 SHA-256：${task.artifacts.transcript?.sha256 ?? '—'}`, `- Chat：${snapshot.models.chat.name} / ${snapshot.models.chat.provider_model}`, `- 校验证据：${task.input_config.evidence_mode === 'audio_multimodal' ? '完整转录 + 音频' : '完整转录'}`, `- Chat 调用：${task.execution.provider_calls.chat.count}`, `- 完整覆盖：${calibration ? `${calibration.strategy.input_unit_count}/${calibration.strategy.returned_unit_count} ${calibration.strategy.coverage_complete ? '通过' : '失败'}` : '未形成'}`, `- 词典快照：${task.dictionary_snapshot.sha256}`, `- 词典 revision：${dictionary.resolved.map((entry) => `${entry.dictionary_id}@${entry.revision}`).join('，') || '无'}`, `- 相关词典条目：${dictionary.matched_entry_ids.join('，') || '无'}`, `- ASR hints：${dictionary.asr_hints.status}（发送 ${dictionary.asr_hints.input_count}/${dictionary.asr_hints.available_count} 项${dictionary.asr_hints.truncated ? '，已按 Adapter 上限截断' : ''}）`, `- 警告：${task.warnings.join('；') || '无'}`, `- 错误：${task.error ? `${task.error.code}：${task.error.message}` : '无'}`, ''].join('\n');
+  const text = ['# Mercury 字幕校准工作报告', '', `- 任务 ID：\`${task.identity.task_id}\``, `- 转写来源：${source}（ASR 调用数：${task.execution.provider_calls.asr.count}）`, `- 外部格式：${task.inputs.transcript_source?.format ?? task.inputs.reference?.format ?? '—'}`, `- 原件 SHA-256：${task.inputs.transcript_source?.sha256 ?? task.inputs.media?.sha256 ?? '—'}`, `- 规范化 SHA-256：${task.artifacts.transcript?.sha256 ?? '—'}`, `- Chat：${snapshot.models.chat.name} / ${snapshot.models.chat.provider_model}`, `- 校验证据：${task.input_config.evidence_mode === 'audio_multimodal' ? '完整转录 + 音频' : '完整转录'}`, `- Chat 调用：${task.execution.provider_calls.chat.count}`, `- 完整覆盖：${calibration ? `${calibration.strategy.input_unit_count}/${calibration.strategy.returned_unit_count} ${calibration.strategy.coverage_complete ? '通过' : '失败'}` : '未形成'}`, `- 校验时间轴策略：${SEGMENTATION_POLICY_VERSION}`, `- 用户可见正文策略：${VISIBLE_SUBTITLE_STYLE_VERSION}`, '- 结构调整：0（校验只改文字）', `- 词典快照：${task.dictionary_snapshot.sha256}`, `- 词典 revision：${dictionary.resolved.map((entry) => `${entry.dictionary_id}@${entry.revision}`).join('，') || '无'}`, `- 相关词典条目：${dictionary.matched_entry_ids.join('，') || '无'}`, `- ASR hints：${dictionary.asr_hints.status}（发送 ${dictionary.asr_hints.input_count}/${dictionary.asr_hints.available_count} 项${dictionary.asr_hints.truncated ? '，已按 Adapter 上限截断' : ''}）`, `- 警告：${task.warnings.join('；') || '无'}`, `- 错误：${task.error ? `${task.error.code}：${task.error.message}` : '无'}`, ''].join('\n');
   await writeFile0600(path.join(directory, 'output/calibration-report.md'), text);
   task.artifacts.report = { path: 'output/calibration-report.md', sha256: await sha256File(path.join(directory, 'output/calibration-report.md')), validation: 'passed' };
 }
@@ -1582,12 +1586,7 @@ export async function executeV5Task(directory: string, dependencies: ExchangeRun
     const calibratedRelative = `output/${stem}.calibrated.srt`;
     await writeFile0600(path.join(directory, calibratedRelative), serializeCalibratedSrt(subtitle.artifact));
     const audioDuration = task.inputs.media ? readMp3DurationMsFromBytes(await readVerifiedMediaBytes(directory, task.inputs.media)) : (transcript.duration_ms ?? transcript.segments.at(-1)!.end_ms);
-    const parsedBaseline = referenceText ? parseReferenceSrt(referenceText) : null;
-    const textOnlyTimeline = parsedBaseline?.ok
-      ? parsedBaseline.segments
-      : task.input_config.transcription_mode === 'provided' && subtitle.artifact.mode === 'text-only'
-        ? legacy.segments.map((segment, index) => ({ reference_segment_id: segment.segment_id, sequence: index + 1, start_ms: segment.start_ms, end_ms: segment.end_ms, text: segment.text }))
-        : null;
+    const textOnlyTimeline = legacy.segments.map((segment, index) => ({ reference_segment_id: segment.segment_id, sequence: index + 1, start_ms: segment.start_ms, end_ms: segment.end_ms, text: segment.text }));
     const validation = await validateSrtFile(path.join(directory, calibratedRelative), { audioDurationMs: audioDuration, expectedSegments: subtitle.artifact.segments, mode: subtitle.artifact.mode, referenceSegments: textOnlyTimeline });
     if (!validation.valid) throw new MercuryError('OUTPUT_VALIDATION_FAILED', validation.checks.filter((item) => item.status === 'failed').map((item) => item.message).join('; '));
     task = await readV5Task(directory);

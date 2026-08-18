@@ -194,7 +194,7 @@ describe('V02-D003 review and approved subtitle', () => {
     const approved = await readFile(path.join(input.taskDirectory, final.approved_artifact!.path), 'utf8');
     expect(approved).toContain('甲一');
     expect(approved).toContain('\n乙\n');
-    expect(approved).toContain('丙自定义');
+    expect(approved).toContain('丙 自定义');
     expect(approved).not.toMatch(/[，！]/u);
     expect(approved.match(/00:00:0\d,000 --> 00:00:0\d,000/gu)).toHaveLength(4);
     expect(await readFile(path.join(input.taskDirectory, 'output/source.transcribed.srt'), 'utf8')).toBe(input.transcribed);

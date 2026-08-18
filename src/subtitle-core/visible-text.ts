@@ -1,4 +1,4 @@
-export const VISIBLE_SUBTITLE_STYLE_VERSION = 'no-sentence-punctuation-v1' as const;
+export const VISIBLE_SUBTITLE_STYLE_VERSION = 'sentence-punctuation-as-space-v2' as const;
 
 export interface VisibleSubtitleTextResult {
   text: string;
@@ -90,6 +90,7 @@ export function normalizeVisibleSubtitleText(value: string): VisibleSubtitleText
     const end = index + character.length;
     if (!protectedAt(ranges, index, end) && /[\p{P}…]/u.test(character)) {
       removed += 1;
+      text += ' ';
     } else {
       text += character;
     }
