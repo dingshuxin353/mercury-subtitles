@@ -40,6 +40,7 @@ const requiredPaths = [
   '.github/ISSUE_TEMPLATE/installation-help.yml',
   '.github/pull_request_template.md',
   '.github/workflows/ci.yml',
+  '.github/workflows/publish.yml',
   'assets/readme-cover.svg',
   'docs/architecture.md',
   'docs/cli.md',
