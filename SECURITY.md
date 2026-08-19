@@ -1,6 +1,6 @@
 # Security Policy
 
-Mercury 目前处于 Public Alpha。安全修复优先覆盖最新的 `next` 版本；旧 Alpha 可能只提供升级建议。
+Mercury 当前稳定版为 `0.3.0`。安全修复优先覆盖 npm `latest` 指向的受支持稳定版本；`next` 只保留预发布历史或后续明确发布的预览版本，旧预发布可能只提供升级建议。
 
 ## 私密报告安全问题
 

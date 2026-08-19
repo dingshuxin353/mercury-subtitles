@@ -6,18 +6,18 @@
 
 **把中文 MP3 变成可检查、可修改、可交付的字幕。**
 
-[![npm next](https://img.shields.io/npm/v/mercury-subtitles/next?label=npm%20next&color=5b5bd6)](https://www.npmjs.com/package/mercury-subtitles)
+[![npm latest](https://img.shields.io/npm/v/mercury-subtitles/latest?label=npm%20latest&color=5b5bd6)](https://www.npmjs.com/package/mercury-subtitles)
 [![Node 24](https://img.shields.io/badge/Node.js-24-3c873a)](https://nodejs.org/)
 [![CI](https://github.com/dingshuxin353/mercury-subtitles/actions/workflows/ci.yml/badge.svg)](https://github.com/dingshuxin353/mercury-subtitles/actions/workflows/ci.yml)
 [![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE)
-[![Release Candidate](https://img.shields.io/badge/status-Release%20Candidate-f59e0b)](https://github.com/dingshuxin353/mercury-subtitles/releases)
+[![Stable](https://img.shields.io/badge/status-Stable-2f855a)](https://github.com/dingshuxin353/mercury-subtitles/releases)
 
 [三步开始](#三步开始) · [CLI / App](#方式一直接使用-cli--app) · [Agent Skill](#方式二让-agent-通过-skill-使用) · [隐私说明](#你的数据会去哪里) · [遇到问题](#常见问题)
 
 </div>
 
 > [!IMPORTANT]
-> Mercury 目前是 `0.3.0-rc.2` 发布候选，适合愿意安装 Node.js 24 的早期用户。请先用副本测试；候选通过后才会形成 `0.3.0` 稳定版。
+> Mercury `0.3.0` 是 V0.3 稳定版，面向愿意安装 Node.js 24 的 CLI 与 Agent 用户。处理重要素材时仍建议保留原文件，并先用副本熟悉工作流。
 
 ## 你会得到什么
 
@@ -56,21 +56,21 @@ node --version
 ### 2. 安装当前已发布版本
 
 ```bash
-npm install --global mercury-subtitles@next
+npm install --global mercury-subtitles@latest
 ```
 
-`@next` 是 Mercury 的公开预发布渠道，不是稳定版 `latest`。安装后请运行 `mercury --version` 核对实际版本；需要精确安装本候选时，可在该版本发布后使用 `npm install --global mercury-subtitles@0.3.0-rc.2`。
+`@latest` 是 Mercury 的稳定渠道。安装后请运行 `mercury --version` 核对实际版本；需要固定本版本时使用 `npm install --global mercury-subtitles@0.3.0`。公开预发布渠道 `@next` 保留不可变的 `0.3.0-rc.2`，不会覆盖稳定安装。
 
-如果当前还是 `0.3.0-alpha.2`，旧版尚无 `mercury update` 命令。首次进入 RC 需要使用管理现有安装的同一个 npm、同一个 global prefix，显式安装确切版本：
+如果当前还是 `0.3.0-alpha.2`，旧版尚无 `mercury update` 命令。首次进入具备内置更新能力的 0.3 系列版本，需要使用管理现有安装的同一个 npm、同一个 global prefix，显式安装确切版本：
 
 ```bash
-npm install --global mercury-subtitles@0.3.0-rc.2
+npm install --global mercury-subtitles@0.3.0
 ```
 
 如果旧安装使用了自定义 `--prefix`，上述命令也必须带完全相同的 `--prefix`；不要使用 `sudo`，不要让 `npx` 修改另一套全局安装。该一次性动作是 bootstrap，不是旧版内置升级。从 `0.3.0-rc.1` 起才可使用 Mercury 内置更新，例如：
 
 ```bash
-mercury update apply --version 0.3.0-rc.2 --yes --json
+mercury update apply --version 0.3.0 --yes --json
 ```
 
 CLI 更新不会静默更新或删除 Skill；Skill 仍由 Skills CLI 单独管理。
@@ -130,7 +130,7 @@ mercury worker start --json
 
 查询状态不会偷偷启动 Worker，也不会重复提交任务。Provider 结果不确定时，Mercury 会停下来阻止自动重放，避免重复调用或计费。
 
-`0.3.0-rc.2` 继续使用 Exchange Protocol v1：脚本可显式导入 SRT、VTT 或 transcript JSON 作为转写事实源（ASR 0 调用），也可用 `reference` 继续走 ASR；两种模式共用稳定任务、事件、结果、词典快照和审阅合同。安全暂停/同 attempt 恢复，以及只读 retry plan + append-only retry 均保持兼容；Provider 结果不确定时仍禁止自动重放。全局/项目词典通过 `mercury dictionary ... --json` 管理，任务创建后固定 revision/hash。
+`0.3.0` 继续使用 Exchange Protocol v1：脚本可显式导入 SRT、VTT 或 transcript JSON 作为转写事实源（ASR 0 调用），也可用 `reference` 继续走 ASR；两种模式共用稳定任务、事件、结果、词典快照和审阅合同。安全暂停/同 attempt 恢复，以及只读 retry plan + append-only retry 均保持兼容；Provider 结果不确定时仍禁止自动重放。全局/项目词典通过 `mercury dictionary ... --json` 管理，任务创建后固定 revision/hash。
 
 不知道命令时可从一屏帮助开始：
 
@@ -225,7 +225,7 @@ Skill 只使用 Mercury 的机器命令，当前完整迁移到稳定 `mercury.c
 如果你执行的是项目内 `npm install`，命令不会自动进入全局 PATH。推荐重新全局安装：
 
 ```bash
-npm install --global mercury-subtitles@next
+npm install --global mercury-subtitles@latest
 ```
 
 或者在本地项目中使用 `npm exec -- mercury`。
@@ -258,10 +258,10 @@ npm install --global mercury-subtitles@next
 mercury update --check
 ```
 
-如果当前入口不是与同一个可信 npm global prefix 完整绑定、且该目录可写的全局安装，Mercury 会拒绝自动覆盖并给出适合该来源的手动动作，而不是修改项目、本地 npm exec 缓存或源码。自动升级会先显示目标并要求确认；机器模式必须显式使用 `--yes`。当前已发布预览版仍可手工安装：
+如果当前入口不是与同一个可信 npm global prefix 完整绑定、且该目录可写的全局安装，Mercury 会拒绝自动覆盖并给出适合该来源的手动动作，而不是修改项目、本地 npm exec 缓存或源码。自动升级会先显示目标并要求确认；机器模式必须显式使用 `--yes`。稳定版也可手工安装：
 
 ```bash
-npm install --global mercury-subtitles@next
+npm install --global mercury-subtitles@latest
 ```
 
 升级或重新配置 Skill：
@@ -307,7 +307,7 @@ npm run verify
 
 ## 版本与反馈
 
-- 当前候选：`0.3.0-rc.2`；公开预发布通过 npm `next` 分发，`latest` 不随 RC 移动。该候选不等于 `0.3.0` 稳定版已经完成或发布；实际渠道版本请以 `npm view mercury-subtitles dist-tags --json` 为准。
+- 当前稳定版：`0.3.0`，通过 npm `latest` 分发；`next` 保留 `0.3.0-rc.2` 作为不可覆盖的预发布历史。实际渠道版本请以 `npm view mercury-subtitles dist-tags --json` 为准。
 - 版本变化：[CHANGELOG.md](./CHANGELOG.md)
 - 下载与校验：[GitHub Releases](https://github.com/dingshuxin353/mercury-subtitles/releases)
 - 安装或配置求助：[创建安装帮助](https://github.com/dingshuxin353/mercury-subtitles/issues/new?template=installation-help.yml)

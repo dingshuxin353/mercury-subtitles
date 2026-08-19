@@ -142,7 +142,7 @@ const lockJson = JSON.parse(await readFile(path.join(snapshotRoot, 'package-lock
 const version = (await readFile(path.join(snapshotRoot, 'VERSION'), 'utf8')).trim();
 if (
   packageJson.name !== 'mercury-subtitles' ||
-  packageJson.version !== '0.3.0-rc.2' ||
+  packageJson.version !== '0.3.0' ||
   packageJson.version !== version ||
   lockJson.name !== packageJson.name ||
   lockJson.version !== packageJson.version ||
@@ -150,7 +150,7 @@ if (
   packageJson.license !== 'Apache-2.0' ||
   packageJson.bin?.mercury !== './dist/src/bin.js' ||
   packageJson.publishConfig?.access !== 'public' ||
-  packageJson.publishConfig?.tag !== 'next'
+  packageJson.publishConfig?.tag !== 'latest'
 ) {
   throw new Error('Public package identity or publish metadata is inconsistent');
 }
@@ -163,10 +163,10 @@ for (const required of [
   '## 方式一：直接使用 CLI / App',
   '## 方式二：让 Agent 通过 Skill 使用',
   '## 你的数据会去哪里',
-  'mercury-subtitles@next',
+  'mercury-subtitles@latest',
   'mercury task submit --request "/绝对路径/request.json" --json',
   'npx skills add dingshuxin353/mercury-subtitles',
-  'Release Candidate',
+  'Stable',
 ]) {
   if (!readme.includes(required)) {
     throw new Error(`Public README is missing required beginner content: ${required}`);

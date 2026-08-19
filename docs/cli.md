@@ -6,7 +6,7 @@ Mercury CLI 是本地执行引擎。它负责配置模型、隐藏输入密钥�
 
 ```bash
 node --version
-npm install --global mercury-subtitles@next
+npm install --global mercury-subtitles@latest
 mercury
 ```
 

@@ -4,7 +4,7 @@ Mercury Skill 让 Codex 等支持本地 Skill 的 Agent 用自然语言调用 Me
 
 ## 前置条件
 
-1. 已安装 `mercury-subtitles@next`。
+1. 已安装 `mercury-subtitles@latest`。
 2. 运行过 `mercury`，并在交互 App 中完成模型配置。
 3. Agent 能读取本地 Skill 目录并执行本机命令。
 
