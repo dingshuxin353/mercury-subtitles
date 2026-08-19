@@ -26,6 +26,12 @@ type Trace = {
   history: { accepted: number; rejected: number; edited: number };
 };
 
+function policyFromNaturalLanguage(request: string): 'auto_finalize' | 'manual_review' {
+  return /(逐条检查|人工复核|先看修改|不要自动定稿)/u.test(request)
+    ? 'manual_review'
+    : 'auto_finalize';
+}
+
 function runSkillForwardFixture(input: Fixture): Trace {
   const mode = input.mode ?? 'auto_finalize';
   const calls = input.providerCalls ?? { asr: 0, chat: 0 };
@@ -89,6 +95,22 @@ function runSkillForwardFixture(input: Fixture): Trace {
 }
 
 describe('V03-D016 packaged Skill auto-finalize forward fixtures', () => {
+  it('forward A: ordinary natural-language request reaches a verified final without another confirmation', () => {
+    const request = '用 Mercury 把这个本地采访字幕处理好，完成后把最终字幕路径给我';
+    const trace = runSkillForwardFixture({ mode: policyFromNaturalLanguage(request), review: 'pending', pending: 2 });
+    expect(trace.stopped).toBeNull();
+    expect(trace.finalPath).toMatch(/\.approved\.srt$/u);
+    expect(trace.commands).toContain('mercury review accept-all <task-id> --confirm-count 2 --actor skill --json');
+  });
+
+  it('forward B: explicit manual-review natural language keeps pending for user decisions', () => {
+    const request = '用 Mercury 处理字幕，但不要自动定稿，我要逐条检查 AI 修改';
+    const trace = runSkillForwardFixture({ mode: policyFromNaturalLanguage(request), review: 'pending', pending: 2 });
+    expect(trace.stopped).toBe('manual_review_waiting');
+    expect(trace.commands).toContain('mercury review list <task-id> --limit 10 --json');
+    expect(trace.commands.join('\n')).not.toMatch(/accept-all|finalize/u);
+  });
+
   it('defaults to exact-count accept-all and finalize with zero Provider increment', () => {
     const trace = runSkillForwardFixture({ review: 'pending', pending: 3, providerCalls: { asr: 1, chat: 1 } });
     expect(trace.commands).toEqual([
