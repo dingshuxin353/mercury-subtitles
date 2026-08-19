@@ -61,7 +61,7 @@ describe('V02-D004 packaged Mercury skill', () => {
     expect(status).toMatchObject({
       installed: false,
       compatible: false,
-      product_version: '0.3.0',
+      product_version: '0.3.1',
       machine_contract: 'mercury.cli/v1',
       recommended_install_command: MERCURY_SKILL_INSTALL_COMMAND,
       install_method: 'none',
@@ -213,6 +213,9 @@ describe('V02-D004 packaged Mercury skill', () => {
     expect(skill).toContain('Never call a Provider directly');
     expect(skill).toContain('Never ask the user to paste a key');
     expect(skill).toContain('`resume.allowed`');
+    expect(skill).toContain('Default to `auto_finalize`');
+    expect(skill).toContain('manual_review');
+    expect(skill).toContain('默认自动采用 AI 校对并输出最终字幕；如需逐条确认请直接说。');
     expect(skill).not.toContain('TODO');
     for (const reference of ['commands.md', 'task-states.md', 'review.md', 'troubleshooting.md']) {
       expect((await readFile(path.join(source, 'references', reference), 'utf8')).length).toBeGreaterThan(200);
@@ -241,6 +244,14 @@ describe('V02-D004 packaged Mercury skill', () => {
     const taskStates = await readFile(path.join(source, 'references', 'task-states.md'), 'utf8');
     expect(taskStates).toContain('`resume.allowed` is true');
     expect(taskStates).toContain('not permission to act');
+    const review = await readFile(path.join(source, 'references', 'review.md'), 'utf8');
+    expect(review).toContain('`auto_finalize` is the default');
+    expect(review).toContain('`manual_review` is opt-in');
+    expect(review).toContain('retry once with the new exact count');
+    expect(review).toContain('A second stale response');
+    expect(review).toContain('exists=true');
+    expect(review).toContain('validation=passed');
+    expect(review).toContain('run `task deliver` at most once');
   });
 
   it('executes the documented first dictionary CRUD flow without invalid command probing', async () => {

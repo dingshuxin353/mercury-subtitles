@@ -142,7 +142,7 @@ const lockJson = JSON.parse(await readFile(path.join(snapshotRoot, 'package-lock
 const version = (await readFile(path.join(snapshotRoot, 'VERSION'), 'utf8')).trim();
 if (
   packageJson.name !== 'mercury-subtitles' ||
-  packageJson.version !== '0.3.0' ||
+  packageJson.version !== '0.3.1' ||
   packageJson.version !== version ||
   lockJson.name !== packageJson.name ||
   lockJson.version !== packageJson.version ||
@@ -177,6 +177,9 @@ if (readme.includes('mercury calibrate --audio "/绝对路径/访谈.mp3" --back
 }
 if (!readme.includes('Skill 只使用 Mercury 的机器命令')) {
   throw new Error('Public README does not state the Skill execution boundary');
+}
+if (!readme.includes('默认自动采用 AI 校对并输出最终字幕；如需逐条确认请直接说')) {
+  throw new Error('Public README does not explain the packaged Skill auto-finalize default');
 }
 if (readme.includes('github.com/dingshuxin353/mercury-subtitles/blob/main/docs/skill.md')) {
   throw new Error('Public README links to the retired ambiguous docs/skill.md path');

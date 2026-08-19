@@ -46,9 +46,13 @@ npx skills remove mercury-subtitles
 
 > 用 Mercury 在后台把这个 MP3 转成字幕：`/path/to/interview.mp3`。提交后立刻告诉我 task ID，不要在会话里一直等。
 
+普通字幕请求默认自动采用仍为 pending 的 AI 校对并生成经过验证的 `approved.srt`，不会再问一次“是否接受全部修改”。Skill 会在开始时用一句话提示这个默认策略；自动 accept-all、finalize 与本地 delivery 不增加 Provider 调用。
+
 > 用 Mercury 查询任务 `<task-id>`。完成后告诉我 transcribed、calibrated、approved 和报告的实际路径。
 
 > 用 Mercury 列出这个任务的校验变化，我要逐项决定，然后生成批准稿。
+
+只有明确说“逐条检查”“人工复核”“先看修改”或“不要自动定稿”时，Skill 才切换为人工审阅；已有接受、驳回、编辑决定会保留，自动流程也只处理剩余 pending。
 
 > 暂停这个 Mercury 任务；等它真正到安全检查点后再告诉我。随后从同一 attempt 恢复，不要重复已固定的 Provider 调用。
 
@@ -63,6 +67,7 @@ npx skills remove mercury-subtitles
 - 暂停/恢复不创建新 attempt；重试前必须展示只读 plan，并且只能执行仍匹配当前 task revision 的 plan。
 - `outcome_unknown` 不得自动恢复或重试。若用户仍要重新处理，必须作为可能重复计费的全新逻辑 request 明示确认。
 - 只报告 Mercury 返回的绝对结果路径，不猜测文件位置。
+- 只有 `approved_srt.exists=true` 且 `validation=passed` 才称为最终字幕；不把 transcribed/calibrated 冒充 final。
 - 除非用户明确要求检查特定内容，不把整份字幕复制到聊天。
 
 Skill 只消费稳定 `mercury.cli/v1` / Exchange Protocol v1；不会解析中文 App 页面或旧实验输出。升级 Alpha 前可以运行 `mercury skill status --json` 检查兼容性；更新 Skill 本身仍使用标准 Skills CLI。

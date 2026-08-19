@@ -17,7 +17,7 @@
 </div>
 
 > [!IMPORTANT]
-> Mercury `0.3.0` 是 V0.3 稳定版，面向愿意安装 Node.js 24 的 CLI 与 Agent 用户。处理重要素材时仍建议保留原文件，并先用副本熟悉工作流。
+> Mercury `0.3.1` 是 V0.3 稳定补丁，面向愿意安装 Node.js 24 的 CLI 与 Agent 用户。处理重要素材时仍建议保留原文件，并先用副本熟悉工作流。
 
 ## 你会得到什么
 
@@ -27,7 +27,7 @@
 | --- | --- |
 | `*.transcribed.srt` | 云端语音转文字的原始结果；方便比较 ASR 到底听出了什么。 |
 | `*.calibrated.srt` | AI 结合完整正文和可用音频校对错字后的版本；cue 数量、顺序和毫秒时间轴与纯转写完全相同。 |
-| `*.approved.srt` | 你逐项接受、驳回或编辑后生成的批准稿；这是最适合交付的版本。 |
+| `*.approved.srt` | 通过审计 review/finalize 生成的最终批准稿；Skill 默认自动采用剩余 AI 校对，明确要求人工复核时仍可逐项决定。 |
 | `calibration-report.md` | 本次模型、校验模式、修改摘要、警告和文件位置。 |
 
 Mercury 会在本地保存任务和结果；长任务可以在后台继续运行。终端或 Agent 会话关掉后，任务不必跟着消失。
@@ -53,13 +53,13 @@ node --version
 
 需要显示 `v24.x.x`。如果还是 Node 22，请先安装或切换到 [Node.js 24](https://nodejs.org/)，然后重新打开终端。
 
-### 2. 安装当前已发布版本
+### 2. 安装稳定版本
 
 ```bash
 npm install --global mercury-subtitles@latest
 ```
 
-`@latest` 是 Mercury 的稳定渠道。安装后请运行 `mercury --version` 核对实际版本；需要固定本版本时使用 `npm install --global mercury-subtitles@0.3.0`。公开预发布渠道 `@next` 保留不可变的 `0.3.0-rc.2`，不会覆盖稳定安装。
+`@latest` 是 Mercury 的稳定渠道。安装后请运行 `mercury --version` 核对实际版本。当前 `0.3.1` 仍是待主控验收的本地候选，尚未发布；候选验收应使用交付的 tarball，不把下面的未来命令当作线上事实。正式发布后，固定本版本可使用 `npm install --global mercury-subtitles@0.3.1`，从已具备更新能力的版本升级可使用 `mercury update apply --version 0.3.1 --yes --json`。公开预发布渠道 `@next` 保留不可变的 `0.3.0-rc.2`。
 
 如果当前还是 `0.3.0-alpha.2`，旧版尚无 `mercury update` 命令。首次进入具备内置更新能力的 0.3 系列版本，需要使用管理现有安装的同一个 npm、同一个 global prefix，显式安装确切版本：
 
@@ -130,7 +130,9 @@ mercury worker start --json
 
 查询状态不会偷偷启动 Worker，也不会重复提交任务。Provider 结果不确定时，Mercury 会停下来阻止自动重放，避免重复调用或计费。
 
-`0.3.0` 继续使用 Exchange Protocol v1：脚本可显式导入 SRT、VTT 或 transcript JSON 作为转写事实源（ASR 0 调用），也可用 `reference` 继续走 ASR；两种模式共用稳定任务、事件、结果、词典快照和审阅合同。安全暂停/同 attempt 恢复，以及只读 retry plan + append-only retry 均保持兼容；Provider 结果不确定时仍禁止自动重放。全局/项目词典通过 `mercury dictionary ... --json` 管理，任务创建后固定 revision/hash。
+`0.3.1` 继续使用 Exchange Protocol v1：脚本可显式导入 SRT、VTT 或 transcript JSON 作为转写事实源（ASR 0 调用），也可用 `reference` 继续走 ASR；两种模式共用稳定任务、事件、结果、词典快照和审阅合同。安全暂停/同 attempt 恢复，以及只读 retry plan + append-only retry 均保持兼容；Provider 结果不确定时仍禁止自动重放。全局/项目词典通过 `mercury dictionary ... --json` 管理，任务创建后固定 revision/hash。
+
+通过 Mercury Skill 发起普通字幕请求时，Skill 会先提示“默认自动采用 AI 校对并输出最终字幕；如需逐条确认请直接说”，任务完成后使用稳定 review/finalize 命令自动采用剩余 AI 建议，并且只有经过验证的 `approved.srt` 才会作为最终字幕返回。用户明确要求逐条检查、人工复核、先看修改或不要自动定稿时，仍进入原有人工审阅流程。该编排不会增加 ASR/Chat 调用，也不会把 calibrated/transcribed 冒充最终稿。
 
 不知道命令时可从一屏帮助开始：
 
@@ -307,7 +309,7 @@ npm run verify
 
 ## 版本与反馈
 
-- 当前稳定版：`0.3.0`，通过 npm `latest` 分发；`next` 保留 `0.3.0-rc.2` 作为不可覆盖的预发布历史。实际渠道版本请以 `npm view mercury-subtitles dist-tags --json` 为准。
+- 当前源码候选版本：`0.3.1`；主控验收与发布授权前不得视为 npm 已发布事实。线上稳定渠道仍以 `npm view mercury-subtitles dist-tags --json` 的实时结果为准；`0.3.0` 是已发布基线，`next` 保留 `0.3.0-rc.2` 预发布历史。
 - 版本变化：[CHANGELOG.md](./CHANGELOG.md)
 - 下载与校验：[GitHub Releases](https://github.com/dingshuxin353/mercury-subtitles/releases)
 - 安装或配置求助：[创建安装帮助](https://github.com/dingshuxin353/mercury-subtitles/issues/new?template=installation-help.yml)

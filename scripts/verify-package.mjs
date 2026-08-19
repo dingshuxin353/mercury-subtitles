@@ -389,6 +389,14 @@ try {
     path.join(installedPackage, 'skills', 'mercury-subtitles', 'references', 'troubleshooting.md'),
     'utf8',
   );
+  const packagedSkill = await readFile(
+    path.join(installedPackage, 'skills', 'mercury-subtitles', 'SKILL.md'),
+    'utf8',
+  );
+  const packagedReview = await readFile(
+    path.join(installedPackage, 'skills', 'mercury-subtitles', 'references', 'review.md'),
+    'utf8',
+  );
   if (
     !packagedCommands.includes('config status.data.models[].model_id') ||
     !packagedCommands.includes('Never use `provider`, `name`, or `category` as a model ID') ||
@@ -408,9 +416,16 @@ try {
     !packagedCommands.includes('mercury update check --json') ||
     !packagedCommands.includes('Do not add `--yes` on the user\'s behalf before confirmation') ||
     !packagedCommands.includes('npx skills update mercury-subtitles') ||
-    !packagedTroubleshooting.includes('If `approved_srt.exists` is false, do not call `task deliver`')
+    !packagedTroubleshooting.includes('If `approved_srt.exists` is false, do not call `task deliver`') ||
+    !packagedSkill.includes('Default to `auto_finalize`') ||
+    !packagedSkill.includes('manual_review') ||
+    !packagedReview.includes('`auto_finalize` is the default') ||
+    !packagedReview.includes('retry once with the new exact count') ||
+    !packagedReview.includes('run `task deliver` at most once') ||
+    !packagedReview.includes('exists=true') ||
+    !packagedReview.includes('validation=passed')
   ) {
-    throw new Error('Installed package Skill is missing the rc4 model/action/delivery/dictionary safety guidance');
+    throw new Error('Installed package Skill is missing stable model/action/delivery/dictionary or auto-finalize safety guidance');
   }
   const { stdout: skillInstallOutput } = await runCli(['skill', 'install', '--json']);
   const skillInstall = JSON.parse(skillInstallOutput);

@@ -1,6 +1,6 @@
 {
   "name": "mercury-subtitles",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Local-first Chinese MP3 transcription, AI proofreading, and human-approved SRT workflow for CLI users and AI agents.",
   "type": "module",
   "packageManager": "npm@11.12.1",
