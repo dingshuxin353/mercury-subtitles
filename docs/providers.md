@@ -27,7 +27,7 @@ Mercury 不保证某个账号、区域、模型名称或配额一定可用。请
 3. 完整校验单元发送给所选 Chat。
 4. Chat 通过音频能力检查且 MP3 不超过 15 MB 时，同一次校验可附带音频；否则只发送文本。
 5. 结构完整的结果生成 `calibrated.srt` 和报告；失败不会伪造校验字幕。
-6. 人工完成所有决定后，本地生成 `approved.srt`，不会再次调用 Provider。
+6. 全部 review 决定完成后在本地生成 `approved.srt`；普通 Skill 请求会以 `actor=skill` 自动接受剩余建议，明确人工复核时仍逐条决定，两种路径都不会再次调用 Provider。
 
 ## 任务词典与 ASR hints
 

@@ -45,6 +45,13 @@ if (packageJson.packageManager !== 'npm@11.12.1') {
   throw new Error('The D015 stable release requires npm 11.12.1');
 }
 if (
+  !packageJson.description.includes('audited approved SRT') ||
+  !packageJson.description.includes('Skill-default auto-finalization') ||
+  packageJson.description.includes('human-approved SRT workflow')
+) {
+  throw new Error('The npm package description conflicts with the Skill auto-finalize default');
+}
+if (
   packageJson.engines?.node !== '>=24.0.0 <25.0.0' ||
   packageJson.bin?.mercury !== './dist/src/bin.js' ||
   packageJson.license !== 'Apache-2.0' ||
@@ -342,6 +349,14 @@ try {
     throw new Error('Installed mercury bin is not executable');
   }
   await assertNoLocalAbsolutePaths(installedPackage);
+  const installedReadme = await readFile(path.join(installedPackage, 'README.md'), 'utf8');
+  if (
+    !installedReadme.includes('## 按需人工审阅校验结果') ||
+    installedReadme.includes('## 人工批准校验结果') ||
+    installedReadme.includes('所有项目决定完毕后才会生成 `approved.srt`')
+  ) {
+    throw new Error('Installed package README conflicts with the Skill auto-finalize default');
+  }
   const installedBeforeCli = await collectFiles(installedPackage);
   const cliEnvironment = {
     ...process.env,

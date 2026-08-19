@@ -186,15 +186,15 @@ Skill 只使用 Mercury 的机器命令，当前完整迁移到稳定 `mercury.c
 
 [Skill 完整说明 →](https://github.com/dingshuxin353/mercury-subtitles/blob/main/docs/agent-skill.md)
 
-## 人工批准校验结果
+## 按需人工审阅校验结果
 
-校验完成后，Mercury 会把每一处正文变化列为待决定项。你可以：
+普通 Skill 请求默认自动接受剩余 AI 建议并生成经过验证的 `approved.srt`，不要求逐项确认。若你明确说“逐条检查”“人工复核”“先看修改”或“不要自动定稿”，Mercury 会把每一处正文变化列为待决定项，你可以：
 
 - 接受：采用校验后的文字；
 - 驳回：保留纯转写文字；
 - 编辑：使用你亲自确认的文字。
 
-所有项目决定完毕后才会生成 `approved.srt`。批准稿沿用校验字幕的完整时间轴，不通过删段或合段来掩盖正文分配问题。
+所有 review 决定完毕后才会生成 `approved.srt`；这些决定可以来自人工逐条操作，也可以来自 Skill 默认的 `actor=skill` 自动接受剩余建议。批准稿沿用校验字幕的完整时间轴，不通过删段或合段来掩盖正文分配问题。
 
 稳定 request 可选指定批准稿业务目录。再次修改同一任务的审阅决定时，旧业务文件保持不可变；下一次 finalize 按新批准稿 hash 生成新路径，任务结果会区分 latest 与 history。
 

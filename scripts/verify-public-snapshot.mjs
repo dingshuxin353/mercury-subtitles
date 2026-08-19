@@ -154,6 +154,13 @@ if (
 ) {
   throw new Error('Public package identity or publish metadata is inconsistent');
 }
+if (
+  !packageJson.description.includes('audited approved SRT') ||
+  !packageJson.description.includes('Skill-default auto-finalization') ||
+  packageJson.description.includes('human-approved SRT workflow')
+) {
+  throw new Error('Public package description conflicts with the Skill auto-finalize default');
+}
 
 const readme = await readFile(path.join(snapshotRoot, 'README.md'), 'utf8');
 for (const required of [
@@ -183,6 +190,24 @@ if (!readme.includes('默认自动采用 AI 校对并输出最终字幕；如需
 }
 if (readme.includes('github.com/dingshuxin353/mercury-subtitles/blob/main/docs/skill.md')) {
   throw new Error('Public README links to the retired ambiguous docs/skill.md path');
+}
+
+const architecture = await readFile(path.join(snapshotRoot, 'docs/architecture.md'), 'utf8');
+const providers = await readFile(path.join(snapshotRoot, 'docs/providers.md'), 'utf8');
+const cli = await readFile(path.join(snapshotRoot, 'docs/cli.md'), 'utf8');
+if (
+  architecture.includes('approved 只在全部人工决定完成后生成') ||
+  providers.includes('人工完成所有决定后') ||
+  readme.includes('## 人工批准校验结果')
+) {
+  throw new Error('Public documentation still requires manual approval for every Skill request');
+}
+if (
+  /review decide[^\n]*--decision/u.test(cli) ||
+  cli.includes('review accept-all <task-id> --json') ||
+  !cli.includes('review accept-all <task-id> --confirm-count <pending-count> --actor cli --json')
+) {
+  throw new Error('Public CLI review examples do not match the stable executable command shape');
 }
 
 const license = await readFile(path.join(snapshotRoot, 'LICENSE'), 'utf8');

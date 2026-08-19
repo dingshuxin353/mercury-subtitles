@@ -16,7 +16,7 @@ Mercury 是一个本地优先的 Node.js CLI。它把 Provider 调用、后台�
                     └────┬────┘
                  转写 / 校验结果
                          │
-                    人工审阅
+                 审阅 / 自动批准
                          │
                     approved.srt
 ```
@@ -30,6 +30,6 @@ Mercury 是一个本地优先的 Node.js CLI。它把 Provider 调用、后台�
 - pause/resume 以可验证安全检查点继续同一 attempt；retry 先形成只读计划，再追加新 attempt 和逐调用事实。
 - 状态、列表、结果与 Worker 状态查询严格只读。
 - ASR 成功后立即保留纯转写；校验失败不会抹掉可用部分结果。
-- approved 只在全部人工决定完成后生成，并保持校验字幕的完整时间轴。
+- approved 只在全部 review 决定完成后生成：可以由用户逐条决定，也可以由 Mercury Skill 以 `actor=skill` 默认接受剩余建议；两条路径都保持校验字幕的完整时间轴且不增加 Provider 调用。
 
 公开包提供 Exchange Protocol v1、subtitle core、output report、model center 及 v1–v5 schema。稳定 Agent/机器入口是 `mercury.cli/v1`；冻结的历史 schema 1–4 和 Alpha.1 v5 任务保持只读兼容。
