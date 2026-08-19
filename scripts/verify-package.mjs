@@ -45,6 +45,13 @@ if (packageJson.packageManager !== 'npm@11.12.1') {
   throw new Error('The D015 stable release requires npm 11.12.1');
 }
 if (
+  !packageJson.description.includes('audited approved SRT') ||
+  !packageJson.description.includes('Skill-default auto-finalization') ||
+  packageJson.description.includes('human-approved SRT workflow')
+) {
+  throw new Error('The npm package description conflicts with the Skill auto-finalize default');
+}
+if (
   packageJson.engines?.node !== '>=24.0.0 <25.0.0' ||
   packageJson.bin?.mercury !== './dist/src/bin.js' ||
   packageJson.license !== 'Apache-2.0' ||
@@ -342,6 +349,14 @@ try {
     throw new Error('Installed mercury bin is not executable');
   }
   await assertNoLocalAbsolutePaths(installedPackage);
+  const installedReadme = await readFile(path.join(installedPackage, 'README.md'), 'utf8');
+  if (
+    !installedReadme.includes('## 按需人工审阅校验结果') ||
+    installedReadme.includes('## 人工批准校验结果') ||
+    installedReadme.includes('所有项目决定完毕后才会生成 `approved.srt`')
+  ) {
+    throw new Error('Installed package README conflicts with the Skill auto-finalize default');
+  }
   const installedBeforeCli = await collectFiles(installedPackage);
   const cliEnvironment = {
     ...process.env,
@@ -389,6 +404,14 @@ try {
     path.join(installedPackage, 'skills', 'mercury-subtitles', 'references', 'troubleshooting.md'),
     'utf8',
   );
+  const packagedSkill = await readFile(
+    path.join(installedPackage, 'skills', 'mercury-subtitles', 'SKILL.md'),
+    'utf8',
+  );
+  const packagedReview = await readFile(
+    path.join(installedPackage, 'skills', 'mercury-subtitles', 'references', 'review.md'),
+    'utf8',
+  );
   if (
     !packagedCommands.includes('config status.data.models[].model_id') ||
     !packagedCommands.includes('Never use `provider`, `name`, or `category` as a model ID') ||
@@ -408,9 +431,16 @@ try {
     !packagedCommands.includes('mercury update check --json') ||
     !packagedCommands.includes('Do not add `--yes` on the user\'s behalf before confirmation') ||
     !packagedCommands.includes('npx skills update mercury-subtitles') ||
-    !packagedTroubleshooting.includes('If `approved_srt.exists` is false, do not call `task deliver`')
+    !packagedTroubleshooting.includes('If `approved_srt.exists` is false, do not call `task deliver`') ||
+    !packagedSkill.includes('Default to `auto_finalize`') ||
+    !packagedSkill.includes('manual_review') ||
+    !packagedReview.includes('`auto_finalize` is the default') ||
+    !packagedReview.includes('retry once with the new exact count') ||
+    !packagedReview.includes('run `task deliver` at most once') ||
+    !packagedReview.includes('exists=true') ||
+    !packagedReview.includes('validation=passed')
   ) {
-    throw new Error('Installed package Skill is missing the rc4 model/action/delivery/dictionary safety guidance');
+    throw new Error('Installed package Skill is missing stable model/action/delivery/dictionary or auto-finalize safety guidance');
   }
   const { stdout: skillInstallOutput } = await runCli(['skill', 'install', '--json']);
   const skillInstall = JSON.parse(skillInstallOutput);

@@ -79,15 +79,15 @@ mercury task cancel <task-id> --json
 
 ```bash
 mercury review status <task-id> --json
-mercury review list <task-id> --json
-mercury review decide <task-id> --change <change-id> --decision accepted --json
-mercury review decide <task-id> --change <change-id> --decision rejected --json
-mercury review decide <task-id> --change <change-id> --decision edited --text "人工确认文字" --json
-mercury review accept-all <task-id> --json
+mercury review list <task-id> --limit 10 --json
+mercury review decide <task-id> --change <change-id> --accept --actor cli --json
+mercury review decide <task-id> --change <change-id> --reject --actor cli --json
+mercury review decide <task-id> --change <change-id> --text "人工确认文字" --actor cli --json
+mercury review accept-all <task-id> --confirm-count <pending-count> --actor cli --json
 mercury review finalize <task-id> --json
 ```
 
-只有 pending 为零时才能 finalize。生成的 `approved.srt` 与 `calibrated.srt` 时间段数和毫秒边界一致。
+`accept-all` 必须先从 `review status` 读取当前精确 pending 数；数量变化时重新读取，不猜测。只有 pending 为零时才能 finalize。生成的 `approved.srt` 与 `calibrated.srt` 时间段数和毫秒边界一致。
 
 请求了业务目录时，finalize 会尝试交付同一 approved Buffer。目录故障不会破坏工作区批准稿；修复目录后只执行本地动作：
 

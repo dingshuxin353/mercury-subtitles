@@ -4,7 +4,7 @@
 - `running`: owned by one Worker.
 - `pausing`: the pause intent is durable, but work has not reached a safe checkpoint. If a Provider call is in flight, wait; do not claim it was stopped.
 - `paused`: safe checkpoint and same attempt are durable. Resume only when the current task field `resume.allowed` is true; contract-level `capabilities.resume.supported` alone is not permission to act.
-- `completed`: processing passed; review may still be pending.
+- `completed`: processing passed; default Skill policy resolves remaining review pending and finalizes, while explicit manual-review intent keeps pending for user decisions.
 - `failed`: a known failure. Read the deterministic retry plan; do not auto-execute it.
 - `interrupted`: inspect `provider_outcome`. `outcome_unknown` forbids resume/retry; `response_persisted` may permit local-only resume.
 - `cancelled`: final cancellation. A remote call was not necessarily withdrawn.
@@ -22,7 +22,7 @@ Artifacts:
 
 - `transcribed_srt`: ASR/provided wording before Chat.
 - `calibrated_srt`: validated AI wording, not final human approval.
-- `approved_srt`: current human-approved final SRT.
+- `approved_srt`: current final SRT produced through the audited review/finalize path; it may reflect explicit human decisions or the Skill's default actor=skill acceptance policy.
 - `calibration_report`: evidence summary.
 
 Only report absolute paths where `exists=true` and `validation=passed`. Historical tasks may truthfully advertise control capabilities as unsupported.

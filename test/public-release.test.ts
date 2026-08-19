@@ -32,7 +32,8 @@ describe('public stable release surface', () => {
 
     expect(packageJson).toMatchObject({
       name: 'mercury-subtitles',
-      version: '0.3.0',
+      version: '0.3.1',
+      description: 'Local-first Chinese transcription, AI proofreading, and audited approved SRT with Skill-default auto-finalization and opt-in manual review.',
       license: 'Apache-2.0',
       engines: { node: '>=24.0.0 <25.0.0' },
       bin: { mercury: './dist/src/bin.js' },
@@ -40,9 +41,31 @@ describe('public stable release surface', () => {
     });
     expect(packageJson.private).not.toBe(true);
     expect(packageJson.repository.url).toBe('git+https://github.com/dingshuxin353/mercury-subtitles.git');
+    expect(packageJson.description).not.toContain('human-approved SRT workflow');
     expect(lockJson.name).toBe(packageJson.name);
     expect(lockJson.version).toBe(packageJson.version);
     expect(version).toBe(packageJson.version);
+  });
+
+  it('keeps public review documentation executable and aligned with auto-finalize', async () => {
+    const architecture = await readFile(path.join(snapshotRoot, 'docs/architecture.md'), 'utf8');
+    const providers = await readFile(path.join(snapshotRoot, 'docs/providers.md'), 'utf8');
+    const cli = await readFile(path.join(snapshotRoot, 'docs/cli.md'), 'utf8');
+    const readme = await readFile(path.join(snapshotRoot, 'README.md'), 'utf8');
+    expect(architecture).toContain('审阅 / 自动批准');
+    expect(architecture).toContain('`actor=skill` 默认接受剩余建议');
+    expect(architecture).not.toContain('approved 只在全部人工决定完成后生成');
+    expect(providers).toContain('全部 review 决定完成后');
+    expect(providers).toContain('`actor=skill` 自动接受剩余建议');
+    expect(providers).not.toContain('人工完成所有决定后');
+    expect(readme).toContain('## 按需人工审阅校验结果');
+    expect(readme).not.toContain('## 人工批准校验结果');
+    expect(cli).toContain('review decide <task-id> --change <change-id> --accept --actor cli --json');
+    expect(cli).toContain('review decide <task-id> --change <change-id> --reject --actor cli --json');
+    expect(cli).toContain('review decide <task-id> --change <change-id> --text "人工确认文字" --actor cli --json');
+    expect(cli).toContain('review accept-all <task-id> --confirm-count <pending-count> --actor cli --json');
+    expect(cli).not.toMatch(/review decide[^\n]*--decision/u);
+    expect(cli).not.toContain('review accept-all <task-id> --json');
   });
 
   it('builds only the public allowlist and maps public documentation', async () => {
@@ -72,8 +95,9 @@ describe('public stable release surface', () => {
     expect(readme).toContain('npm install --global mercury-subtitles@latest');
     expect(readme).toContain('`@latest` 是 Mercury 的稳定渠道');
     expect(readme).toContain('旧版尚无 `mercury update` 命令');
-    expect(readme).toContain('npm install --global mercury-subtitles@0.3.0');
-    expect(readme).toContain('mercury update apply --version 0.3.0 --yes --json');
+    expect(readme).toContain('npm install --global mercury-subtitles@0.3.1');
+    expect(readme).toContain('mercury update apply --version 0.3.1 --yes --json');
+    expect(readme).toContain('默认自动采用 AI 校对并输出最终字幕；如需逐条确认请直接说');
     expect(readme).toContain('该一次性动作是 bootstrap，不是旧版内置升级');
     expect(readme).toContain('`@next` 保留不可变的 `0.3.0-rc.2`');
     expect(readme).not.toContain('`@next` 当前仍指向已经发布的 `0.3.0-alpha.2`');

@@ -149,4 +149,8 @@ mercury review finalize <task-id> --json
 mercury task deliver <task-id> --json
 ```
 
+Ordinary requests use the default auto-finalize sequence: read task result/review status → exact pending count → `accept-all --confirm-count <count> --actor skill` → reread pending=0 → finalize → reread and verify `approved_srt`. Do not ask for an extra accept-all confirmation. On `REVIEW_CONFIRM_COUNT_STALE`, refresh and retry at most once; a second stale response stops the flow.
+
+Only explicit manual-review intent uses `review list` plus decide. In that mode, do not auto accept pending changes. Existing accepted/rejected/edited decisions always remain authoritative; accept-all handles only remaining pending.
+
 `task deliver` is local-only and only retries the task's already-fixed approved directory. It never accepts a new directory and never calls a Provider.

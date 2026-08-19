@@ -142,7 +142,7 @@ const lockJson = JSON.parse(await readFile(path.join(snapshotRoot, 'package-lock
 const version = (await readFile(path.join(snapshotRoot, 'VERSION'), 'utf8')).trim();
 if (
   packageJson.name !== 'mercury-subtitles' ||
-  packageJson.version !== '0.3.0' ||
+  packageJson.version !== '0.3.1' ||
   packageJson.version !== version ||
   lockJson.name !== packageJson.name ||
   lockJson.version !== packageJson.version ||
@@ -153,6 +153,13 @@ if (
   packageJson.publishConfig?.tag !== 'latest'
 ) {
   throw new Error('Public package identity or publish metadata is inconsistent');
+}
+if (
+  !packageJson.description.includes('audited approved SRT') ||
+  !packageJson.description.includes('Skill-default auto-finalization') ||
+  packageJson.description.includes('human-approved SRT workflow')
+) {
+  throw new Error('Public package description conflicts with the Skill auto-finalize default');
 }
 
 const readme = await readFile(path.join(snapshotRoot, 'README.md'), 'utf8');
@@ -178,8 +185,29 @@ if (readme.includes('mercury calibrate --audio "/绝对路径/访谈.mp3" --back
 if (!readme.includes('Skill 只使用 Mercury 的机器命令')) {
   throw new Error('Public README does not state the Skill execution boundary');
 }
+if (!readme.includes('默认自动采用 AI 校对并输出最终字幕；如需逐条确认请直接说')) {
+  throw new Error('Public README does not explain the packaged Skill auto-finalize default');
+}
 if (readme.includes('github.com/dingshuxin353/mercury-subtitles/blob/main/docs/skill.md')) {
   throw new Error('Public README links to the retired ambiguous docs/skill.md path');
+}
+
+const architecture = await readFile(path.join(snapshotRoot, 'docs/architecture.md'), 'utf8');
+const providers = await readFile(path.join(snapshotRoot, 'docs/providers.md'), 'utf8');
+const cli = await readFile(path.join(snapshotRoot, 'docs/cli.md'), 'utf8');
+if (
+  architecture.includes('approved 只在全部人工决定完成后生成') ||
+  providers.includes('人工完成所有决定后') ||
+  readme.includes('## 人工批准校验结果')
+) {
+  throw new Error('Public documentation still requires manual approval for every Skill request');
+}
+if (
+  /review decide[^\n]*--decision/u.test(cli) ||
+  cli.includes('review accept-all <task-id> --json') ||
+  !cli.includes('review accept-all <task-id> --confirm-count <pending-count> --actor cli --json')
+) {
+  throw new Error('Public CLI review examples do not match the stable executable command shape');
 }
 
 const license = await readFile(path.join(snapshotRoot, 'LICENSE'), 'utf8');

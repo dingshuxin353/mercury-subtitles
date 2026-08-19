@@ -1,4 +1,4 @@
 interface:
   display_name: "Mercury 字幕助手"
-  short_description: "稳定提交、控制、审阅并交付 Mercury 中文字幕"
-  default_prompt: "Use $mercury-subtitles with Mercury's stable Exchange CLI to submit my subtitle request, manage it safely, review changes, and deliver the approved SRT."
+  short_description: "稳定提交并默认自动定稿 Mercury 中文字幕"
+  default_prompt: "Use $mercury-subtitles with Mercury's stable Exchange CLI to submit my subtitle request, manage it safely, automatically finalize AI changes by default unless I request manual review, and deliver the verified approved SRT."

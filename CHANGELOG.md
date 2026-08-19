@@ -1,5 +1,11 @@
 # Mercury Changelog
 
+## 0.3.1 — 2026-08-19
+
+- Changed only the packaged Mercury Skill orchestration policy: ordinary subtitle requests now accept remaining AI proposals and finalize a verified `approved_srt` by default, without an extra confirmation prompt.
+- Kept explicit manual review as an opt-in flow, preserving prior accepted/rejected/edited history and bounded stale-count handling.
+- Kept Exchange Protocol v1, the CLI/runtime, Provider behavior, subtitle text/timing rules, and local delivery contracts unchanged; auto accept/finalize/deliver add zero Provider calls.
+
 ## 0.3.0 — 2026-08-19
 
 - Promoted the independently accepted RC.2 runtime to the V0.3 stable release without changing Exchange Protocol v1, subtitle processing, task control, dictionaries, review, delivery, Provider behavior, or the packaged Mercury Skill.
