@@ -42,7 +42,7 @@ if (packageJson.private === true) {
   throw new Error('The public package must not be marked private');
 }
 if (packageJson.packageManager !== 'npm@11.12.1') {
-  throw new Error('The D014 release candidate requires npm 11.12.1');
+  throw new Error('The D015 stable release requires npm 11.12.1');
 }
 if (
   packageJson.engines?.node !== '>=24.0.0 <25.0.0' ||
@@ -50,7 +50,7 @@ if (
   packageJson.license !== 'Apache-2.0' ||
   packageJson.repository?.url !== 'git+https://github.com/dingshuxin353/mercury-subtitles.git' ||
   packageJson.publishConfig?.access !== 'public' ||
-  packageJson.publishConfig?.tag !== 'next'
+  packageJson.publishConfig?.tag !== 'latest'
 ) {
   throw new Error('The public package metadata is incomplete or inconsistent');
 }

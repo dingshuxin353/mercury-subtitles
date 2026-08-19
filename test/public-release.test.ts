@@ -11,7 +11,7 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 let temporaryRoot = '';
 let snapshotRoot = '';
 
-describe('public release candidate surface', () => {
+describe('public stable release surface', () => {
   beforeAll(async () => {
     temporaryRoot = await mkdtemp(path.join(tmpdir(), 'mercury-public-release-'));
     snapshotRoot = path.join(temporaryRoot, 'snapshot');
@@ -32,11 +32,11 @@ describe('public release candidate surface', () => {
 
     expect(packageJson).toMatchObject({
       name: 'mercury-subtitles',
-      version: '0.3.0-rc.2',
+      version: '0.3.0',
       license: 'Apache-2.0',
       engines: { node: '>=24.0.0 <25.0.0' },
       bin: { mercury: './dist/src/bin.js' },
-      publishConfig: { access: 'public', tag: 'next' },
+      publishConfig: { access: 'public', tag: 'latest' },
     });
     expect(packageJson.private).not.toBe(true);
     expect(packageJson.repository.url).toBe('git+https://github.com/dingshuxin353/mercury-subtitles.git');
@@ -69,15 +69,16 @@ describe('public release candidate surface', () => {
     ]) {
       expect(readme).toContain(heading);
     }
-    expect(readme).toContain('npm install --global mercury-subtitles@next');
-    expect(readme).toContain('`@next` 是 Mercury 的公开预发布渠道');
+    expect(readme).toContain('npm install --global mercury-subtitles@latest');
+    expect(readme).toContain('`@latest` 是 Mercury 的稳定渠道');
     expect(readme).toContain('旧版尚无 `mercury update` 命令');
-    expect(readme).toContain('npm install --global mercury-subtitles@0.3.0-rc.2');
-    expect(readme).toContain('mercury update apply --version 0.3.0-rc.2 --yes --json');
+    expect(readme).toContain('npm install --global mercury-subtitles@0.3.0');
+    expect(readme).toContain('mercury update apply --version 0.3.0 --yes --json');
     expect(readme).toContain('该一次性动作是 bootstrap，不是旧版内置升级');
-    expect(readme).toContain('`latest` 不随 RC 移动');
+    expect(readme).toContain('`@next` 保留不可变的 `0.3.0-rc.2`');
     expect(readme).not.toContain('`@next` 当前仍指向已经发布的 `0.3.0-alpha.2`');
     expect(readme).not.toContain('尚未获得 npm 发布授权');
+    expect(readme).not.toContain('当前候选');
     expect(readme).toContain('npx skills add dingshuxin353/mercury-subtitles');
     expect(readme).toContain('mercury task submit --request "/绝对路径/request.json" --json');
     expect(readme).not.toContain('mercury calibrate --audio "/绝对路径/访谈.mp3" --background --json');
@@ -92,5 +93,16 @@ describe('public release candidate surface', () => {
       snapshotRoot,
     ], { cwd: snapshotRoot });
     expect(stdout).toContain('Public snapshot verified');
+  });
+
+  it('keeps one OIDC Release-event publish path and maps a formal Release to npm latest', async () => {
+    const workflow = await readFile(path.join(snapshotRoot, '.github/workflows/publish.yml'), 'utf8');
+    expect(workflow).toContain('release:\n    types: [published]');
+    expect(workflow).toContain('id-token: write');
+    expect(workflow).toContain('if [[ "$RELEASE_PRERELEASE" == "true" ]]');
+    expect(workflow).toContain('dist_tag="next"');
+    expect(workflow).toContain('dist_tag="latest"');
+    expect(workflow).toContain('npm publish --access public --tag "$DIST_TAG"');
+    expect(workflow).not.toContain('NODE_AUTH_TOKEN');
   });
 });

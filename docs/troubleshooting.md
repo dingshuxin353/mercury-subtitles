@@ -2,7 +2,7 @@
 
 ## Node 版本不支持
 
-Mercury Public Alpha 固定要求 Node.js 24。切换后重新打开终端：
+Mercury 0.3.0 固定要求 Node.js 24。切换后重新打开终端：
 
 ```bash
 node --version
@@ -14,7 +14,7 @@ mercury --version
 全局安装：
 
 ```bash
-npm install --global mercury-subtitles@next
+npm install --global mercury-subtitles@latest
 ```
 
 项目内安装则使用 `npm exec -- mercury`。

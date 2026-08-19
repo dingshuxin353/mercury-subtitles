@@ -1,5 +1,11 @@
 # Mercury Changelog
 
+## 0.3.0 — 2026-08-19
+
+- Promoted the independently accepted RC.2 runtime to the V0.3 stable release without changing Exchange Protocol v1, subtitle processing, task control, dictionaries, review, delivery, Provider behavior, or the packaged Mercury Skill.
+- Made npm `latest` the stable installation channel while preserving `next=0.3.0-rc.2` as immutable prerelease history.
+- Documented the real RC.2-to-0.3.0 exact-version built-in update path and the stable CLI/App entry points.
+
 ## 0.3.0-rc.2 — 2026-08-18
 
 - Corrected the packaged README so public prerelease installation, npm `next` and the unchanged `latest` boundary remain accurate before and after publication.
